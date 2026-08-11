@@ -642,21 +642,64 @@
                                           MediaEnded="PreviewMedia_MediaEnded"
                                           MediaFailed="PreviewMedia_MediaFailed" />
                             <Image x:Name="PreviewImage" Stretch="Uniform" Visibility="Collapsed" />
-                            <Canvas x:Name="PreviewTextCanvas" Width="960" Height="540" IsHitTestVisible="False">
+                            <Canvas x:Name="PreviewTextCanvas" Width="960" Height="540">
                                 <Border x:Name="PreviewTextBorder"
                                         Visibility="Collapsed"
                                         Background="#66000000"
                                         CornerRadius="4"
-                                        Padding="8,3">
-                                    <TextBlock x:Name="PreviewTextBlock"
-                                               TextWrapping="Wrap"
-                                               TextAlignment="Center"
-                                               MaxWidth="850"
-                                               FontWeight="SemiBold">
-                                        <TextBlock.Effect>
-                                            <DropShadowEffect BlurRadius="3" ShadowDepth="1" Color="Black" Opacity="0.9" />
-                                        </TextBlock.Effect>
-                                    </TextBlock>
+                                        Padding="8,3"
+                                        Cursor="SizeAll"
+                                        ToolTip="Перетащите текст мышью"
+                                        PreviewMouseLeftButtonDown="PreviewTextBorder_MouseLeftButtonDown"
+                                        PreviewMouseMove="PreviewTextBorder_MouseMove"
+                                        PreviewMouseLeftButtonUp="PreviewTextBorder_MouseLeftButtonUp">
+                                    <Grid>
+                                        <Rectangle x:Name="PreviewTextSelectionOutline"
+                                                   Visibility="Collapsed"
+                                                   Stroke="#60A5FA"
+                                                   StrokeThickness="2"
+                                                   StrokeDashArray="4,3"
+                                                   IsHitTestVisible="False" />
+                                        <TextBlock x:Name="PreviewTextBlock"
+                                                   Margin="8"
+                                                   TextWrapping="Wrap"
+                                                   TextAlignment="Center"
+                                                   HorizontalAlignment="Stretch"
+                                                   VerticalAlignment="Center"
+                                                   FontWeight="SemiBold">
+                                            <TextBlock.Effect>
+                                                <DropShadowEffect BlurRadius="3" ShadowDepth="1" Color="Black" Opacity="0.9" />
+                                            </TextBlock.Effect>
+                                        </TextBlock>
+                                        <TextBox x:Name="PreviewTextEditor"
+                                                 Visibility="Collapsed"
+                                                 Margin="8"
+                                                 AcceptsReturn="True"
+                                                 AcceptsTab="False"
+                                                 TextWrapping="Wrap"
+                                                 VerticalScrollBarVisibility="Auto"
+                                                 HorizontalContentAlignment="Stretch"
+                                                 VerticalContentAlignment="Top"
+                                                 Background="#CC111217"
+                                                 Foreground="White"
+                                                 BorderThickness="0"
+                                                 TextChanged="PreviewTextEditor_TextChanged"
+                                                 PreviewKeyDown="PreviewTextEditor_PreviewKeyDown"
+                                                 LostKeyboardFocus="PreviewTextEditor_LostKeyboardFocus" />
+                                        <Thumb x:Name="PreviewTextResizeThumb"
+                                               Visibility="Collapsed"
+                                               Width="14" Height="14"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Bottom"
+                                               Margin="0,0,-7,-7"
+                                               Cursor="SizeNWSE"
+                                               Background="#60A5FA"
+                                               BorderBrush="White"
+                                               BorderThickness="2"
+                                               DragStarted="PreviewTextResizeThumb_DragStarted"
+                                               DragDelta="PreviewTextResizeThumb_DragDelta"
+                                               DragCompleted="PreviewTextResizeThumb_DragCompleted" />
+                                    </Grid>
                                 </Border>
                             </Canvas>
                             <Grid x:Name="EmptyPreview">
@@ -868,7 +911,7 @@
                                          Padding="4">
                                 <MenuItem Header="Разрезать в позиции курсора" Click="Split_Click" Padding="12,8" />
                                 <Separator Background="{StaticResource BorderBrush}" Margin="4,2" />
-                                <MenuItem Header="Удалить клип" Click="DeleteClip_Click" Padding="12,8" />
+                                <MenuItem Header="Удалить выбранный элемент" Click="DeleteClip_Click" Padding="12,8" />
                                 <Separator Background="{StaticResource BorderBrush}" Margin="4,2" />
                                 <MenuItem Header="Разорвать связь видео и звука" Click="UnlinkClip_Click" Padding="12,8" />
                                 <Separator Background="{StaticResource BorderBrush}" Margin="4,2" />

@@ -138,7 +138,8 @@ public sealed class ExportService(FfmpegLocator locator, ProcessRunner processRu
                 $"color=c=black@0:s={width}x{height}:r=30:d={Format(duration)},format=rgba," +
                 $"drawtext=fontfile='{fontPath}':text='{EscapeDrawText(overlay.Text)}':expansion=none:" +
                 $"fontsize={Format(fontSize)}:fontcolor={fontColor}:borderw=2:bordercolor=black@0.9{box}:" +
-                $"x=(w-text_w)*{Format(overlay.X)}:y=(h-text_h)*{Format(overlay.Y)}[{textSource}]");
+                $"x=max(0\\,min(w-text_w\\,w*{Format(overlay.X)}-text_w/2)):" +
+                $"y=max(0\\,min(h-text_h\\,h*{Format(overlay.Y)}-text_h/2))[{textSource}]");
             var sourceForOverlay = textSource;
             if (Math.Abs(overlay.Rotation) > 0.01)
             {

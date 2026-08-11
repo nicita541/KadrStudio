@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using KadrStudio.Models;
 
 namespace KadrStudio.Controls;
@@ -36,6 +37,11 @@ public sealed class TimelineControl : FrameworkElement
     private TimelineClip? _dragClip;
     private TimelineClip? _dragOriginal;
     private readonly List<(TimelineClip Clip, TimelineClip Original)> _dragLinkedClips = [];
+    private readonly Dictionary<string, ImageSource> _imageCache = new(StringComparer.OrdinalIgnoreCase);
+    private TextOverlay? _dragTextOverlay;
+    private TextOverlay? _dragTextOriginal;
+    private Guid? _selectedTextOverlayId;
+    private bool _isDraggingPlayhead;
     private bool _dragChanged;
 
     public TimelineControl()
@@ -46,6 +52,8 @@ public sealed class TimelineControl : FrameworkElement
     }
 
     public event EventHandler<ClipSelectedEventArgs>? ClipSelected;
+    public event EventHandler<TextOverlaySelectedEventArgs>? TextOverlaySelected;
+    public event EventHandler<TextOverlaySelectedEventArgs>? TextOverlayEditRequested;
     public event EventHandler<PlayheadChangedEventArgs>? PlayheadChanged;
     public event EventHandler<TimelineEditEventArgs>? EditStarted;
     public event EventHandler<TimelineEditEventArgs>? EditCompleted;
@@ -79,6 +87,20 @@ public sealed class TimelineControl : FrameworkElement
                 return;
             }
             _selectedClipId = value;
+            InvalidateVisual();
+        }
+    }
+
+    public Guid? SelectedTextOverlayId
+    {
+        get => _selectedTextOverlayId;
+        set
+        {
+            if (_selectedTextOverlayId == value)
+            {
+                return;
+            }
+            _selectedTextOverlayId = value;
             InvalidateVisual();
         }
     }
@@ -137,6 +159,10 @@ public sealed class TimelineControl : FrameworkElement
 
         var visualCount = GetTrackCount(TrackKind.Visual);
         var audioCount = GetTrackCount(TrackKind.Audio);
+        if (HasTextTrack)
+        {
+            DrawTextTrack(context, dpi);
+        }
         for (var index = 0; index < visualCount; index++)
         {
             DrawTrack(context, TrackKind.Visual, index, dpi);
@@ -158,10 +184,33 @@ public sealed class TimelineControl : FrameworkElement
         base.OnMouseLeftButtonDown(e);
         Focus();
         var point = e.GetPosition(this);
+        var playheadX = LeftGutterWidth + PlayheadSeconds * PixelsPerSecond;
         if (point.Y <= RulerHeight && HitTestMarker(point) is { } marker)
         {
             PlayheadSeconds = marker.Start;
             PlayheadChanged?.Invoke(this, new PlayheadChangedEventArgs(marker.Start));
+            BeginPlayheadDrag();
+            e.Handled = true;
+            return;
+        }
+        if (point.Y <= RulerHeight || Math.Abs(point.X - playheadX) <= 7)
+        {
+            SetPlayheadFromPoint(point);
+            BeginPlayheadDrag();
+            e.Handled = true;
+            return;
+        }
+
+        if (HitTestTextOverlay(point) is { } textOverlay)
+        {
+            SelectTextOverlay(textOverlay);
+            if (e.ClickCount >= 2)
+            {
+                TextOverlayEditRequested?.Invoke(this, new TextOverlaySelectedEventArgs(textOverlay.Id));
+                e.Handled = true;
+                return;
+            }
+            BeginTextOverlayDrag(textOverlay, point);
             e.Handled = true;
             return;
         }
@@ -170,11 +219,17 @@ public sealed class TimelineControl : FrameworkElement
         if (hit is null)
         {
             SelectedClipId = null;
+            SelectedTextOverlayId = null;
             ClipSelected?.Invoke(this, new ClipSelectedEventArgs(null));
+            TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(null));
             SetPlayheadFromPoint(point);
+            BeginPlayheadDrag();
+            e.Handled = true;
             return;
         }
 
+        SelectedTextOverlayId = null;
+        TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(null));
         SelectedClipId = hit.Id;
         ClipSelected?.Invoke(this, new ClipSelectedEventArgs(hit.Id));
         _dragClip = hit;
@@ -204,7 +259,15 @@ public sealed class TimelineControl : FrameworkElement
     {
         base.OnMouseRightButtonDown(e);
         Focus();
-        var hit = HitTestClip(e.GetPosition(this));
+        var point = e.GetPosition(this);
+        if (HitTestTextOverlay(point) is { } overlay)
+        {
+            SelectTextOverlay(overlay);
+            return;
+        }
+        var hit = HitTestClip(point);
+        SelectedTextOverlayId = null;
+        TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(null));
         SelectedClipId = hit?.Id;
         ClipSelected?.Invoke(this, new ClipSelectedEventArgs(hit?.Id));
     }
@@ -213,6 +276,18 @@ public sealed class TimelineControl : FrameworkElement
     {
         base.OnMouseMove(e);
         var point = e.GetPosition(this);
+        if (_isDraggingPlayhead && e.LeftButton == MouseButtonState.Pressed)
+        {
+            SetPlayheadFromPoint(point);
+            e.Handled = true;
+            return;
+        }
+        if (_dragTextOverlay is not null && _dragTextOriginal is not null && e.LeftButton == MouseButtonState.Pressed)
+        {
+            ApplyTextOverlayDrag(point);
+            e.Handled = true;
+            return;
+        }
         if (_dragClip is not null && _dragOriginal is not null && e.LeftButton == MouseButtonState.Pressed)
         {
             ApplyDrag(point);
@@ -220,6 +295,14 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
 
+        if (HitTestTextOverlay(point) is { } textOverlay)
+        {
+            var textRectangle = GetTextOverlayRectangle(textOverlay);
+            Cursor = Math.Abs(point.X - textRectangle.Left) <= ClipEdgeGrip || Math.Abs(point.X - textRectangle.Right) <= ClipEdgeGrip
+                ? Cursors.SizeWE
+                : Cursors.SizeAll;
+            return;
+        }
         var hit = HitTestClip(point);
         if (hit is null)
         {
@@ -235,6 +318,27 @@ public sealed class TimelineControl : FrameworkElement
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
         base.OnMouseLeftButtonUp(e);
+        if (_isDraggingPlayhead)
+        {
+            _isDraggingPlayhead = false;
+            if (IsMouseCaptured) ReleaseMouseCapture();
+            Cursor = Cursors.Arrow;
+            e.Handled = true;
+            return;
+        }
+        if (_dragTextOverlay is not null)
+        {
+            var overlayId = _dragTextOverlay.Id;
+            if (IsMouseCaptured) ReleaseMouseCapture();
+            Cursor = Cursors.Arrow;
+            _dragTextOverlay = null;
+            _dragTextOriginal = null;
+            _dragOperation = DragOperation.None;
+            EditCompleted?.Invoke(this, new TimelineEditEventArgs(overlayId, _dragChanged));
+            _dragChanged = false;
+            e.Handled = true;
+            return;
+        }
         if (_dragClip is null)
         {
             return;
@@ -249,6 +353,67 @@ public sealed class TimelineControl : FrameworkElement
         EditCompleted?.Invoke(this, new TimelineEditEventArgs(clipId, _dragChanged));
         _dragChanged = false;
         e.Handled = true;
+    }
+
+    private void BeginPlayheadDrag()
+    {
+        _isDraggingPlayhead = true;
+        CaptureMouse();
+        Cursor = Cursors.SizeWE;
+    }
+
+    private void SelectTextOverlay(TextOverlay overlay)
+    {
+        SelectedClipId = null;
+        ClipSelected?.Invoke(this, new ClipSelectedEventArgs(null));
+        SelectedTextOverlayId = overlay.Id;
+        TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(overlay.Id));
+    }
+
+    private void BeginTextOverlayDrag(TextOverlay overlay, Point point)
+    {
+        _dragTextOverlay = overlay;
+        _dragTextOriginal = overlay.Clone();
+        _dragOrigin = point;
+        _dragChanged = false;
+        var rectangle = GetTextOverlayRectangle(overlay);
+        _dragPointerOffsetSeconds = Math.Max(0, (point.X - rectangle.Left) / PixelsPerSecond);
+        _dragOperation = Math.Abs(point.X - rectangle.Left) <= ClipEdgeGrip
+            ? DragOperation.TrimLeft
+            : Math.Abs(point.X - rectangle.Right) <= ClipEdgeGrip
+                ? DragOperation.TrimRight
+                : DragOperation.Move;
+        EditStarted?.Invoke(this, new TimelineEditEventArgs(overlay.Id, false));
+        CaptureMouse();
+    }
+
+    private void ApplyTextOverlayDrag(Point point)
+    {
+        if (_dragTextOverlay is null || _dragTextOriginal is null)
+        {
+            return;
+        }
+        var delta = SnapDuration((point.X - _dragOrigin.X) / PixelsPerSecond);
+        switch (_dragOperation)
+        {
+            case DragOperation.TrimLeft:
+            {
+                var applied = Math.Clamp(delta, -_dragTextOriginal.Start, _dragTextOriginal.Duration - MinimumClipDuration);
+                _dragTextOverlay.Start = _dragTextOriginal.Start + applied;
+                _dragTextOverlay.Duration = _dragTextOriginal.Duration - applied;
+                break;
+            }
+            case DragOperation.TrimRight:
+                _dragTextOverlay.Duration = Math.Max(MinimumClipDuration, _dragTextOriginal.Duration + delta);
+                break;
+            case DragOperation.Move:
+                _dragTextOverlay.Start = SnapTime(Math.Max(0,
+                    (point.X - LeftGutterWidth) / PixelsPerSecond - _dragPointerOffsetSeconds));
+                break;
+        }
+        _dragChanged |= !TextOverlayEquals(_dragTextOverlay, _dragTextOriginal);
+        InvalidateMeasure();
+        InvalidateVisual();
     }
 
     protected override void OnMouseWheel(MouseWheelEventArgs e)
@@ -437,6 +602,19 @@ public sealed class TimelineControl : FrameworkElement
         }
     }
 
+    private void DrawTextTrack(DrawingContext context, double dpi)
+    {
+        var top = GetTextTrackTop();
+        context.DrawRoundedRectangle(
+            new SolidColorBrush(Color.FromRgb(35, 24, 45)),
+            _gridPen,
+            new Rect(LeftGutterWidth, top, Math.Max(0, RenderSize.Width - LeftGutterWidth - 7), TrackHeight),
+            4,
+            4);
+        context.DrawText(CreateText("T1", 10, Color.FromRgb(216, 180, 254), dpi, FontWeights.SemiBold),
+            new Point(14, top + 18));
+    }
+
     private void DrawClips(DrawingContext context, double dpi)
     {
         if (Project is null)
@@ -461,10 +639,11 @@ public sealed class TimelineControl : FrameworkElement
             context.DrawRoundedRectangle(new SolidColorBrush(baseColor), outline, rectangle, 5, 5);
             if (clip.Track == TrackKind.Audio)
             {
-                DrawWaveform(context, rectangle);
+                DrawWaveform(context, clip, asset, rectangle, dpi);
             }
             else
             {
+                DrawVideoFrames(context, clip, asset, rectangle);
                 DrawClipAnalysisOverlays(context, clip, rectangle, dpi);
             }
 
@@ -473,6 +652,8 @@ public sealed class TimelineControl : FrameworkElement
             context.PushClip(new RectangleGeometry(new Rect(rectangle.X + 7, rectangle.Y, Math.Max(0, rectangle.Width - 14), rectangle.Height)));
             if (rectangle.Width >= 42)
             {
+                context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(150, 8, 10, 16)), null,
+                    new Rect(rectangle.X + 5, rectangle.Y + 4, Math.Min(rectangle.Width - 10, 250), 17), 3, 3);
                 context.DrawText(CreateText(clippedTitle, 10.5, Colors.White, dpi, FontWeights.SemiBold), new Point(rectangle.X + 9, rectangle.Y + 7));
             }
             if (clip.LinkGroupId.HasValue && rectangle.Width >= 70)
@@ -491,6 +672,35 @@ public sealed class TimelineControl : FrameworkElement
                 context.DrawRoundedRectangle(handleBrush, null, new Rect(rectangle.Right - 3, rectangle.Top + 6, 5, rectangle.Height - 12), 2, 2);
             }
         }
+    }
+
+    private void DrawVideoFrames(DrawingContext context, TimelineClip clip, MediaAsset? asset, Rect rectangle)
+    {
+        if (asset is null || asset.TimelineFramePaths.Count == 0)
+        {
+            return;
+        }
+
+        context.PushClip(new RectangleGeometry(rectangle));
+        context.PushOpacity(0.88);
+        const double tileWidth = 82;
+        for (var left = rectangle.Left; left < rectangle.Right; left += tileWidth)
+        {
+            var center = Math.Min(rectangle.Right, left + tileWidth / 2);
+            var localRatio = rectangle.Width <= 0 ? 0 : (center - rectangle.Left) / rectangle.Width;
+            var sourceTime = clip.SourceStart + localRatio * clip.Duration;
+            var sourceRatio = asset.Duration <= 0 ? 0 : Math.Clamp(sourceTime / asset.Duration, 0, 1);
+            var frameIndex = Math.Clamp((int)Math.Round(sourceRatio * (asset.TimelineFramePaths.Count - 1)),
+                0, asset.TimelineFramePaths.Count - 1);
+            if (TryLoadImage(asset.TimelineFramePaths[frameIndex]) is not { } image)
+            {
+                continue;
+            }
+            context.DrawImage(image,
+                new Rect(left, rectangle.Top, Math.Min(tileWidth, rectangle.Right - left), rectangle.Height));
+        }
+        context.Pop();
+        context.Pop();
     }
 
     private void DrawClipAnalysisOverlays(DrawingContext context, TimelineClip clip, Rect rectangle, double dpi)
@@ -562,39 +772,93 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
 
-        var top = GetTrackTop(TrackKind.Visual, 0) + TrackHeight - 14;
         foreach (var overlay in Project.TextOverlays.OrderBy(item => item.Start))
         {
-            var left = LeftGutterWidth + overlay.Start * PixelsPerSecond;
-            var width = Math.Max(4, overlay.Duration * PixelsPerSecond);
-            if (left > RenderSize.Width || left + width < LeftGutterWidth)
+            var rect = GetTextOverlayRectangle(overlay);
+            if (rect.Left > RenderSize.Width || rect.Right < LeftGutterWidth)
             {
                 continue;
             }
 
             var color = overlay.IsSubtitle ? Color.FromRgb(236, 72, 153) : Color.FromRgb(168, 85, 247);
-            var rect = new Rect(left, top, width, 11);
+            var selected = SelectedTextOverlayId == overlay.Id;
             context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(225, color.R, color.G, color.B)),
-                CreatePen(Color.FromArgb(220, 255, 255, 255), 1), rect, 2, 2);
-            if (width >= 32)
+                selected ? CreatePen(Colors.White, 2.5) : CreatePen(Color.FromArgb(190, 255, 255, 255), 1), rect, 5, 5);
+            context.PushClip(new RectangleGeometry(new Rect(rect.Left + 6, rect.Top, Math.Max(0, rect.Width - 12), rect.Height)));
+            if (rect.Width >= 30)
             {
-                context.PushClip(new RectangleGeometry(rect));
-                context.DrawText(CreateText(overlay.IsSubtitle ? "CC" : "T", 7.5, Colors.White, dpi, FontWeights.Bold),
-                    new Point(left + 4, top + 1));
-                context.Pop();
+                var title = overlay.IsSubtitle ? $"CC  {overlay.Text}" : $"T  {overlay.Text}";
+                context.DrawText(CreateText(title, 10, Colors.White, dpi, FontWeights.SemiBold),
+                    new Point(rect.Left + 9, rect.Top + 7));
+            }
+            if (rect.Width >= 55)
+            {
+                context.DrawText(CreateText(FormatClipDuration(overlay.Duration), 9, Color.FromArgb(220, 255, 255, 255), dpi),
+                    new Point(rect.Left + 9, rect.Bottom - 19));
+            }
+            context.Pop();
+            if (selected)
+            {
+                context.DrawRoundedRectangle(Brushes.White, null,
+                    new Rect(rect.Left - 2, rect.Top + 6, 5, rect.Height - 12), 2, 2);
+                context.DrawRoundedRectangle(Brushes.White, null,
+                    new Rect(rect.Right - 3, rect.Top + 6, 5, rect.Height - 12), 2, 2);
             }
         }
     }
 
-    private static void DrawWaveform(DrawingContext context, Rect rectangle)
+    private void DrawWaveform(DrawingContext context, TimelineClip clip, MediaAsset? asset, Rect rectangle, double dpi)
     {
-        var pen = CreatePen(Color.FromArgb(135, 225, 255, 236), 1);
-        var center = rectangle.Top + rectangle.Height / 2;
-        for (var x = rectangle.Left + 7; x < rectangle.Right - 7; x += 5)
+        if (asset?.WaveformPath is { } path && TryLoadImage(path) is { } waveform)
         {
-            var phase = (x - rectangle.Left) * 0.19;
-            var amplitude = 4 + Math.Abs(Math.Sin(phase) * 8 + Math.Cos(phase * 0.47) * 3);
-            context.DrawLine(pen, new Point(x, center - amplitude), new Point(x, center + amplitude));
+            var startRatio = asset.Duration <= 0 ? 0 : Math.Clamp(clip.SourceStart / asset.Duration, 0, 1);
+            var widthRatio = asset.Duration <= 0 ? 1 : Math.Clamp(clip.Duration / asset.Duration, 0.0001, 1 - startRatio);
+            var brush = new ImageBrush(waveform)
+            {
+                Stretch = Stretch.Fill,
+                ViewboxUnits = BrushMappingMode.RelativeToBoundingBox,
+                Viewbox = new Rect(startRatio, 0, widthRatio, 1),
+                AlignmentY = AlignmentY.Bottom,
+                Opacity = 0.95
+            };
+            context.DrawRoundedRectangle(brush, null,
+                new Rect(rectangle.Left + 2, rectangle.Top + 22, Math.Max(0, rectangle.Width - 4), rectangle.Height - 25), 2, 2);
+            return;
+        }
+
+        context.DrawLine(CreatePen(Color.FromArgb(150, 154, 243, 199), 1),
+            new Point(rectangle.Left + 5, rectangle.Bottom - 5), new Point(rectangle.Right - 5, rectangle.Bottom - 5));
+        if (rectangle.Width >= 110)
+        {
+            context.DrawText(CreateText("Форма волны готовится…", 8.5, Color.FromArgb(210, 210, 245, 229), dpi),
+                new Point(rectangle.Left + 8, rectangle.Bottom - 19));
+        }
+    }
+
+    private ImageSource? TryLoadImage(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return null;
+        }
+        if (_imageCache.TryGetValue(path, out var cached))
+        {
+            return cached;
+        }
+        try
+        {
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.UriSource = new Uri(path, UriKind.Absolute);
+            image.EndInit();
+            image.Freeze();
+            _imageCache[path] = image;
+            return image;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -666,6 +930,11 @@ public sealed class TimelineControl : FrameworkElement
             .ThenByDescending(clip => clip.Start)
             .FirstOrDefault(clip => GetClipRectangle(clip).Contains(point));
 
+    private TextOverlay? HitTestTextOverlay(Point point)
+        => Project?.TextOverlays
+            .OrderByDescending(overlay => overlay.Start)
+            .FirstOrDefault(overlay => GetTextOverlayRectangle(overlay).Contains(point));
+
     private TimelineMarker? HitTestMarker(Point point)
     {
         if (Project is null || point.X < LeftGutterWidth)
@@ -688,6 +957,12 @@ public sealed class TimelineControl : FrameworkElement
         return new Rect(left, top + 3, width, TrackHeight - 6);
     }
 
+    private Rect GetTextOverlayRectangle(TextOverlay overlay)
+    {
+        var left = LeftGutterWidth + overlay.Start * PixelsPerSecond;
+        return new Rect(left, GetTextTrackTop() + 3, Math.Max(10, overlay.Duration * PixelsPerSecond), TrackHeight - 6);
+    }
+
     private TrackAddress? GetTrackAt(double y)
     {
         if (y < TrackAreaTop)
@@ -696,29 +971,43 @@ public sealed class TimelineControl : FrameworkElement
         }
         var slot = (int)((y - TrackAreaTop) / (TrackHeight + TrackGap));
         var visualCount = GetTrackCount(TrackKind.Visual);
+        var textCount = HasTextTrack ? 1 : 0;
         if (slot < 0)
         {
             return null;
         }
-        if (slot < visualCount)
+        if (slot < textCount)
         {
-            return new TrackAddress(TrackKind.Visual, slot);
+            return new TrackAddress(TrackKind.Visual, 0);
         }
-        var audioIndex = slot - visualCount;
+        var visualSlot = slot - textCount;
+        if (visualSlot < visualCount)
+        {
+            return new TrackAddress(TrackKind.Visual, visualCount - 1 - visualSlot);
+        }
+        var audioIndex = visualSlot - visualCount;
         return audioIndex < GetTrackCount(TrackKind.Audio) ? new TrackAddress(TrackKind.Audio, audioIndex) : null;
     }
 
     private double GetTrackTop(TrackKind kind, int index)
     {
-        var slot = kind == TrackKind.Visual ? index : GetTrackCount(TrackKind.Visual) + index;
+        var textCount = HasTextTrack ? 1 : 0;
+        var slot = kind == TrackKind.Visual
+            ? textCount + GetTrackCount(TrackKind.Visual) - 1 - index
+            : textCount + GetTrackCount(TrackKind.Visual) + index;
         return TrackAreaTop + slot * (TrackHeight + TrackGap);
     }
+
+    private double GetTextTrackTop() => TrackAreaTop;
+
+    private bool HasTextTrack => Project?.TextOverlays.Count > 0;
 
     private int GetTrackCount(TrackKind kind)
         => kind == TrackKind.Visual ? Project?.VisualTrackCount ?? 2 : Project?.AudioTrackCount ?? 2;
 
     private double GetRequiredHeight()
-        => TrackAreaTop + (GetTrackCount(TrackKind.Visual) + GetTrackCount(TrackKind.Audio)) * (TrackHeight + TrackGap) - TrackGap + TrackBottomPadding;
+        => TrackAreaTop + (GetTrackCount(TrackKind.Visual) + GetTrackCount(TrackKind.Audio) + (HasTextTrack ? 1 : 0)) *
+            (TrackHeight + TrackGap) - TrackGap + TrackBottomPadding;
 
     private TimelineClip? GetPreviousClip(TimelineClip clip)
         => Project?.GetTrackClips(clip.Track, clip.TrackIndex)
@@ -759,6 +1048,7 @@ public sealed class TimelineControl : FrameworkElement
         project.Clips.CollectionChanged += OnClipsChanged;
         project.Markers.CollectionChanged += OnMarkersChanged;
         project.TextOverlays.CollectionChanged += OnTextOverlaysChanged;
+        project.Media.CollectionChanged += OnMediaChanged;
         project.PropertyChanged += OnProjectPropertyChanged;
         foreach (var clip in project.Clips)
         {
@@ -767,6 +1057,10 @@ public sealed class TimelineControl : FrameworkElement
         foreach (var overlay in project.TextOverlays)
         {
             overlay.PropertyChanged += OnTextOverlayPropertyChanged;
+        }
+        foreach (var asset in project.Media)
+        {
+            asset.PropertyChanged += OnMediaPropertyChanged;
         }
     }
 
@@ -779,6 +1073,7 @@ public sealed class TimelineControl : FrameworkElement
         project.Clips.CollectionChanged -= OnClipsChanged;
         project.Markers.CollectionChanged -= OnMarkersChanged;
         project.TextOverlays.CollectionChanged -= OnTextOverlaysChanged;
+        project.Media.CollectionChanged -= OnMediaChanged;
         project.PropertyChanged -= OnProjectPropertyChanged;
         foreach (var clip in project.Clips)
         {
@@ -787,6 +1082,10 @@ public sealed class TimelineControl : FrameworkElement
         foreach (var overlay in project.TextOverlays)
         {
             overlay.PropertyChanged -= OnTextOverlayPropertyChanged;
+        }
+        foreach (var asset in project.Media)
+        {
+            asset.PropertyChanged -= OnMediaPropertyChanged;
         }
     }
 
@@ -846,6 +1145,40 @@ public sealed class TimelineControl : FrameworkElement
     {
         InvalidateMeasure();
         InvalidateVisual();
+    }
+
+    private void OnMediaChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+        {
+            foreach (MediaAsset asset in e.OldItems)
+            {
+                asset.PropertyChanged -= OnMediaPropertyChanged;
+            }
+        }
+        if (e.NewItems is not null)
+        {
+            foreach (MediaAsset asset in e.NewItems)
+            {
+                asset.PropertyChanged += OnMediaPropertyChanged;
+            }
+        }
+        InvalidateVisual();
+    }
+
+    private void OnMediaPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.WaveformPath))
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                InvalidateVisual();
+            }
+            else
+            {
+                _ = Dispatcher.BeginInvoke(InvalidateVisual);
+            }
+        }
     }
 
     private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -924,6 +1257,10 @@ public sealed class TimelineControl : FrameworkElement
            Math.Abs(left.SourceStart - right.SourceStart) < 0.0001 &&
            Math.Abs(left.Duration - right.Duration) < 0.0001;
 
+    private static bool TextOverlayEquals(TextOverlay left, TextOverlay right)
+        => Math.Abs(left.Start - right.Start) < 0.0001 &&
+           Math.Abs(left.Duration - right.Duration) < 0.0001;
+
     private readonly record struct TrackAddress(TrackKind Kind, int Index);
 
     private enum DragOperation
@@ -938,6 +1275,11 @@ public sealed class TimelineControl : FrameworkElement
 public sealed class ClipSelectedEventArgs(Guid? clipId) : EventArgs
 {
     public Guid? ClipId { get; } = clipId;
+}
+
+public sealed class TextOverlaySelectedEventArgs(Guid? overlayId) : EventArgs
+{
+    public Guid? OverlayId { get; } = overlayId;
 }
 
 public sealed class PlayheadChangedEventArgs(double seconds) : EventArgs

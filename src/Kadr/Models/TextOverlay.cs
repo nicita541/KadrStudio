@@ -13,6 +13,8 @@ public sealed class TextOverlay : ObservableObject
     private double _y = 0.82;
     private double _rotation;
     private string _color = "#FFFFFF";
+    private double _boxWidth = 0.6;
+    private double _boxHeight = 0.18;
 
     public Guid Id { get; set; } = Guid.NewGuid();
     public bool IsSubtitle { get; set; }
@@ -40,7 +42,7 @@ public sealed class TextOverlay : ObservableObject
     public string Text
     {
         get => _text;
-        set => SetProperty(ref _text, string.IsNullOrWhiteSpace(value) ? "Текст" : value.Trim());
+        set => SetProperty(ref _text, value ?? string.Empty);
     }
 
     public string FontFamily
@@ -79,7 +81,36 @@ public sealed class TextOverlay : ObservableObject
         set => SetProperty(ref _color, string.IsNullOrWhiteSpace(value) ? "#FFFFFF" : value.Trim());
     }
 
+    public double BoxWidth
+    {
+        get => _boxWidth;
+        set => SetProperty(ref _boxWidth, Math.Clamp(value, 0.08, 1));
+    }
+
+    public double BoxHeight
+    {
+        get => _boxHeight;
+        set => SetProperty(ref _boxHeight, Math.Clamp(value, 0.06, 1));
+    }
+
     public string TimeLabel => $"{FormatTime(Start)}–{FormatTime(End)}";
+
+    public TextOverlay Clone() => new()
+    {
+        Id = Id,
+        IsSubtitle = IsSubtitle,
+        Start = Start,
+        Duration = Duration,
+        Text = Text,
+        FontFamily = FontFamily,
+        FontSize = FontSize,
+        X = X,
+        Y = Y,
+        Rotation = Rotation,
+        Color = Color,
+        BoxWidth = BoxWidth,
+        BoxHeight = BoxHeight
+    };
 
     private static string FormatTime(double seconds)
         => TimeSpan.FromSeconds(Math.Max(0, seconds)).ToString(seconds >= 3600 ? @"h\:mm\:ss" : @"m\:ss");

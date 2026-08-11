@@ -18,6 +18,65 @@ if (args is ["--models"])
     return availableModels.Count > 0 ? 0 : 1;
 }
 
+if (args is ["--preview-smoke", var previewInput] && File.Exists(previewInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var previewAsset = await probe.ProbeAsync(Path.GetFullPath(previewInput));
+    var service = new PreviewProxyService(ffmpegLocator, processRunner);
+    var started = System.Diagnostics.Stopwatch.StartNew();
+    var segment = await service.EnsureSegmentAsync(previewAsset, Math.Min(39, previewAsset.Duration / 2));
+    var segmentAsset = await probe.ProbeAsync(segment.Path);
+    if (!File.Exists(segment.Path) || segmentAsset.Kind != MediaKind.Video || segmentAsset.Duration > 21 || !segmentAsset.HasAudio)
+    {
+        throw new InvalidOperationException("Быстрый фрагмент предпросмотра создан неверно.");
+    }
+    Console.WriteLine($"PREVIEW_SEGMENT_SMOKE_OK {segmentAsset.Duration:0.0}s in {started.Elapsed.TotalSeconds:0.0}s");
+    return 0;
+}
+
+if (args is ["--timeline-cache-smoke", var cacheInput] && File.Exists(cacheInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var cacheAsset = await probe.ProbeAsync(Path.GetFullPath(cacheInput));
+    var service = new TimelineMediaCacheService(ffmpegLocator, processRunner);
+    var started = System.Diagnostics.Stopwatch.StartNew();
+    await service.PrepareAsync(cacheAsset);
+    if (cacheAsset.TimelineFramePaths.Count < 8 || cacheAsset.TimelineFramePaths.Any(path => !File.Exists(path)) ||
+        string.IsNullOrWhiteSpace(cacheAsset.WaveformPath) || !File.Exists(cacheAsset.WaveformPath))
+    {
+        throw new InvalidOperationException("Кадры или реальная форма волны таймлайна не созданы.");
+    }
+    Console.WriteLine($"TIMELINE_CACHE_SMOKE_OK frames={cacheAsset.TimelineFramePaths.Count} waveform=yes in {started.Elapsed.TotalSeconds:0.0}s");
+    return 0;
+}
+
+if (args is ["--make-ui-project", var uiInput, var uiOutput] && File.Exists(uiInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var uiAsset = await probe.ProbeAsync(Path.GetFullPath(uiInput));
+    var uiProject = EditorProject.CreateNew();
+    uiProject.Name = "Проверка нового таймлайна";
+    uiProject.Media.Add(uiAsset);
+    var link = Guid.NewGuid();
+    uiProject.Clips.Add(new TimelineClip
+    {
+        AssetId = uiAsset.Id, Track = TrackKind.Visual, TrackIndex = 0, LinkGroupId = link,
+        Start = 0, SourceStart = 0, Duration = uiAsset.Duration
+    });
+    uiProject.Clips.Add(new TimelineClip
+    {
+        AssetId = uiAsset.Id, Track = TrackKind.Audio, TrackIndex = 0, LinkGroupId = link,
+        Start = 0, SourceStart = 0, Duration = uiAsset.Duration
+    });
+    uiProject.TextOverlays.Add(new TextOverlay
+    {
+        Start = 15, Duration = 12, Text = "Текст можно двигать и растягивать", X = 0.5, Y = 0.78
+    });
+    await File.WriteAllTextAsync(Path.GetFullPath(uiOutput), ProjectJson.Serialize(uiProject), Encoding.UTF8);
+    Console.WriteLine($"UI_PROJECT_OK {Path.GetFullPath(uiOutput)}");
+    return 0;
+}
+
 if (args is ["--history-smoke"])
 {
     var testRoot = Path.Combine(Path.GetTempPath(), "KadrStudio", "history-smoke", Guid.NewGuid().ToString("N"));
@@ -125,12 +184,14 @@ if (args is ["--export-smoke"])
         {
             Start = 0.2,
             Duration = 1.4,
-            Text = "Тест Kadr Studio",
+            Text = "Kadr Studio export\nSecond line",
             IsSubtitle = true,
             FontFamily = "Segoe UI",
             FontSize = 38,
             X = 0.5,
-            Y = 0.82
+            Y = 0.82,
+            BoxWidth = 0.72,
+            BoxHeight = 0.2
         });
 
         var exporter = new ExportService(ffmpegLocator, processRunner);

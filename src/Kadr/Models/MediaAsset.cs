@@ -8,6 +8,8 @@ public sealed class MediaAsset : ObservableObject
     private string _path = string.Empty;
     private string? _thumbnailPath;
     private string? _previewSourcePath;
+    private IReadOnlyList<string> _timelineFramePaths = Array.Empty<string>();
+    private string? _waveformPath;
     private bool _isMissing;
 
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -42,6 +44,20 @@ public sealed class MediaAsset : ObservableObject
     }
 
     [JsonIgnore]
+    public IReadOnlyList<string> TimelineFramePaths
+    {
+        get => _timelineFramePaths;
+        set => SetProperty(ref _timelineFramePaths, value ?? Array.Empty<string>());
+    }
+
+    [JsonIgnore]
+    public string? WaveformPath
+    {
+        get => _waveformPath;
+        set => SetProperty(ref _waveformPath, value);
+    }
+
+    [JsonIgnore]
     public bool IsMissing
     {
         get => _isMissing;
@@ -65,4 +81,3 @@ public sealed class MediaAsset : ObservableObject
     [JsonIgnore]
     public string ResolutionLabel => Width > 0 && Height > 0 ? $"{Width}×{Height}" : string.Empty;
 }
-

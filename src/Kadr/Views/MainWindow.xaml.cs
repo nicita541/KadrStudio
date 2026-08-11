@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -34,6 +35,9 @@ public partial class MainWindow : Window
     private bool _audioOpened;
     private Guid? _activeVisualClipId;
     private Guid? _activeAudioClipId;
+    private string? _activeVisualSourcePath;
+    private string? _activeAudioSourcePath;
+    private readonly Dictionary<Guid, PreviewSegment> _previewSegments = [];
     private readonly string? _initialProjectPath;
     private CancellationTokenSource? _analysisCancellation;
     private readonly ObservableCollection<OllamaModelInfo> _localAiModels = [];
@@ -43,6 +47,14 @@ public partial class MainWindow : Window
     private bool _useHalfQualityPreview = true;
     private AudioWorkspaceWindow? _audioWorkspaceWindow;
     private ColorWorkspaceWindow? _colorWorkspaceWindow;
+    private bool _isDraggingPreviewText;
+    private Point _previewTextDragOffset;
+    private TextOverlay? _previewDraggedOverlay;
+    private int _previewPrimeVersion;
+    private bool _isEditingPreviewText;
+    private bool _isResizingPreviewText;
+    private string _previewTextBeforeEdit = string.Empty;
+    private TextOverlay? _previewEditedOverlay;
 
     public MainWindow() : this(null)
     {
@@ -64,6 +76,8 @@ public partial class MainWindow : Window
         _playbackTimer.Tick += PlaybackTimer_Tick;
 
         TimelineEditor.ClipSelected += TimelineEditor_ClipSelected;
+        TimelineEditor.TextOverlaySelected += TimelineEditor_TextOverlaySelected;
+        TimelineEditor.TextOverlayEditRequested += TimelineEditor_TextOverlayEditRequested;
         TimelineEditor.PlayheadChanged += TimelineEditor_PlayheadChanged;
         TimelineEditor.EditStarted += TimelineEditor_EditStarted;
         TimelineEditor.EditCompleted += TimelineEditor_EditCompleted;
@@ -347,6 +361,22 @@ public partial class MainWindow : Window
     private void Split_Click(object sender, RoutedEventArgs e)
     {
         StopPlayback();
+        if (TextOverlayList.SelectedItem is TextOverlay overlay &&
+            TimelineEditor.SelectedTextOverlayId == overlay.Id &&
+            _viewModel.Playhead > overlay.Start + 0.1 && _viewModel.Playhead < overlay.End - 0.1)
+        {
+            _viewModel.BeginEdit();
+            var right = overlay.Clone();
+            right.Id = Guid.NewGuid();
+            right.Start = _viewModel.Playhead;
+            right.Duration = overlay.End - _viewModel.Playhead;
+            overlay.Duration = _viewModel.Playhead - overlay.Start;
+            _viewModel.Project.TextOverlays.Add(right);
+            _viewModel.CommitEdit("Текстовый клип разделён");
+            TextOverlayList.SelectedItem = right;
+            TimelineEditor.SelectedTextOverlayId = right.Id;
+            return;
+        }
         if (!_viewModel.SplitSelectedAtPlayhead())
         {
             _viewModel.StatusText = "Курсор должен находиться внутри выбранного клипа";
@@ -358,6 +388,16 @@ public partial class MainWindow : Window
     private void DeleteClip_Click(object sender, RoutedEventArgs e)
     {
         StopPlayback();
+        if (TextOverlayList.SelectedItem is TextOverlay overlay && TimelineEditor.SelectedTextOverlayId == overlay.Id)
+        {
+            _viewModel.BeginEdit();
+            _viewModel.Project.TextOverlays.Remove(overlay);
+            _viewModel.CommitEdit("Текст удалён");
+            TimelineEditor.SelectedTextOverlayId = null;
+            TextOverlayList.SelectedItem = null;
+            UpdateTextOverlayPreview(_viewModel.Playhead);
+            return;
+        }
         _viewModel.DeleteSelectedClip();
         TimelineEditor.SelectedClipId = null;
         _viewModel.Playhead = Math.Min(_viewModel.Playhead, _viewModel.Project.Duration);
@@ -591,6 +631,8 @@ public partial class MainWindow : Window
         _viewModel.Project.TextOverlays.Add(overlay);
         _viewModel.CommitEdit("Текст добавлен");
         TextOverlayList.SelectedItem = overlay;
+        TimelineEditor.SelectedTextOverlayId = overlay.Id;
+        TimelineEditor.SelectedClipId = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
@@ -603,6 +645,7 @@ public partial class MainWindow : Window
         _viewModel.BeginEdit();
         _viewModel.Project.TextOverlays.Remove(overlay);
         _viewModel.CommitEdit("Текст удалён");
+        TimelineEditor.SelectedTextOverlayId = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
@@ -621,6 +664,9 @@ public partial class MainWindow : Window
     {
         if (TextOverlayList.SelectedItem is TextOverlay overlay)
         {
+            TimelineEditor.SelectedTextOverlayId = overlay.Id;
+            TimelineEditor.SelectedClipId = null;
+            _viewModel.SelectedClip = null;
             SeekTo(overlay.Start);
         }
     }
@@ -645,6 +691,7 @@ public partial class MainWindow : Window
                 throw new InvalidDataException("В SRT не найдено корректных реплик.");
             }
             var offset = _viewModel.Project.InPoint ?? 0;
+            _viewModel.CreateHistoryCheckpoint("Авто: перед импортом субтитров");
             _viewModel.BeginEdit();
             foreach (var cue in cues)
             {
@@ -690,6 +737,7 @@ public partial class MainWindow : Window
             {
                 throw new InvalidOperationException("Речь не распознана. Проверьте, что в Windows установлен русский речевой пакет.");
             }
+            _viewModel.CreateHistoryCheckpoint("Авто: перед созданием автосубтитров");
             _viewModel.BeginEdit();
             foreach (var cue in cues)
             {
@@ -721,6 +769,8 @@ public partial class MainWindow : Window
         FontSize = 42,
         X = 0.5,
         Y = 0.86,
+        BoxWidth = 0.86,
+        BoxHeight = 0.16,
         Color = "#FFFFFF"
     };
 
@@ -839,6 +889,7 @@ public partial class MainWindow : Window
 
             var mappedStart = mappedMarkers.Min(marker => marker.Start);
             var mappedEnd = mappedMarkers.Max(marker => marker.End);
+            _viewModel.CreateHistoryCheckpoint("Авто: перед AI-анализом видео");
             _viewModel.ReplaceAnalysisMarkers(asset.Id, mappedStart, mappedEnd, mappedMarkers);
             TimelineEditor.InvalidateVisual();
             AnalysisSummaryTextBlock.Text = string.Join(" ",
@@ -1106,13 +1157,48 @@ public partial class MainWindow : Window
     private void TimelineEditor_ClipSelected(object? sender, ClipSelectedEventArgs e)
     {
         _viewModel.SelectedClip = e.ClipId is { } id ? _viewModel.Project.FindClip(id) : null;
+        if (e.ClipId.HasValue)
+        {
+            TextOverlayList.SelectedItem = null;
+            TimelineEditor.SelectedTextOverlayId = null;
+        }
         _audioWorkspaceWindow?.FollowSelection();
         _colorWorkspaceWindow?.FollowSelection();
     }
 
+    private void TimelineEditor_TextOverlaySelected(object? sender, TextOverlaySelectedEventArgs e)
+    {
+        var overlay = e.OverlayId is { } id
+            ? _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == id)
+            : null;
+        TextOverlayList.SelectedItem = overlay;
+        if (overlay is not null)
+        {
+            _viewModel.SelectedClip = null;
+        }
+    }
+
+    private void TimelineEditor_TextOverlayEditRequested(object? sender, TextOverlaySelectedEventArgs e)
+    {
+        var overlay = e.OverlayId is { } id
+            ? _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == id)
+            : null;
+        if (overlay is null)
+        {
+            return;
+        }
+        SetLeftPanel(showAnalysis: false, showHistory: false, showText: true);
+        TextOverlayList.SelectedItem = overlay;
+        if (_viewModel.Playhead < overlay.Start || _viewModel.Playhead >= overlay.End)
+        {
+            SeekTo(overlay.Start);
+        }
+        BeginPreviewTextEditing(overlay);
+    }
+
     private void TimelineEditor_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
-        if (_viewModel.SelectedClip is null)
+        if (_viewModel.SelectedClip is null && TimelineEditor.SelectedTextOverlayId is null)
         {
             e.Handled = true;
         }
@@ -1124,8 +1210,12 @@ public partial class MainWindow : Window
 
     private void TimelineEditor_EditCompleted(object? sender, TimelineEditEventArgs e)
     {
-        _viewModel.NormalizeSelectedClip();
-        _viewModel.CommitEdit(e.Changed ? "Клип изменён" : "Готово");
+        var editingText = TimelineEditor.SelectedTextOverlayId.HasValue;
+        if (!editingText)
+        {
+            _viewModel.NormalizeSelectedClip();
+        }
+        _viewModel.CommitEdit(e.Changed ? (editingText ? "Текстовый клип изменён" : "Клип изменён") : "Готово");
         _viewModel.Playhead = Math.Min(_viewModel.Playhead, _viewModel.Project.Duration);
         TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
@@ -1342,6 +1432,7 @@ public partial class MainWindow : Window
             .LastOrDefault(item => timelineSeconds >= item.Start && timelineSeconds < item.End);
         if (overlay is null)
         {
+            FinishPreviewTextEditing(commit: true, refresh: false);
             PreviewTextBorder.Visibility = Visibility.Collapsed;
             return;
         }
@@ -1349,6 +1440,8 @@ public partial class MainWindow : Window
         PreviewTextBlock.Text = overlay.Text;
         PreviewTextBlock.FontFamily = new FontFamily(overlay.FontFamily);
         PreviewTextBlock.FontSize = overlay.FontSize;
+        PreviewTextEditor.FontFamily = PreviewTextBlock.FontFamily;
+        PreviewTextEditor.FontSize = overlay.FontSize;
         try
         {
             PreviewTextBlock.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(overlay.Color));
@@ -1357,14 +1450,202 @@ public partial class MainWindow : Window
         {
             PreviewTextBlock.Foreground = Brushes.White;
         }
+        PreviewTextEditor.Foreground = PreviewTextBlock.Foreground;
         PreviewTextBorder.RenderTransformOrigin = new Point(0.5, 0.5);
         PreviewTextBorder.RenderTransform = new RotateTransform(overlay.Rotation);
-        PreviewTextBorder.Measure(new Size(850, 220));
-        var width = Math.Min(850, PreviewTextBorder.DesiredSize.Width);
-        var height = Math.Min(220, PreviewTextBorder.DesiredSize.Height);
+        var width = Math.Clamp(overlay.BoxWidth * 960, 80, 960);
+        var height = Math.Clamp(overlay.BoxHeight * 540, 36, 540);
+        PreviewTextBorder.Width = width;
+        PreviewTextBorder.Height = height;
         Canvas.SetLeft(PreviewTextBorder, Math.Clamp(overlay.X * 960 - width / 2, 0, 960 - width));
         Canvas.SetTop(PreviewTextBorder, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
+        var selected = TextOverlayList.SelectedItem == overlay;
+        PreviewTextSelectionOutline.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
+        PreviewTextResizeThumb.Visibility = selected && !_isEditingPreviewText ? Visibility.Visible : Visibility.Collapsed;
         PreviewTextBorder.Visibility = Visibility.Visible;
+    }
+
+    private void PreviewTextBorder_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var overlay = _viewModel.Project.TextOverlays
+            .LastOrDefault(item => _viewModel.Playhead >= item.Start && _viewModel.Playhead < item.End);
+        if (overlay is null)
+        {
+            return;
+        }
+        if (e.OriginalSource is Thumb || e.OriginalSource is TextBox)
+        {
+            return;
+        }
+        if (e.ClickCount >= 2)
+        {
+            BeginPreviewTextEditing(overlay);
+            e.Handled = true;
+            return;
+        }
+        if (_isEditingPreviewText || _isResizingPreviewText)
+        {
+            return;
+        }
+        _viewModel.BeginEdit();
+        _previewDraggedOverlay = overlay;
+        _previewTextDragOffset = e.GetPosition(PreviewTextBorder);
+        _isDraggingPreviewText = true;
+        TextOverlayList.SelectedItem = overlay;
+        TimelineEditor.SelectedTextOverlayId = overlay.Id;
+        PreviewTextBorder.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void PreviewTextBorder_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (!_isDraggingPreviewText || _previewDraggedOverlay is null || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+        var point = e.GetPosition(PreviewTextCanvas);
+        var width = Math.Max(1, PreviewTextBorder.ActualWidth);
+        var height = Math.Max(1, PreviewTextBorder.ActualHeight);
+        var left = Math.Clamp(point.X - _previewTextDragOffset.X, 0, 960 - width);
+        var top = Math.Clamp(point.Y - _previewTextDragOffset.Y, 0, 540 - height);
+        _previewDraggedOverlay.X = Math.Clamp((left + width / 2) / 960, 0, 1);
+        _previewDraggedOverlay.Y = Math.Clamp((top + height / 2) / 540, 0, 1);
+        UpdateTextOverlayPreview(_viewModel.Playhead);
+        e.Handled = true;
+    }
+
+    private void PreviewTextBorder_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (!_isDraggingPreviewText)
+        {
+            return;
+        }
+        _isDraggingPreviewText = false;
+        _previewDraggedOverlay = null;
+        PreviewTextBorder.ReleaseMouseCapture();
+        _viewModel.CommitEdit("Положение текста изменено");
+        TimelineEditor.InvalidateVisual();
+        e.Handled = true;
+    }
+
+    private void BeginPreviewTextEditing(TextOverlay overlay)
+    {
+        if (_isEditingPreviewText && _previewEditedOverlay == overlay)
+        {
+            PreviewTextEditor.Focus();
+            return;
+        }
+        FinishPreviewTextEditing(commit: true, refresh: false);
+        StopPlayback();
+        _viewModel.BeginEdit();
+        _previewEditedOverlay = overlay;
+        _previewTextBeforeEdit = overlay.Text;
+        _isEditingPreviewText = true;
+        TextOverlayList.SelectedItem = overlay;
+        TimelineEditor.SelectedTextOverlayId = overlay.Id;
+        PreviewTextEditor.Text = overlay.Text;
+        PreviewTextBlock.Visibility = Visibility.Collapsed;
+        PreviewTextEditor.Visibility = Visibility.Visible;
+        PreviewTextSelectionOutline.Visibility = Visibility.Visible;
+        PreviewTextResizeThumb.Visibility = Visibility.Collapsed;
+        PreviewTextEditor.Focus();
+        PreviewTextEditor.CaretIndex = PreviewTextEditor.Text.Length;
+    }
+
+    private void FinishPreviewTextEditing(bool commit, bool refresh = true)
+    {
+        if (!_isEditingPreviewText)
+        {
+            return;
+        }
+        var overlay = _previewEditedOverlay;
+        _isEditingPreviewText = false;
+        _previewEditedOverlay = null;
+        PreviewTextEditor.Visibility = Visibility.Collapsed;
+        PreviewTextBlock.Visibility = Visibility.Visible;
+        if (!commit && overlay is not null)
+        {
+            overlay.Text = _previewTextBeforeEdit;
+        }
+        _viewModel.CommitEdit(commit ? "Текст изменён" : "Редактирование текста отменено");
+        TimelineEditor.InvalidateVisual();
+        if (refresh)
+        {
+            UpdateTextOverlayPreview(_viewModel.Playhead);
+        }
+    }
+
+    private void PreviewTextEditor_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_isEditingPreviewText || _previewEditedOverlay is null)
+        {
+            return;
+        }
+        _previewEditedOverlay.Text = PreviewTextEditor.Text;
+        PreviewTextBlock.Text = PreviewTextEditor.Text;
+        TimelineEditor.InvalidateVisual();
+    }
+
+    private void PreviewTextEditor_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            FinishPreviewTextEditing(commit: false);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Enter && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        {
+            FinishPreviewTextEditing(commit: true);
+            e.Handled = true;
+        }
+    }
+
+    private void PreviewTextEditor_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (_isEditingPreviewText && !PreviewTextEditor.IsKeyboardFocusWithin)
+        {
+            FinishPreviewTextEditing(commit: true);
+        }
+    }
+
+    private void PreviewTextResizeThumb_DragStarted(object sender, DragStartedEventArgs e)
+    {
+        if (TextOverlayList.SelectedItem is not TextOverlay overlay)
+        {
+            return;
+        }
+        FinishPreviewTextEditing(commit: true, refresh: false);
+        _isResizingPreviewText = true;
+        _previewDraggedOverlay = overlay;
+        _viewModel.BeginEdit();
+        e.Handled = true;
+    }
+
+    private void PreviewTextResizeThumb_DragDelta(object sender, DragDeltaEventArgs e)
+    {
+        if (!_isResizingPreviewText || _previewDraggedOverlay is null)
+        {
+            return;
+        }
+        var width = Math.Clamp(PreviewTextBorder.Width + e.HorizontalChange, 80, 960);
+        var height = Math.Clamp(PreviewTextBorder.Height + e.VerticalChange, 36, 540);
+        _previewDraggedOverlay.BoxWidth = width / 960;
+        _previewDraggedOverlay.BoxHeight = height / 540;
+        UpdateTextOverlayPreview(_viewModel.Playhead);
+        e.Handled = true;
+    }
+
+    private void PreviewTextResizeThumb_DragCompleted(object sender, DragCompletedEventArgs e)
+    {
+        if (!_isResizingPreviewText)
+        {
+            return;
+        }
+        _isResizingPreviewText = false;
+        _previewDraggedOverlay = null;
+        _viewModel.CommitEdit("Размер текстового блока изменён");
+        TimelineEditor.InvalidateVisual();
+        e.Handled = true;
     }
 
     private TimelineClip? FindActiveClip(TrackKind track, double time)
@@ -1387,6 +1668,7 @@ public partial class MainWindow : Window
         if (clip is null)
         {
             _activeVisualClipId = null;
+            _activeVisualSourcePath = null;
             PreviewMedia.Stop();
             PreviewMedia.Source = null;
             PreviewMedia.Visibility = Visibility.Collapsed;
@@ -1422,30 +1704,43 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!TryResolvePreviewSource(asset, sourcePosition, out var sourcePath, out var mediaPosition))
+        {
+            PreviewMedia.Stop();
+            PreviewMedia.Source = null;
+            PreviewMedia.Visibility = Visibility.Collapsed;
+            if (!string.IsNullOrWhiteSpace(asset.ThumbnailPath) && File.Exists(asset.ThumbnailPath))
+            {
+                PreviewImage.Source = LoadBitmap(asset.ThumbnailPath);
+                PreviewImage.Visibility = Visibility.Visible;
+            }
+            return;
+        }
+
         PreviewImage.Visibility = Visibility.Collapsed;
         PreviewMedia.Visibility = Visibility.Visible;
         var hasLinkedAudio = clip.LinkGroupId is Guid linkGroupId &&
                              _viewModel.Project.Clips.Any(item => item.Track == TrackKind.Audio && item.LinkGroupId == linkGroupId);
         PreviewMedia.IsMuted = clip.IsMuted || hasLinkedAudio;
         PreviewMedia.Volume = Math.Clamp(clip.Volume, 0, 1);
-        if (_activeVisualClipId != clip.Id)
+        if (_activeVisualClipId != clip.Id || !string.Equals(_activeVisualSourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
         {
             _activeVisualClipId = clip.Id;
+            _activeVisualSourcePath = sourcePath;
             _videoOpened = false;
-            _pendingVideoPosition = sourcePosition;
+            _pendingVideoPosition = mediaPosition;
             PreviewMedia.Stop();
-            var sourcePath = _useHalfQualityPreview ? asset.PreviewSourcePath ?? asset.Path : asset.Path;
             PreviewMedia.Source = new Uri(sourcePath, UriKind.Absolute);
-            if (_useHalfQualityPreview && string.Equals(sourcePath, asset.Path, StringComparison.OrdinalIgnoreCase))
-            {
-                _ = EnsureHalfQualityPreviewAsync(asset);
-            }
             return;
         }
 
-        if (_videoOpened && (forceSeek || Math.Abs(PreviewMedia.Position.TotalSeconds - sourcePosition) > 0.38))
+        if (_videoOpened && (forceSeek || Math.Abs(PreviewMedia.Position.TotalSeconds - mediaPosition) > 0.38))
         {
-            PreviewMedia.Position = TimeSpan.FromSeconds(sourcePosition);
+            PreviewMedia.Position = TimeSpan.FromSeconds(mediaPosition);
+            if (!_isPlaying)
+            {
+                PrimePausedPreviewFrame();
+            }
         }
     }
 
@@ -1454,6 +1749,7 @@ public partial class MainWindow : Window
         if (clip is null)
         {
             _activeAudioClipId = null;
+            _activeAudioSourcePath = null;
             _audioOpened = false;
             PreviewAudio.Stop();
             PreviewAudio.Source = null;
@@ -1472,21 +1768,54 @@ public partial class MainWindow : Window
         PreviewAudio.Volume = Math.Clamp(clip.Volume, 0, 1);
         PreviewAudio.Balance = Math.Clamp(clip.Pan, -1, 1);
 
-        if (_activeAudioClipId != clip.Id)
+        if (!TryResolvePreviewSource(asset, sourcePosition, out var sourcePath, out var mediaPosition))
+        {
+            PreviewAudio.Stop();
+            PreviewAudio.Source = null;
+            return;
+        }
+
+        if (_activeAudioClipId != clip.Id || !string.Equals(_activeAudioSourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
         {
             _activeAudioClipId = clip.Id;
+            _activeAudioSourcePath = sourcePath;
             _audioOpened = false;
-            _pendingAudioPosition = sourcePosition;
+            _pendingAudioPosition = mediaPosition;
             PreviewAudio.Stop();
-            var sourcePath = _useHalfQualityPreview ? asset.PreviewSourcePath ?? asset.Path : asset.Path;
             PreviewAudio.Source = new Uri(sourcePath, UriKind.Absolute);
             return;
         }
 
-        if (_audioOpened && (forceSeek || Math.Abs(PreviewAudio.Position.TotalSeconds - sourcePosition) > 0.38))
+        if (_audioOpened && (forceSeek || Math.Abs(PreviewAudio.Position.TotalSeconds - mediaPosition) > 0.38))
         {
-            PreviewAudio.Position = TimeSpan.FromSeconds(sourcePosition);
+            PreviewAudio.Position = TimeSpan.FromSeconds(mediaPosition);
         }
+    }
+
+    private bool TryResolvePreviewSource(MediaAsset asset, double sourcePosition, out string sourcePath, out double mediaPosition)
+    {
+        if (!_useHalfQualityPreview)
+        {
+            sourcePath = asset.Path;
+            mediaPosition = sourcePosition;
+            return true;
+        }
+        if (_previewSegments.TryGetValue(asset.Id, out var previewSegment) &&
+            previewSegment.Contains(asset.Id, sourcePosition) && File.Exists(previewSegment.Path))
+        {
+            sourcePath = previewSegment.Path;
+            mediaPosition = Math.Max(0, sourcePosition - previewSegment.SourceStart);
+            if (previewSegment.SourceEnd - sourcePosition < 4 && sourcePosition + 5 < asset.Duration)
+            {
+                _ = EnsureHalfQualityPreviewAsync(asset, sourcePosition + 5);
+            }
+            return true;
+        }
+
+        sourcePath = string.Empty;
+        mediaPosition = 0;
+        _ = EnsureHalfQualityPreviewAsync(asset, sourcePosition);
+        return false;
     }
 
     private void PreviewMedia_MediaOpened(object sender, RoutedEventArgs e)
@@ -1498,6 +1827,17 @@ public partial class MainWindow : Window
             PreviewMedia.Play();
         }
         else
+        {
+            PrimePausedPreviewFrame();
+        }
+    }
+
+    private async void PrimePausedPreviewFrame()
+    {
+        var version = ++_previewPrimeVersion;
+        PreviewMedia.Play();
+        await Task.Delay(120);
+        if (version == _previewPrimeVersion && !_isPlaying)
         {
             PreviewMedia.Pause();
         }
@@ -1545,44 +1885,42 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!string.Equals(asset.PreviewSourcePath, asset.Path, StringComparison.OrdinalIgnoreCase))
-        {
-            _viewModel.StatusText = $"Не удалось воспроизвести {asset.Name}: {playbackError?.Message}";
-            return;
-        }
-
-        _isPreparingPreview = true;
         PausePlayback();
         try
         {
-            await _viewModel.EnsurePreviewAsync(asset);
-            _activeVisualClipId = null;
-            _activeAudioClipId = null;
-            UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+            _useHalfQualityPreview = true;
+            PreviewQualityComboBox.SelectedIndex = 0;
+            var active = FindActiveClip(TrackKind.Visual, _viewModel.Playhead) ?? FindActiveClip(TrackKind.Audio, _viewModel.Playhead);
+            var sourcePosition = active is null
+                ? 0
+                : active.SourceStart + Math.Max(0, _viewModel.Playhead - active.Start);
+            await EnsureHalfQualityPreviewAsync(asset, sourcePosition);
         }
         catch (Exception exception)
         {
             ShowError("Не удалось подготовить предпросмотр", exception);
         }
-        finally
-        {
-            _isPreparingPreview = false;
-        }
     }
 
-    private async Task EnsureHalfQualityPreviewAsync(MediaAsset asset)
+    private async Task EnsureHalfQualityPreviewAsync(MediaAsset asset, double sourcePosition = 0)
     {
-        if (_isPreparingPreview || asset.Kind == MediaKind.Image)
+        if (asset.Kind == MediaKind.Image ||
+            (_previewSegments.TryGetValue(asset.Id, out var existing) && existing.Contains(asset.Id, sourcePosition)) ||
+            _isPreparingPreview)
         {
             return;
         }
         _isPreparingPreview = true;
+        _viewModel.StatusText = $"Быстрый предпросмотр {FormatEditorTime(sourcePosition)}…";
         try
         {
-            await _viewModel.EnsurePreviewAsync(asset);
+            _previewSegments[asset.Id] = await _viewModel.PreviewProxyService.EnsureSegmentAsync(asset, sourcePosition);
             _activeVisualClipId = null;
             _activeAudioClipId = null;
+            _activeVisualSourcePath = null;
+            _activeAudioSourcePath = null;
             UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+            _viewModel.StatusText = "Предпросмотр готов";
         }
         catch (Exception exception)
         {
@@ -1603,11 +1941,14 @@ public partial class MainWindow : Window
         _useHalfQualityPreview = (PreviewQualityComboBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() != "Original";
         _activeVisualClipId = null;
         _activeAudioClipId = null;
+        _activeVisualSourcePath = null;
+        _activeAudioSourcePath = null;
         var active = FindActiveClip(TrackKind.Visual, _viewModel.Playhead) ?? FindActiveClip(TrackKind.Audio, _viewModel.Playhead);
         var asset = active is null ? null : _viewModel.Project.FindAsset(active.AssetId);
         if (_useHalfQualityPreview && asset is not null)
         {
-            await EnsureHalfQualityPreviewAsync(asset);
+            var sourcePosition = active!.SourceStart + Math.Max(0, _viewModel.Playhead - active.Start);
+            await EnsureHalfQualityPreviewAsync(asset, sourcePosition);
         }
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         _viewModel.StatusText = _useHalfQualityPreview ? "Предпросмотр: 1/2 качества" : "Предпросмотр: оригинал";
@@ -1659,6 +2000,8 @@ public partial class MainWindow : Window
     {
         _activeVisualClipId = null;
         _activeAudioClipId = null;
+        _activeVisualSourcePath = null;
+        _activeAudioSourcePath = null;
         _videoOpened = false;
         _audioOpened = false;
         TimelineEditor.Project = _viewModel.Project;

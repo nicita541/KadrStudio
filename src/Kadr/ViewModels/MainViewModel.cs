@@ -40,6 +40,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
         ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
         PreviewProxyService = new PreviewProxyService(_ffmpegLocator, _processRunner);
+        TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
         ExportService = new ExportService(_ffmpegLocator, _processRunner);
         ProjectHistoryService = new ProjectHistoryService();
         AutoSubtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
@@ -52,6 +53,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public MediaProbeService MediaProbeService { get; }
     public ThumbnailService ThumbnailService { get; }
     public PreviewProxyService PreviewProxyService { get; }
+    public TimelineMediaCacheService TimelineMediaCacheService { get; }
     public ExportService ExportService { get; }
     public ProjectHistoryService ProjectHistoryService { get; }
     public AutoSubtitleService AutoSubtitleService { get; }
@@ -208,6 +210,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     var asset = await MediaProbeService.ProbeAsync(path, cancellationToken);
                     asset.ThumbnailPath = await ThumbnailService.CreateAsync(asset, cancellationToken);
                     Project.Media.Add(asset);
+                    PrepareTimelineMedia(asset);
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
@@ -1030,6 +1033,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         foreach (var overlay in project.TextOverlays)
         {
             SubscribeTextOverlay(overlay);
+        }
+        foreach (var asset in project.Media)
+        {
+            PrepareTimelineMedia(asset);
+        }
+    }
+
+    private async void PrepareTimelineMedia(MediaAsset asset)
+    {
+        try
+        {
+            await TimelineMediaCacheService.PrepareAsync(asset);
+        }
+        catch
+        {
+            // Монтаж остаётся доступным, даже если FFmpeg не смог построить визуальный кэш дорожки.
         }
     }
 

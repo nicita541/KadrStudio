@@ -1,0 +1,122 @@
+<Window x:Class="KadrStudio.Views.ProjectHistoryWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="История проекта — Kadr Studio"
+        Width="680"
+        Height="560"
+        MinWidth="560"
+        MinHeight="420"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource WindowBrush}"
+        Foreground="{StaticResource TextBrush}">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,15">
+            <TextBlock Text="История проекта" FontSize="22" FontWeight="SemiBold" />
+            <TextBlock Text="Контрольные точки похожи на коммиты Git: дайте версии имя, продолжайте монтаж и возвращайтесь к ней при необходимости."
+                       Foreground="{StaticResource MutedTextBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,5,0,0" />
+        </StackPanel>
+
+        <Grid Grid.Row="1" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="8" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="CheckpointMessageTextBox"
+                     VerticalContentAlignment="Center"
+                     MaxLength="160"
+                     ToolTip="Например: до удаления опенинга"
+                     Text="Новая версия" />
+            <Button Grid.Column="2"
+                    Style="{StaticResource AccentButton}"
+                    Click="CreateCheckpoint_Click"
+                    Padding="14,8"
+                    Content="Создать точку" />
+        </Grid>
+
+        <Border Grid.Row="2"
+                Background="{StaticResource PanelBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="1"
+                CornerRadius="7">
+            <Grid>
+                <TextBlock x:Name="EmptyHistoryTextBlock"
+                           Text="История пока пуста. Создайте первую контрольную точку перед важным изменением."
+                           Foreground="{StaticResource MutedTextBrush}"
+                           TextWrapping="Wrap"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           TextAlignment="Center"
+                           MaxWidth="360" />
+                <ListBox x:Name="HistoryListBox"
+                         Background="Transparent"
+                         BorderThickness="0"
+                         SelectionMode="Single"
+                         MouseDoubleClick="HistoryListBox_MouseDoubleClick">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="10,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="12" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Width="30" Height="30" CornerRadius="15" Background="#34284E">
+                                    <TextBlock Text="&#xE81C;"
+                                               FontFamily="Segoe MDL2 Assets"
+                                               Foreground="#CBB8FF"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center" />
+                                </Border>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock Text="{Binding Message}"
+                                               FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding CreatedLabel}"
+                                               Foreground="{StaticResource MutedTextBrush}"
+                                               FontSize="10"
+                                               Margin="0,3,0,0" />
+                                </StackPanel>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="3" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="8" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button Style="{StaticResource AccentButton}"
+                    Click="RestoreCheckpoint_Click"
+                    Padding="14,8"
+                    Content="Вернуться к выбранной" />
+            <Button Grid.Column="2"
+                    Style="{StaticResource ButtonBase}"
+                    Click="DeleteCheckpoint_Click"
+                    Foreground="#FFBBC2"
+                    BorderBrush="#70404A"
+                    Padding="12,8"
+                    Content="Удалить точку" />
+            <Button Grid.Column="4"
+                    Style="{StaticResource ButtonBase}"
+                    Click="Close_Click"
+                    Padding="14,8"
+                    Content="Закрыть" />
+        </Grid>
+    </Grid>
+</Window>

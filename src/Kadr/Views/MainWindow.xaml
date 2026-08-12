@@ -28,7 +28,7 @@
             <RowDefinition Height="26" />
         </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="72" />
+            <ColumnDefinition Width="76" />
             <ColumnDefinition Width="300" MinWidth="210" MaxWidth="440" />
             <ColumnDefinition Width="6" />
             <ColumnDefinition Width="*" />
@@ -145,22 +145,22 @@
         <!-- Навигация -->
         <Border Grid.Row="1" Grid.Column="0" Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
             <StackPanel Margin="0,8">
-                <Button x:Name="MediaNavButton" Style="{StaticResource NavButton}" Background="#34284E" ToolTip="Ваши медиа" Click="ShowMedia_Click">
+                <Button x:Name="MediaNavButton" Style="{StaticResource NavButton}" Tag="Selected" ToolTip="Ваши медиа" Click="ShowMedia_Click">
                     <StackPanel>
-                        <TextBlock Text="&#xE8B7;" FontFamily="Segoe MDL2 Assets" FontSize="20" HorizontalAlignment="Center" />
-                        <TextBlock Text="Медиа" FontSize="10" HorizontalAlignment="Center" Margin="0,4,0,0" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M3,5 L8,5 L10,7 L21,7 L21,19 L3,19 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" Fill="Transparent" StrokeLineJoin="Round"/><Path Data="M7,16 L11,12 L14,15 L17,11 L21,16" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.5" Fill="Transparent"/></Canvas></Viewbox>
+                        <TextBlock Text="Медиа" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
                 <Button x:Name="AnalysisNavButton" Style="{StaticResource NavButton}" ToolTip="Локальный анализ видео" Click="ShowAnalysis_Click">
                     <StackPanel>
-                        <TextBlock Text="&#xE9D9;" FontFamily="Segoe MDL2 Assets" FontSize="20" HorizontalAlignment="Center" />
-                        <TextBlock Text="Анализ" FontSize="10" HorizontalAlignment="Center" Margin="0,4,0,0" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M3,18 L7,14 L10,16 L14,8 L18,12 L21,5" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/><Path Data="M3,21 L21,21" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.5"/></Canvas></Viewbox>
+                        <TextBlock Text="Анализ" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
                 <Button x:Name="HistoryNavButton" Style="{StaticResource NavButton}" ToolTip="История версий проекта" Click="ShowHistory_Click">
                     <StackPanel>
-                        <TextBlock Text="&#xE81C;" FontFamily="Segoe MDL2 Assets" FontSize="20" HorizontalAlignment="Center" />
-                        <TextBlock Text="История" FontSize="9" HorizontalAlignment="Center" Margin="0,4,0,0" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M5,7 A8,8 0 1 1 4,15" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" Fill="Transparent"/><Path Data="M5,3 L5,8 L10,8 M12,7 L12,12 L16,14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Canvas></Viewbox>
+                        <TextBlock Text="История" FontSize="9" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
                 <Button Style="{StaticResource NavButton}" IsEnabled="False" Visibility="Collapsed" ToolTip="Будет добавлено в следующей версии">
@@ -171,8 +171,8 @@
                 </Button>
                 <Button x:Name="TextNavButton" Style="{StaticResource NavButton}" ToolTip="Текст и автосубтитры" Click="ShowText_Click">
                     <StackPanel>
-                        <TextBlock Text="T" FontSize="20" FontWeight="Bold" HorizontalAlignment="Center" />
-                        <TextBlock Text="Текст" FontSize="10" HorizontalAlignment="Center" Margin="0,4,0,0" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M4,5 L20,5 M12,5 L12,20 M8,20 L16,20" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Canvas></Viewbox>
+                        <TextBlock Text="Текст" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
                 <Button Style="{StaticResource NavButton}" IsEnabled="False" Visibility="Collapsed" ToolTip="Будет добавлено в следующей версии">
@@ -303,7 +303,9 @@
                     <ComboBox x:Name="AnalysisAssetComboBox"
                               ItemsSource="{Binding Project.Media}"
                               SelectedItem="{Binding SelectedAsset}"
-                              DisplayMemberPath="Name" />
+                              TextSearch.TextPath="Name">
+                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" /></DataTemplate></ComboBox.ItemTemplate>
+                    </ComboBox>
                 </StackPanel>
 
                 <StackPanel Grid.Row="2" Margin="0,0,0,10">
@@ -734,12 +736,12 @@
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" HorizontalAlignment="Right" Text="{Binding PlayheadLabel}" FontFamily="Consolas" FontSize="12" Margin="0,0,13,0" />
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
-                    <Button Style="{StaticResource IconButton}" Click="PreviousFrame_Click" ToolTip="Назад" Content="&#xE892;" Margin="0,0,7,0" />
-                    <Button x:Name="PlayPauseButton" Style="{StaticResource IconButton}" Click="PlayPause_Click" ToolTip="Воспроизведение (Пробел)" Content="&#xE768;" Width="44" Height="44" FontSize="20" />
-                    <Button Style="{StaticResource IconButton}" Click="NextFrame_Click" ToolTip="Вперёд" Content="&#xE893;" Margin="7,0,0,0" />
-                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomOut_Click" ToolTip="Отдалить предпросмотр" Content="&#xE738;" Margin="14,7,3,7" />
+                    <Button Style="{StaticResource IconButton}" Click="PreviousFrame_Click" ToolTip="Предыдущий кадр" Content="❮" FontFamily="Segoe UI Symbol" FontSize="18" Margin="0,0,7,0" />
+                    <Button x:Name="PlayPauseButton" Style="{StaticResource IconButton}" Click="PlayPause_Click" ToolTip="Воспроизведение (Пробел)" Content="▶" FontFamily="Segoe UI Symbol" Width="44" Height="44" FontSize="19" />
+                    <Button Style="{StaticResource IconButton}" Click="NextFrame_Click" ToolTip="Следующий кадр" Content="❯" FontFamily="Segoe UI Symbol" FontSize="18" Margin="7,0,0,0" />
+                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomOut_Click" ToolTip="Отдалить предпросмотр" Content="−" FontFamily="Segoe UI" FontWeight="Bold" Margin="14,7,3,7" />
                     <TextBlock x:Name="PreviewZoomLabel" Text="100%" Foreground="{StaticResource MutedTextBrush}" FontSize="10" VerticalAlignment="Center" Width="38" TextAlignment="Center" />
-                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomIn_Click" ToolTip="Приблизить предпросмотр" Content="&#xE710;" Margin="3,7,12,7" />
+                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomIn_Click" ToolTip="Приблизить предпросмотр" Content="+" FontFamily="Segoe UI" FontWeight="Bold" Margin="3,7,12,7" />
                     <ComboBox x:Name="PreviewQualityComboBox"
                               Width="105"
                               Height="30"
@@ -912,6 +914,7 @@
                               HorizontalScrollBarVisibility="Auto"
                               VerticalScrollBarVisibility="Auto"
                               PanningMode="Both"
+                              ScrollChanged="TimelineScrollViewer_ScrollChanged"
                               PreviewMouseWheel="TimelineScrollViewer_PreviewMouseWheel">
                     <controls:TimelineControl x:Name="TimelineEditor"
                                               ContextMenuOpening="TimelineEditor_ContextMenuOpening">

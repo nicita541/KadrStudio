@@ -58,6 +58,8 @@ public partial class MainWindow : Window
     private Rect _previewTextResizeStartBounds;
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
+    private CancellationTokenSource? _stillPreviewCancellation;
+    private int _stillPreviewVersion;
 
     public MainWindow() : this(null)
     {
@@ -548,10 +550,10 @@ public partial class MainWindow : Window
         AnalysisPanel.Visibility = showAnalysis ? Visibility.Visible : Visibility.Collapsed;
         HistoryPanel.Visibility = showHistory ? Visibility.Visible : Visibility.Collapsed;
         TextPanel.Visibility = showText ? Visibility.Visible : Visibility.Collapsed;
-        MediaNavButton.Background = showAnalysis || showHistory || showText ? Brushes.Transparent : new SolidColorBrush(Color.FromRgb(52, 40, 78));
-        AnalysisNavButton.Background = showAnalysis ? new SolidColorBrush(Color.FromRgb(52, 40, 78)) : Brushes.Transparent;
-        HistoryNavButton.Background = showHistory ? new SolidColorBrush(Color.FromRgb(52, 40, 78)) : Brushes.Transparent;
-        TextNavButton.Background = showText ? new SolidColorBrush(Color.FromRgb(52, 40, 78)) : Brushes.Transparent;
+        MediaNavButton.Tag = showAnalysis || showHistory || showText ? null : "Selected";
+        AnalysisNavButton.Tag = showAnalysis ? "Selected" : null;
+        HistoryNavButton.Tag = showHistory ? "Selected" : null;
+        TextNavButton.Tag = showText ? "Selected" : null;
     }
 
     private void RefreshInlineHistory(Guid? selectedId = null)
@@ -1344,6 +1346,13 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
+    private void TimelineScrollViewer_ScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        TimelineEditor.HorizontalViewportOffset = e.HorizontalOffset;
+        TimelineEditor.HorizontalViewportWidth = TimelineScrollViewer.ViewportWidth;
+        TimelineEditor.InvalidateVisual();
+    }
+
     private void StartPlayback()
     {
         if (_viewModel.Project.Duration <= 0)
@@ -1369,7 +1378,7 @@ public partial class MainWindow : Window
             PreviewAudio.Play();
         }
         _playbackTimer.Start();
-        PlayPauseButton.Content = "\uE769";
+        PlayPauseButton.Content = "Ⅱ";
     }
 
     private void PausePlayback()
@@ -1385,7 +1394,7 @@ public partial class MainWindow : Window
         PreviewMedia.Pause();
         PreviewAudio.Pause();
         UpdateAudioMeters(null);
-        PlayPauseButton.Content = "\uE768";
+        PlayPauseButton.Content = "▶";
     }
 
     private void StopPlayback()
@@ -1436,6 +1445,30 @@ public partial class MainWindow : Window
         var audioClip = FindActiveClip(TrackKind.Audio, timelineSeconds);
         UpdateAudioPreview(audioClip, timelineSeconds, forceSeek);
         UpdateTextOverlayPreview(timelineSeconds);
+    }
+
+    private async Task UpdatePausedStillFrameAsync(MediaAsset asset, double sourcePosition)
+    {
+        var version = ++_stillPreviewVersion;
+        _stillPreviewCancellation?.Cancel();
+        _stillPreviewCancellation?.Dispose();
+        _stillPreviewCancellation = new CancellationTokenSource();
+        try
+        {
+            var path = await _viewModel.PreviewProxyService.EnsureStillFrameAsync(
+                asset, sourcePosition, _stillPreviewCancellation.Token);
+            if (version != _stillPreviewVersion || _isPlaying) return;
+            PreviewImage.Source = LoadBitmap(path);
+            PreviewImage.Visibility = Visibility.Visible;
+            PreviewMedia.Visibility = Visibility.Collapsed;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            if (version == _stillPreviewVersion) _viewModel.StatusText = $"Кадр предпросмотра недоступен: {exception.Message}";
+        }
     }
 
     private void UpdateTextOverlayPreview(double timelineSeconds)
@@ -1786,6 +1819,21 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!_isPlaying)
+        {
+            if (forceSeek || PreviewImage.Source is null || _activeVisualClipId != clip.Id)
+            {
+                _activeVisualClipId = clip.Id;
+                _ = UpdatePausedStillFrameAsync(asset, sourcePosition);
+            }
+            if (PreviewImage.Source is not null)
+            {
+                PreviewImage.Visibility = Visibility.Visible;
+                PreviewMedia.Visibility = Visibility.Collapsed;
+            }
+            return;
+        }
+
         if (!TryResolvePreviewSource(asset, sourcePosition, out var sourcePath, out var mediaPosition))
         {
             PreviewMedia.Stop();
@@ -2080,6 +2128,8 @@ public partial class MainWindow : Window
 
     private void ResetPreviewState()
     {
+        _stillPreviewCancellation?.Cancel();
+        PreviewImage.Source = null;
         _activeVisualClipId = null;
         _activeAudioClipId = null;
         _activeVisualSourcePath = null;

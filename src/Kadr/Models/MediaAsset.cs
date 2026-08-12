@@ -10,6 +10,7 @@ public sealed class MediaAsset : ObservableObject
     private string? _previewSourcePath;
     private IReadOnlyList<string> _timelineFramePaths = Array.Empty<string>();
     private string? _waveformPath;
+    private IReadOnlyList<float> _waveformPeaks = Array.Empty<float>();
     private bool _isMissing;
 
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -55,6 +56,13 @@ public sealed class MediaAsset : ObservableObject
     {
         get => _waveformPath;
         set => SetProperty(ref _waveformPath, value);
+    }
+
+    [JsonIgnore]
+    public IReadOnlyList<float> WaveformPeaks
+    {
+        get => _waveformPeaks;
+        set => SetProperty(ref _waveformPeaks, value ?? Array.Empty<float>());
     }
 
     [JsonIgnore]

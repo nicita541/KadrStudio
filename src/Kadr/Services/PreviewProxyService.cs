@@ -6,6 +6,37 @@ public sealed class PreviewProxyService(FfmpegLocator locator, ProcessRunner pro
 {
     private readonly string _cacheDirectory = ThumbnailService.CreateCacheDirectory("Proxies");
     private readonly string _segmentDirectory = ThumbnailService.CreateCacheDirectory("PreviewSegments");
+    private readonly string _stillDirectory = ThumbnailService.CreateCacheDirectory("PreviewStills");
+
+    public async Task<string> EnsureStillFrameAsync(
+        MediaAsset asset,
+        double sourcePosition,
+        CancellationToken cancellationToken = default)
+    {
+        locator.EnsureAvailable();
+        var frameBucket = Math.Max(0, (int)Math.Round(sourcePosition * 10));
+        var outputPath = Path.Combine(_stillDirectory,
+            $"{ThumbnailService.BuildCacheKey(asset.Path)}-{frameBucket:00000000}-v2.jpg");
+        if (File.Exists(outputPath) && new FileInfo(outputPath).Length > 512) return outputPath;
+        var temporaryPath = outputPath + $"-{Guid.NewGuid():N}.tmp.jpg";
+        try
+        {
+            var result = await processRunner.RunAsync(locator.FfmpegPath,
+                [
+                    "-hide_banner", "-loglevel", "error", "-y", "-ss", Format(sourcePosition), "-i", asset.Path,
+                    "-frames:v", "1", "-vf", "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+                    "-q:v", "3", temporaryPath
+                ], cancellationToken: cancellationToken);
+            if (result.ExitCode != 0 || !File.Exists(temporaryPath))
+                throw new InvalidOperationException($"Не удалось получить кадр предпросмотра.\n{LastMeaningfulLine(result.StandardError)}");
+            File.Move(temporaryPath, outputPath, overwrite: true);
+            return outputPath;
+        }
+        finally
+        {
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); } catch { }
+        }
+    }
 
     public async Task<PreviewSegment> EnsureSegmentAsync(
         MediaAsset asset,

@@ -6,6 +6,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using KadrStudio.Models;
+using KadrStudio.Services;
 
 namespace KadrStudio.Controls;
 
@@ -136,6 +137,9 @@ public sealed class TimelineControl : FrameworkElement
         }
     }
 
+    public double HorizontalViewportOffset { get; set; }
+    public double HorizontalViewportWidth { get; set; }
+
     protected override Size MeasureOverride(Size availableSize)
     {
         var duration = Math.Max(1, Project?.TimelineDisplayDuration ?? 0);
@@ -177,6 +181,7 @@ public sealed class TimelineControl : FrameworkElement
         DrawSemanticFlags(context, dpi);
         DrawInOutSelection(context, dpi);
         DrawPlayhead(context);
+        DrawStickyHeaders(context, dpi);
     }
 
     protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
@@ -590,10 +595,6 @@ public sealed class TimelineControl : FrameworkElement
             4,
             4);
         var hasClips = Project?.Clips.Any(clip => clip.Track == kind && clip.TrackIndex == index) ?? false;
-        var accent = kind == TrackKind.Visual ? Color.FromRgb(89, 145, 245) : Color.FromRgb(55, 190, 128);
-        context.DrawText(
-            CreateText($"{(kind == TrackKind.Visual ? "V" : "A")}{index + 1}", 10, accent, dpi, FontWeights.SemiBold),
-            new Point(14, top + 18));
         if (!hasClips)
         {
             var last = index == GetTrackCount(kind) - 1;
@@ -611,8 +612,28 @@ public sealed class TimelineControl : FrameworkElement
             new Rect(LeftGutterWidth, top, Math.Max(0, RenderSize.Width - LeftGutterWidth - 7), TrackHeight),
             4,
             4);
-        context.DrawText(CreateText("T1", 10, Color.FromRgb(216, 180, 254), dpi, FontWeights.SemiBold),
-            new Point(14, top + 18));
+    }
+
+    private void DrawStickyHeaders(DrawingContext context, double dpi)
+    {
+        var left = Math.Clamp(HorizontalViewportOffset, 0, Math.Max(0, RenderSize.Width - LeftGutterWidth));
+        context.DrawRectangle(new SolidColorBrush(Color.FromRgb(20, 21, 26)), null,
+            new Rect(left, 0, LeftGutterWidth, RulerHeight));
+        context.DrawLine(_gridPen, new Point(left + LeftGutterWidth, 0), new Point(left + LeftGutterWidth, RenderSize.Height));
+        var visibleTime = Math.Max(0, HorizontalViewportOffset / PixelsPerSecond);
+        context.DrawText(CreateText(FormatRulerTime(visibleTime), 9.5, Color.FromRgb(167, 168, 176), dpi), new Point(left + 8, 1));
+        if (HasTextTrack) DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254), dpi);
+        for (var index = 0; index < GetTrackCount(TrackKind.Visual); index++)
+            DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Visual, index), $"V{index + 1}", Color.FromRgb(89, 145, 245), dpi);
+        for (var index = 0; index < GetTrackCount(TrackKind.Audio); index++)
+            DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Audio, index), $"A{index + 1}", Color.FromRgb(55, 190, 128), dpi);
+    }
+
+    private void DrawStickyTrackHeader(DrawingContext context, double left, double top, string label, Color color, double dpi)
+    {
+        context.DrawRectangle(new SolidColorBrush(Color.FromRgb(15, 16, 20)), null,
+            new Rect(left, top, LeftGutterWidth, TrackHeight));
+        context.DrawText(CreateText(label, 10, color, dpi, FontWeights.SemiBold), new Point(left + 14, top + 18));
     }
 
     private void DrawClips(DrawingContext context, double dpi)
@@ -624,7 +645,11 @@ public sealed class TimelineControl : FrameworkElement
         foreach (var clip in Project.Clips.OrderBy(item => item.Track).ThenBy(item => item.TrackIndex).ThenBy(item => item.Start))
         {
             var rectangle = GetClipRectangle(clip);
-            if (rectangle.Right < LeftGutterWidth || rectangle.Left > RenderSize.Width)
+            var visibleLeft = HorizontalViewportOffset + LeftGutterWidth;
+            var visibleRight = HorizontalViewportWidth > 0
+                ? HorizontalViewportOffset + HorizontalViewportWidth
+                : RenderSize.Width;
+            if (rectangle.Right < visibleLeft || rectangle.Left > visibleRight)
             {
                 continue;
             }
@@ -681,10 +706,13 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
 
-        context.PushClip(new RectangleGeometry(rectangle));
+        var visible = GetVisibleContentRectangle(rectangle, 1);
+        if (visible.IsEmpty) return;
+        context.PushClip(new RectangleGeometry(visible));
         context.PushOpacity(0.88);
         const double tileWidth = 82;
-        for (var left = rectangle.Left; left < rectangle.Right; left += tileWidth)
+        var firstTile = rectangle.Left + Math.Floor((visible.Left - rectangle.Left) / tileWidth) * tileWidth;
+        for (var left = firstTile; left < visible.Right; left += tileWidth)
         {
             var center = Math.Min(rectangle.Right, left + tileWidth / 2);
             var localRatio = rectangle.Width <= 0 ? 0 : (center - rectangle.Left) / rectangle.Width;
@@ -813,6 +841,39 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawWaveform(DrawingContext context, TimelineClip clip, MediaAsset? asset, Rect rectangle, double dpi)
     {
+        if (asset is { WaveformPeaks.Count: > 0 })
+        {
+            var wholeWaveformArea = new Rect(rectangle.Left + 4, rectangle.Top + 21,
+                Math.Max(0, rectangle.Width - 8), Math.Max(0, rectangle.Height - 26));
+            var waveformArea = GetVisibleContentRectangle(wholeWaveformArea, 3);
+            if (waveformArea.IsEmpty) return;
+            context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(74, 5, 48, 35)), null,
+                waveformArea, 3, 3);
+
+            // Адаптивная плотность: около 100 отдельных столбиков в видимой части клипа.
+            // При увеличении таймлайна каждый столбик охватывает меньший фрагмент исходного звука.
+            var columnCount = Math.Max(1, Math.Min(120, (int)Math.Ceiling(waveformArea.Width / 3.2)));
+            var step = waveformArea.Width / columnCount;
+            var barWidth = Math.Max(1, Math.Min(2.2, step * 0.62));
+            var visibleClipStartRatio = rectangle.Width <= 0 ? 0 : Math.Clamp((waveformArea.Left - rectangle.Left) / rectangle.Width, 0, 1);
+            var visibleClipEndRatio = rectangle.Width <= 0 ? 1 : Math.Clamp((waveformArea.Right - rectangle.Left) / rectangle.Width, 0, 1);
+            var sourceStartRatio = asset.Duration <= 0 ? 0 : Math.Clamp((clip.SourceStart + visibleClipStartRatio * clip.Duration) / asset.Duration, 0, 1);
+            var sourceEndRatio = asset.Duration <= 0 ? 1 : Math.Clamp((clip.SourceStart + visibleClipEndRatio * clip.Duration) / asset.Duration, 0, 1);
+            var visiblePeaks = TimelineMediaCacheService.AggregateVisiblePeaks(
+                asset.WaveformPeaks, sourceStartRatio, sourceEndRatio, columnCount);
+            var barBrush = new SolidColorBrush(Color.FromRgb(167, 243, 208));
+            var quietBrush = new SolidColorBrush(Color.FromRgb(74, 222, 128));
+            for (var column = 0; column < columnCount; column++)
+            {
+                var peak = visiblePeaks[column];
+                var height = Math.Max(1.5, peak * (waveformArea.Height - 2));
+                var x = waveformArea.Left + column * step + (step - barWidth) / 2;
+                context.DrawRoundedRectangle(peak < 0.13 ? quietBrush : barBrush, null,
+                    new Rect(x, waveformArea.Bottom - height - 1, barWidth, height), 0.8, 0.8);
+            }
+            return;
+        }
+
         if (asset?.WaveformPath is { } path && TryLoadImage(path) is { } waveform)
         {
             var startRatio = asset.Duration <= 0 ? 0 : Math.Clamp(clip.SourceStart / asset.Duration, 0, 1);
@@ -844,6 +905,17 @@ public sealed class TimelineControl : FrameworkElement
             context.DrawText(CreateText("Форма волны готовится…", 8.5, Color.FromArgb(210, 210, 245, 229), dpi),
                 new Point(rectangle.Left + 8, rectangle.Bottom - 19));
         }
+    }
+
+    private Rect GetVisibleContentRectangle(Rect source, double inset)
+    {
+        var visibleLeft = HorizontalViewportOffset + LeftGutterWidth + inset;
+        var visibleRight = HorizontalViewportWidth > 0
+            ? HorizontalViewportOffset + HorizontalViewportWidth - inset
+            : RenderSize.Width - inset;
+        var left = Math.Max(source.Left, visibleLeft);
+        var right = Math.Min(source.Right, visibleRight);
+        return right > left ? new Rect(left, source.Top, right - left, source.Height) : Rect.Empty;
     }
 
     private ImageSource? TryLoadImage(string path)
@@ -1179,7 +1251,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void OnMediaPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.WaveformPath))
+        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.WaveformPath) or nameof(MediaAsset.WaveformPeaks))
         {
             if (Dispatcher.CheckAccess())
             {

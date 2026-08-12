@@ -42,11 +42,38 @@ if (args is ["--timeline-cache-smoke", var cacheInput] && File.Exists(cacheInput
     var started = System.Diagnostics.Stopwatch.StartNew();
     await service.PrepareAsync(cacheAsset);
     if (cacheAsset.TimelineFramePaths.Count < 8 || cacheAsset.TimelineFramePaths.Any(path => !File.Exists(path)) ||
-        string.IsNullOrWhiteSpace(cacheAsset.WaveformPath) || !File.Exists(cacheAsset.WaveformPath))
+        cacheAsset.WaveformPeaks.Count < 1000 || cacheAsset.WaveformPeaks.All(value => value <= 0.03f))
     {
         throw new InvalidOperationException("Кадры или реальная форма волны таймлайна не созданы.");
     }
-    Console.WriteLine($"TIMELINE_CACHE_SMOKE_OK frames={cacheAsset.TimelineFramePaths.Count} waveform=yes in {started.Elapsed.TotalSeconds:0.0}s");
+    Console.WriteLine($"TIMELINE_CACHE_SMOKE_OK frames={cacheAsset.TimelineFramePaths.Count} waveformPeaks={cacheAsset.WaveformPeaks.Count} in {started.Elapsed.TotalSeconds:0.0}s");
+    return 0;
+}
+
+if (args is ["--still-frame-smoke", var stillInput] && File.Exists(stillInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var stillAsset = await probe.ProbeAsync(Path.GetFullPath(stillInput));
+    var service = new PreviewProxyService(ffmpegLocator, processRunner);
+    var positions = new[] { 9.2, Math.Min(stillAsset.Duration - 0.1, 47.3) };
+    foreach (var position in positions)
+    {
+        var path = await service.EnsureStillFrameAsync(stillAsset, position);
+        if (!File.Exists(path) || new FileInfo(path).Length < 1024)
+            throw new InvalidOperationException($"Точный кадр {position:0.0} не создан.");
+    }
+    Console.WriteLine("STILL_FRAME_SMOKE_OK " + string.Join(", ", positions.Select(value => value.ToString("0.0"))));
+    return 0;
+}
+
+if (args is ["--waveform-zoom-smoke"])
+{
+    var samples = Enumerable.Range(0, 1000).Select(index => index % 100 / 100f).ToArray();
+    var full = TimelineMediaCacheService.AggregateVisiblePeaks(samples, 0, 1, 100);
+    var tenPercent = TimelineMediaCacheService.AggregateVisiblePeaks(samples, 0.4, 0.5, 100);
+    if (full.Count != 100 || tenPercent.Count != 100 || full.SequenceEqual(tenPercent))
+        throw new InvalidOperationException("Waveform не меняет детализацию вместе с масштабом.");
+    Console.WriteLine("WAVEFORM_ZOOM_SMOKE_OK full=100 visible10percent=100");
     return 0;
 }
 

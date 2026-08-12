@@ -53,6 +53,9 @@ public partial class MainWindow : Window
     private int _previewPrimeVersion;
     private bool _isEditingPreviewText;
     private bool _isResizingPreviewText;
+    private string _previewTextResizeHandle = "BottomRight";
+    private Point _previewTextResizeStartPoint;
+    private Rect _previewTextResizeStartBounds;
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
 
@@ -1461,7 +1464,7 @@ public partial class MainWindow : Window
         Canvas.SetTop(PreviewTextBorder, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
         var selected = TextOverlayList.SelectedItem == overlay;
         PreviewTextSelectionOutline.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
-        PreviewTextResizeThumb.Visibility = selected && !_isEditingPreviewText ? Visibility.Visible : Visibility.Collapsed;
+        PreviewTextResizeHandles.Visibility = selected && !_isEditingPreviewText ? Visibility.Visible : Visibility.Collapsed;
         PreviewTextBorder.Visibility = Visibility.Visible;
     }
 
@@ -1473,8 +1476,15 @@ public partial class MainWindow : Window
         {
             return;
         }
-        if (e.OriginalSource is Thumb || e.OriginalSource is TextBox)
+        if (e.OriginalSource is TextBox)
         {
+            return;
+        }
+        if (FindResizeHandle(e.OriginalSource as DependencyObject) is { } resizeHandle)
+        {
+            BeginPreviewTextResize(overlay, resizeHandle, e.GetPosition(PreviewTextCanvas));
+            PreviewTextBorder.CaptureMouse();
+            e.Handled = true;
             return;
         }
         if (e.ClickCount >= 2)
@@ -1499,6 +1509,12 @@ public partial class MainWindow : Window
 
     private void PreviewTextBorder_MouseMove(object sender, MouseEventArgs e)
     {
+        if (_isResizingPreviewText && _previewDraggedOverlay is not null && e.LeftButton == MouseButtonState.Pressed)
+        {
+            ResizePreviewTextTo(e.GetPosition(PreviewTextCanvas));
+            e.Handled = true;
+            return;
+        }
         if (!_isDraggingPreviewText || _previewDraggedOverlay is null || e.LeftButton != MouseButtonState.Pressed)
         {
             return;
@@ -1516,6 +1532,13 @@ public partial class MainWindow : Window
 
     private void PreviewTextBorder_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (_isResizingPreviewText)
+        {
+            CompletePreviewTextResize();
+            PreviewTextBorder.ReleaseMouseCapture();
+            e.Handled = true;
+            return;
+        }
         if (!_isDraggingPreviewText)
         {
             return;
@@ -1547,7 +1570,7 @@ public partial class MainWindow : Window
         PreviewTextBlock.Visibility = Visibility.Collapsed;
         PreviewTextEditor.Visibility = Visibility.Visible;
         PreviewTextSelectionOutline.Visibility = Visibility.Visible;
-        PreviewTextResizeThumb.Visibility = Visibility.Collapsed;
+        PreviewTextResizeHandles.Visibility = Visibility.Collapsed;
         PreviewTextEditor.Focus();
         PreviewTextEditor.CaretIndex = PreviewTextEditor.Text.Length;
     }
@@ -1608,34 +1631,85 @@ public partial class MainWindow : Window
         }
     }
 
-    private void PreviewTextResizeThumb_DragStarted(object sender, DragStartedEventArgs e)
+    private static FrameworkElement? FindResizeHandle(DependencyObject? source)
     {
-        if (TextOverlayList.SelectedItem is not TextOverlay overlay)
+        while (source is not null)
         {
-            return;
+            if (source is FrameworkElement element && element.Tag is string handle &&
+                handle is "Left" or "Right" or "Top" or "Bottom" or "TopLeft" or "TopRight" or "BottomLeft" or "BottomRight")
+            {
+                return element;
+            }
+            source = VisualTreeHelper.GetParent(source);
         }
+        return null;
+    }
+
+    private void BeginPreviewTextResize(TextOverlay overlay, FrameworkElement handle, Point startPoint)
+    {
         FinishPreviewTextEditing(commit: true, refresh: false);
         _isResizingPreviewText = true;
         _previewDraggedOverlay = overlay;
+        _previewTextResizeHandle = handle.Tag as string ?? "BottomRight";
+        _previewTextResizeStartPoint = startPoint;
+        _previewTextResizeStartBounds = new Rect(
+            Canvas.GetLeft(PreviewTextBorder),
+            Canvas.GetTop(PreviewTextBorder),
+            PreviewTextBorder.Width,
+            PreviewTextBorder.Height);
         _viewModel.BeginEdit();
-        e.Handled = true;
     }
 
-    private void PreviewTextResizeThumb_DragDelta(object sender, DragDeltaEventArgs e)
+    private void ResizePreviewTextTo(Point point)
     {
         if (!_isResizingPreviewText || _previewDraggedOverlay is null)
         {
             return;
         }
-        var width = Math.Clamp(PreviewTextBorder.Width + e.HorizontalChange, 80, 960);
-        var height = Math.Clamp(PreviewTextBorder.Height + e.VerticalChange, 36, 540);
+        const double minWidth = 80;
+        const double minHeight = 36;
+        var deltaX = point.X - _previewTextResizeStartPoint.X;
+        var deltaY = point.Y - _previewTextResizeStartPoint.Y;
+        var width = _previewTextResizeStartBounds.Width;
+        var height = _previewTextResizeStartBounds.Height;
+        var left = _previewTextResizeStartBounds.Left;
+        var top = _previewTextResizeStartBounds.Top;
+
+        var resizeLeft = _previewTextResizeHandle is "Left" or "TopLeft" or "BottomLeft";
+        var resizeRight = _previewTextResizeHandle is "Right" or "TopRight" or "BottomRight";
+        var resizeTop = _previewTextResizeHandle is "Top" or "TopLeft" or "TopRight";
+        var resizeBottom = _previewTextResizeHandle is "Bottom" or "BottomLeft" or "BottomRight";
+
+        if (resizeLeft)
+        {
+            var nextLeft = Math.Clamp(left + deltaX, 0, left + width - minWidth);
+            width += left - nextLeft;
+            left = nextLeft;
+        }
+        else if (resizeRight)
+        {
+            width = Math.Clamp(width + deltaX, minWidth, 960 - left);
+        }
+
+        if (resizeTop)
+        {
+            var nextTop = Math.Clamp(top + deltaY, 0, top + height - minHeight);
+            height += top - nextTop;
+            top = nextTop;
+        }
+        else if (resizeBottom)
+        {
+            height = Math.Clamp(height + deltaY, minHeight, 540 - top);
+        }
+
         _previewDraggedOverlay.BoxWidth = width / 960;
         _previewDraggedOverlay.BoxHeight = height / 540;
+        _previewDraggedOverlay.X = (left + width / 2) / 960;
+        _previewDraggedOverlay.Y = (top + height / 2) / 540;
         UpdateTextOverlayPreview(_viewModel.Playhead);
-        e.Handled = true;
     }
 
-    private void PreviewTextResizeThumb_DragCompleted(object sender, DragCompletedEventArgs e)
+    private void CompletePreviewTextResize()
     {
         if (!_isResizingPreviewText)
         {
@@ -1645,7 +1719,6 @@ public partial class MainWindow : Window
         _previewDraggedOverlay = null;
         _viewModel.CommitEdit("Размер текстового блока изменён");
         TimelineEditor.InvalidateVisual();
-        e.Handled = true;
     }
 
     private TimelineClip? FindActiveClip(TrackKind track, double time)

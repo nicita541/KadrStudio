@@ -729,6 +729,10 @@ public sealed class TimelineControl : FrameworkElement
 
             context.DrawRectangle(new SolidColorBrush(Color.FromArgb(92, color.R, color.G, color.B)), null, new Rect(left, rectangle.Top + 1, width, rectangle.Height - 2));
             context.DrawRectangle(new SolidColorBrush(color), null, new Rect(left, rectangle.Top + 1, width, 4));
+            context.DrawLine(CreatePen(Color.FromArgb(245, color.R, color.G, color.B), 1.8),
+                new Point(left, rectangle.Top), new Point(left, rectangle.Bottom));
+            context.DrawLine(CreatePen(Color.FromArgb(245, color.R, color.G, color.B), 1.8),
+                new Point(left + width, rectangle.Top), new Point(left + width, rectangle.Bottom));
             if (width >= 54)
             {
                 context.PushClip(new RectangleGeometry(new Rect(left + 4, rectangle.Top + 3, Math.Max(0, width - 8), 17)));
@@ -819,10 +823,17 @@ public sealed class TimelineControl : FrameworkElement
                 ViewboxUnits = BrushMappingMode.RelativeToBoundingBox,
                 Viewbox = new Rect(startRatio, 0, widthRatio, 1),
                 AlignmentY = AlignmentY.Bottom,
-                Opacity = 0.95
+                Opacity = 1
             };
+            var waveformArea = new Rect(rectangle.Left + 3, rectangle.Top + 21,
+                Math.Max(0, rectangle.Width - 6), Math.Max(0, rectangle.Height - 25));
+            context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(82, 7, 52, 38)), null,
+                waveformArea, 3, 3);
             context.DrawRoundedRectangle(brush, null,
-                new Rect(rectangle.Left + 2, rectangle.Top + 22, Math.Max(0, rectangle.Width - 4), rectangle.Height - 25), 2, 2);
+                waveformArea, 3, 3);
+            context.DrawLine(CreatePen(Color.FromArgb(215, 183, 247, 213), 1),
+                new Point(waveformArea.Left, waveformArea.Bottom - 1),
+                new Point(waveformArea.Right, waveformArea.Bottom - 1));
             return;
         }
 

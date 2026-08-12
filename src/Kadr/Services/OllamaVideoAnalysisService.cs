@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using KadrStudio.Models;
 
 namespace KadrStudio.Services;
@@ -12,6 +13,9 @@ public sealed class OllamaVideoAnalysisService : IDisposable
 {
     private const string WorkspaceHost = "127.0.0.1:11435";
     private static readonly Uri ApiBaseAddress = new($"http://{WorkspaceHost}/");
+    private static readonly Regex EpisodeTitlePattern = new(
+        @"(?i)\b(?:сер(?:ия|ии)|эпизод|episode|next|следующ\w*)\b",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private readonly FfmpegLocator _ffmpegLocator;
     private readonly ProcessRunner _processRunner;
     private readonly HttpClient _httpClient;
@@ -131,6 +135,12 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             await EnsureSuccessAsync(response, $"Локальная модель {model} не выполнила анализ", cancellationToken);
             var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
             var enhancement = ParseEnhancement(responseJson, baseline, model, supportsVision);
+            if (supportsVision && enhancement.Ranges.Any(range => range.Kind == MarkerKind.Ending))
+            {
+                progress?.Report(new VideoAnalysisProgress(98, "Шаг 5/6: отдельно проверяем эндинг, сцену после титров и превью"));
+                enhancement = await RefineFinalStructureAsync(
+                    asset, baseline, enhancement, model, cancellationToken);
+            }
             progress?.Report(new VideoAnalysisProgress(100, "Многошаговый анализ завершён"));
             return enhancement;
         }
@@ -382,8 +392,8 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         Directory.CreateDirectory(temporaryDirectory);
         var outputPath = Path.Combine(temporaryDirectory, $"contact-{Guid.NewGuid():N}.jpg");
         var duration = Math.Max(0.25, sourceEnd - sourceStart);
-        var columns = frameCount == 16 ? 4 : 2;
-        var rows = frameCount / columns;
+        var columns = Math.Max(2, (int)Math.Ceiling(Math.Sqrt(frameCount)));
+        var rows = (int)Math.Ceiling(frameCount / (double)columns);
         var framesPerSecond = (frameCount + 0.75) / duration;
         var filter =
             $"fps={Format(framesPerSecond)}," +
@@ -404,6 +414,273 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         }
 
         return outputPath;
+    }
+
+    private async Task<OllamaAnalysisEnhancement> RefineFinalStructureAsync(
+        MediaAsset asset,
+        VideoAnalysisResult baseline,
+        OllamaAnalysisEnhancement firstPass,
+        string model,
+        CancellationToken cancellationToken)
+    {
+        var ending = firstPass.Ranges.First(range => range.Kind == MarkerKind.Ending);
+        // Захватываем заметный участок до грубой границы: первый обзор может увидеть
+        // титры не с первого кадра и запоздать на несколько десятков секунд.
+        var start = Math.Max(baseline.SourceStart, ending.SourceStart - 45);
+        var end = baseline.SourceEnd;
+        if (end - start < 8)
+        {
+            return firstPass;
+        }
+
+        var frameCount = 36;
+        var sheetPath = await CreateContactSheetAsync(asset.Path, start, end, frameCount, cancellationToken);
+        try
+        {
+            var step = (end - start) / frameCount;
+            var prompt = $$"""
+                          Диапазон финала: {{Format(start)}}–{{Format(end)}} секунд. На изображении {{frameCount}} кадров,
+                          слева направо и сверху вниз, приблизительное время кадра N: {{Format(start)}} + (N-0.5)*{{Format(step)}} секунд.
+                          Первый проход уже нашёл предполагаемый ending {{Format(ending.SourceStart)}}–{{Format(ending.SourceStart + ending.Duration)}}.
+                          Он может ошибаться и в начале, и в конце. Первые кадры диапазона могут ещё быть обычной серией.
+                          Классифицируй КАЖДЫЙ кадр отдельно исключительно по тому, что реально видно на нём, не по его месту в видео.
+                          ending = видны японские/латинские имена, производственные титры ИЛИ кадр находится между соседними кадрами одной музыкальной титровой последовательности;
+                          postcredits = устойчивая сюжетная сцена БЕЗ имён/производственных титров, начавшаяся только после последнего титрового кадра;
+                          preview = анонс/нарезка следующей серии;
+                          episode = обычная серия до эндинга или пустой финальный кадр.
+                          Верни ровно 36 меток в порядке кадров и только JSON:
+                          {"labels":["episode","ending","postcredits","preview",...],"summary":"кратко что изменилось между блоками"}.
+                          Если поверх сюжетного кадра остаётся хотя бы один столбец имён — это ending. Нельзя вернуть все 36 кадров как postcredits:
+                          сначала должна быть непрерывная серия ending, и лишь после последнего кадра с именами может начаться postcredits.
+                          """;
+            var messages = new object[]
+            {
+                new { role = "system", content = "/no_think\nТы покадрово разделяешь финальные блоки anime. Ответ только JSON без Markdown." },
+                new
+                {
+                    role = "user",
+                    content = prompt,
+                    images = new[] { Convert.ToBase64String(await File.ReadAllBytesAsync(sheetPath, cancellationToken)) }
+                }
+            };
+            using var response = await _httpClient.PostAsJsonAsync(
+                "api/chat",
+                new
+                {
+                    model,
+                    stream = false,
+                    think = false,
+                    format = "json",
+                    messages,
+                    options = new { temperature = 0.0, num_ctx = 16384, num_predict = 2048 }
+                }, cancellationToken);
+            await EnsureSuccessAsync(response, "Локальный ИИ не смог отдельно проверить финал", cancellationToken);
+            var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
+            var finalPass = ParseFrameClassifications(responseJson, start, end, frameCount, model, ending);
+            if (!finalPass.Ranges.Any(range => range.Kind == MarkerKind.PostCredits))
+            {
+                var embeddedTextRanges = await InferFinalRangesFromEmbeddedTextAsync(
+                    asset, baseline, ending, cancellationToken);
+                if (embeddedTextRanges.Count > 1)
+                {
+                    finalPass = finalPass with
+                    {
+                        Summary = "Финал разделён по независимому сигналу встроенных надписей; границы дополнительно проверяются по кадрам.",
+                        Ranges = embeddedTextRanges
+                    };
+                }
+            }
+            var finalKinds = new HashSet<MarkerKind> { MarkerKind.Ending, MarkerKind.PostCredits, MarkerKind.Preview };
+            var finalRanges = finalPass.Ranges.Where(range => finalKinds.Contains(range.Kind)).ToList();
+            if (finalRanges.Count == 0)
+            {
+                return firstPass;
+            }
+
+            var merged = firstPass.Ranges
+                .Where(range => !finalKinds.Contains(range.Kind))
+                .Concat(finalRanges)
+                .OrderBy(range => range.SourceStart)
+                .ToList();
+            return firstPass with
+            {
+                Summary = finalPass.Summary,
+                Ranges = NormalizeSemanticRelationships(merged)
+            };
+        }
+        finally
+        {
+            TryDelete(sheetPath);
+        }
+    }
+
+    public async Task<IReadOnlyList<DetectedVideoRange>> InferFinalRangesFromEmbeddedTextAsync(
+        MediaAsset asset,
+        VideoAnalysisResult baseline,
+        DetectedVideoRange fallbackEnding,
+        CancellationToken cancellationToken = default)
+    {
+        var scanStart = Math.Max(baseline.SourceStart, fallbackEnding.SourceStart - 10);
+        var scanDuration = baseline.SourceEnd - scanStart;
+        var subtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
+        var relativeCues = await subtitleService.ExtractEmbeddedTextAsync(
+            asset, scanStart, scanDuration, preferSigns: true, cancellationToken);
+        if (relativeCues.Count == 0)
+        {
+            return [fallbackEnding];
+        }
+
+        var cues = relativeCues
+            .Select(cue => new SubtitleCue(cue.Start + scanStart, cue.End + scanStart, cue.Text))
+            .Where(cue => cue.Start >= fallbackEnding.SourceStart + 35)
+            .OrderBy(cue => cue.Start)
+            .ToList();
+        var episodeTitle = cues.FirstOrDefault(cue => EpisodeTitlePattern.IsMatch(cue.Text));
+        var previewStart = episodeTitle is null
+            ? baseline.SourceEnd
+            : Math.Max(fallbackEnding.SourceStart + 45, episodeTitle.Start - 20);
+        var postCreditsCue = cues
+            .Where(cue => cue.Start < previewStart - 3 && !EpisodeTitlePattern.IsMatch(cue.Text))
+            .FirstOrDefault();
+        if (postCreditsCue is null)
+        {
+            return [fallbackEnding];
+        }
+
+        var postCreditsStart = postCreditsCue.Start;
+        var referenceOpening = baseline.Ranges.FirstOrDefault(range => range.Kind == MarkerKind.Opening);
+        var expectedEndingDuration = referenceOpening?.Duration is >= 60 and <= 120
+            ? referenceOpening.Duration
+            : 90;
+        var endingStart = fallbackEnding.SourceStart;
+        if (postCreditsStart - endingStart < expectedEndingDuration * 0.8)
+        {
+            endingStart = Math.Max(baseline.SourceStart, postCreditsStart - expectedEndingDuration);
+        }
+        var ranges = new List<DetectedVideoRange>
+        {
+            fallbackEnding with
+            {
+                SourceStart = endingStart,
+                Duration = Math.Max(3, postCreditsStart - endingStart),
+                Description = fallbackEnding.Description +
+                    " Конец титров подтверждён появлением отдельной экранной надписи следующей сюжетной сцены; начало перепроверено по длительности музыкального блока.",
+                Confidence = Math.Max(fallbackEnding.Confidence, 0.82)
+            },
+            new(MarkerKind.PostCredits, postCreditsStart, Math.Max(3, previewStart - postCreditsStart),
+                KindTitle(MarkerKind.PostCredits),
+                $"Сцена после титров начинается с отдельной экранной надписи «{TrimForDescription(postCreditsCue.Text)}».", 0.86)
+        };
+        if (episodeTitle is not null && baseline.SourceEnd - previewStart >= 3)
+        {
+            ranges.Add(new DetectedVideoRange(
+                MarkerKind.Preview, previewStart, baseline.SourceEnd - previewStart,
+                KindTitle(MarkerKind.Preview),
+                $"Блок перед надписью следующего эпизода «{TrimForDescription(episodeTitle.Text)}».", 0.76));
+        }
+        return ranges;
+    }
+
+    private static string TrimForDescription(string text)
+    {
+        var compact = string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return compact.Length <= 90 ? compact : compact[..87] + "…";
+    }
+
+    private static OllamaAnalysisEnhancement ParseFrameClassifications(
+        string responseJson,
+        double start,
+        double end,
+        int frameCount,
+        string model,
+        DetectedVideoRange fallbackEnding)
+    {
+        using var envelope = JsonDocument.Parse(responseJson);
+        if (!envelope.RootElement.TryGetProperty("message", out var message) ||
+            !message.TryGetProperty("content", out var contentElement))
+        {
+            return new OllamaAnalysisEnhancement(string.Empty, Array.Empty<DetectedVideoRange>(), model, true);
+        }
+        var content = ExtractJson(contentElement.GetString() ?? string.Empty);
+        using var document = JsonDocument.Parse(content);
+        if (!document.RootElement.TryGetProperty("labels", out var labelsElement) || labelsElement.ValueKind != JsonValueKind.Array)
+        {
+            return new OllamaAnalysisEnhancement(string.Empty, Array.Empty<DetectedVideoRange>(), model, true);
+        }
+        var labels = labelsElement.EnumerateArray()
+            .Select(item => NormalizeFrameLabel(item.GetString()))
+            .Take(frameCount)
+            .ToList();
+        while (labels.Count < frameCount) labels.Add("episode");
+        labels = StabilizeFrameLabels(labels);
+        var step = (end - start) / frameCount;
+        var endingIndexes = labels.Select((label, index) => (label, index))
+            .Where(item => item.label == "ending")
+            .Select(item => item.index)
+            .ToList();
+        if (endingIndexes.Count < 3)
+        {
+            return new OllamaAnalysisEnhancement(
+                "Покадровая проверка финала отклонена: модель не подтвердила непрерывную титровую последовательность.",
+                [fallbackEnding], model, true);
+        }
+        var firstEndingIndex = endingIndexes.First();
+        var lastEndingIndex = endingIndexes.Last();
+        if (firstEndingIndex == 0 && fallbackEnding.SourceStart - start > 20)
+        {
+            return new OllamaAnalysisEnhancement(
+                "Покадровая проверка финала отклонена: модель без доказательств расширила титры на весь проверяемый диапазон.",
+                [fallbackEnding], model, true);
+        }
+        for (var index = firstEndingIndex; index <= lastEndingIndex; index++) labels[index] = "ending";
+        for (var index = 0; index < firstEndingIndex; index++)
+        {
+            if (labels[index] is "postcredits" or "preview") labels[index] = "episode";
+        }
+        var ranges = new List<DetectedVideoRange>();
+        for (var index = 0; index < labels.Count;)
+        {
+            var label = labels[index];
+            var next = index + 1;
+            while (next < labels.Count && labels[next] == label) next++;
+            if (TryParseKind(label, out var kind) && kind is MarkerKind.Ending or MarkerKind.PostCredits or MarkerKind.Preview)
+            {
+                var rangeStart = start + index * step;
+                var rangeEnd = start + next * step;
+                ranges.Add(new DetectedVideoRange(kind, rangeStart, rangeEnd - rangeStart,
+                    KindTitle(kind), $"Покадровая классификация: кадры {index + 1}–{next} из {frameCount}.", 0.78));
+            }
+            index = next;
+        }
+        var summary = document.RootElement.TryGetProperty("summary", out var summaryElement)
+            ? summaryElement.GetString() ?? string.Empty
+            : string.Empty;
+        return new OllamaAnalysisEnhancement(summary, ranges, model, true);
+    }
+
+    private static string NormalizeFrameLabel(string? value)
+    {
+        var label = (value ?? string.Empty).Trim().ToLowerInvariant().Replace("-", string.Empty).Replace("_", string.Empty);
+        return label switch
+        {
+            "ending" or "credits" or "эндинг" or "титры" => "ending",
+            "postcredits" or "postcredit" or "послетитров" => "postcredits",
+            "preview" or "nextpreview" or "превью" or "анонс" => "preview",
+            _ => "episode"
+        };
+    }
+
+    private static List<string> StabilizeFrameLabels(IReadOnlyList<string> labels)
+    {
+        var result = labels.ToList();
+        for (var index = 1; index < result.Count - 1; index++)
+        {
+            if (result[index - 1] == result[index + 1] && result[index] != result[index - 1])
+            {
+                result[index] = result[index - 1];
+            }
+        }
+        return result;
     }
 
     private static string BuildSystemPrompt()

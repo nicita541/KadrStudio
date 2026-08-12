@@ -729,16 +729,18 @@ public partial class MainWindow : Window
         }
 
         _viewModel.IsBusy = true;
-        _viewModel.StatusText = "Локальное распознавание речи Windows…";
+        _viewModel.StatusText = "Поиск встроенных субтитров или локального распознавания…";
         try
         {
-            var cues = await _viewModel.AutoSubtitleService.TranscribeWithWindowsAsync(
+            var transcription = await _viewModel.AutoSubtitleService.TranscribeLocalAsync(
                 asset,
                 audioClip.SourceStart,
                 audioClip.Duration);
+            var cues = transcription.Cues;
             if (cues.Count == 0)
             {
-                throw new InvalidOperationException("Речь не распознана. Проверьте, что в Windows установлен русский речевой пакет.");
+                throw new InvalidOperationException(
+                    "Субтитры не найдены. Добавьте русскую дорожку субтитров в файл либо положите whisper-cli.exe и модель ggml-*.bin в папку tools.");
             }
             _viewModel.CreateHistoryCheckpoint("Авто: перед созданием автосубтитров");
             _viewModel.BeginEdit();
@@ -751,6 +753,7 @@ public partial class MainWindow : Window
             }
             _viewModel.CommitEdit($"Создано автосубтитров: {cues.Count}");
             TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.LastOrDefault();
+            _viewModel.StatusText = $"Создано субтитров: {cues.Count} ({transcription.Engine})";
         }
         catch (Exception exception)
         {
@@ -880,6 +883,12 @@ public partial class MainWindow : Window
                     localAiWarning = $"Локальный ИИ пропущен: {exception.Message}";
                 }
             }
+
+            result = await _viewModel.VideoAnalysisService.RefineSemanticBoundariesAsync(
+                asset,
+                result,
+                progress,
+                _analysisCancellation.Token);
 
             var mappedMarkers = MapAnalysisMarkers(asset, timelineClips, result, query);
             if (mappedMarkers.Count == 0)

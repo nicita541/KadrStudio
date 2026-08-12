@@ -291,7 +291,7 @@
 
                 <StackPanel Grid.Row="0" Margin="2,2,0,13">
                     <TextBlock Text="AI-анализ" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Один запрос: найти части видео или изменить монтаж"
+                    <TextBlock Text="Каскад: общий обзор → точная зона → граница до кадра"
                                Foreground="{StaticResource MutedTextBrush}"
                                FontSize="10"
                                TextWrapping="Wrap"
@@ -394,7 +394,7 @@
                                 Grid.Column="0"
                                 Style="{StaticResource AccentButton}"
                                 Click="RunAnalysis_Click"
-                                Content="Найти части"
+                                Content="Анализировать точно"
                                 Padding="13,9" />
                         <Button x:Name="CancelAnalysisButton"
                                 Grid.Column="2"
@@ -473,6 +473,7 @@
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
                                     <Grid>
                                         <Grid.ColumnDefinitions>
@@ -483,6 +484,7 @@
                                         <TextBlock Grid.Column="1" Text="{Binding ConfidenceLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9" Margin="8,0,0,0" />
                                     </Grid>
                                     <TextBlock Grid.Row="1" Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9" Margin="0,3,0,0" />
+                                    <TextBlock Grid.Row="2" Text="{Binding Description}" Foreground="#AEB2C5" FontSize="9" TextWrapping="Wrap" MaxHeight="42" Margin="0,3,0,0" />
                                 </Grid>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
@@ -691,23 +693,23 @@
                                               Panel.ZIndex="20">
                                             <Grid.Resources>
                                                 <Style TargetType="Border">
-                                                    <Setter Property="Width" Value="20" />
-                                                    <Setter Property="Height" Value="20" />
-                                                    <Setter Property="Background" Value="#60A5FA" />
-                                                    <Setter Property="BorderBrush" Value="White" />
-                                                    <Setter Property="BorderThickness" Value="2" />
-                                                    <Setter Property="CornerRadius" Value="2" />
+                                                    <Setter Property="Width" Value="11" />
+                                                    <Setter Property="Height" Value="11" />
+                                                    <Setter Property="Background" Value="#F8FAFC" />
+                                                    <Setter Property="BorderBrush" Value="#3B82F6" />
+                                                    <Setter Property="BorderThickness" Value="1.5" />
+                                                    <Setter Property="CornerRadius" Value="5.5" />
                                                 </Style>
                                             </Grid.Resources>
 
                                             <Border Tag="TopLeft" HorizontalAlignment="Left" VerticalAlignment="Top" Cursor="SizeNWSE" />
-                                            <Border Tag="Top" Width="52" Height="14" HorizontalAlignment="Center" VerticalAlignment="Top" Cursor="SizeNS" />
+                                            <Border Tag="Top" Width="28" Height="8" HorizontalAlignment="Center" VerticalAlignment="Top" Cursor="SizeNS" />
                                             <Border Tag="TopRight" HorizontalAlignment="Right" VerticalAlignment="Top" Cursor="SizeNESW" />
-                                            <Border Tag="Right" Width="14" Height="52" HorizontalAlignment="Right" VerticalAlignment="Center" Cursor="SizeWE" />
+                                            <Border Tag="Right" Width="8" Height="28" HorizontalAlignment="Right" VerticalAlignment="Center" Cursor="SizeWE" />
                                             <Border Tag="BottomRight" HorizontalAlignment="Right" VerticalAlignment="Bottom" Cursor="SizeNWSE" />
-                                            <Border Tag="Bottom" Width="52" Height="14" HorizontalAlignment="Center" VerticalAlignment="Bottom" Cursor="SizeNS" />
+                                            <Border Tag="Bottom" Width="28" Height="8" HorizontalAlignment="Center" VerticalAlignment="Bottom" Cursor="SizeNS" />
                                             <Border Tag="BottomLeft" HorizontalAlignment="Left" VerticalAlignment="Bottom" Cursor="SizeNESW" />
-                                            <Border Tag="Left" Width="14" Height="52" HorizontalAlignment="Left" VerticalAlignment="Center" Cursor="SizeWE" />
+                                            <Border Tag="Left" Width="8" Height="28" HorizontalAlignment="Left" VerticalAlignment="Center" Cursor="SizeWE" />
                                         </Grid>
                                     </Grid>
                                 </Border>

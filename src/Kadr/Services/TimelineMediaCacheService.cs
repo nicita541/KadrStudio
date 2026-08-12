@@ -65,7 +65,7 @@ public sealed class TimelineMediaCacheService(FfmpegLocator locator, ProcessRunn
 
     private async Task<string?> PrepareWaveformAsync(MediaAsset asset, CancellationToken cancellationToken)
     {
-        var output = Path.Combine(_waveformRoot, ThumbnailService.BuildCacheKey(asset.Path) + "-v2.png");
+        var output = Path.Combine(_waveformRoot, ThumbnailService.BuildCacheKey(asset.Path) + "-v3.png");
         if (File.Exists(output) && new FileInfo(output).Length > 512)
         {
             return output;
@@ -73,7 +73,7 @@ public sealed class TimelineMediaCacheService(FfmpegLocator locator, ProcessRunn
 
         var filter =
             "[0:a:0]aformat=channel_layouts=mono," +
-            "showwavespic=s=2400x192:colors=0x9AF3C7:draw=full," +
+            "showwavespic=s=2400x192:colors=0xB7F7D5:draw=scale:filter=peak:scale=sqrt," +
             "crop=2400:96:0:0,format=rgba,colorkey=0x000000:0.05:0.0[wave]";
         var result = await processRunner.RunAsync(locator.FfmpegPath,
             [

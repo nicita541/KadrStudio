@@ -46,5 +46,5 @@ public sealed class TimelineMarker : ObservableObject
     public string ConfidenceLabel => Confidence <= 0 ? string.Empty : $"{Confidence:P0}";
 
     private static string FormatTime(double seconds)
-        => TimeSpan.FromSeconds(Math.Max(0, seconds)).ToString(seconds >= 3600 ? @"h\:mm\:ss" : @"m\:ss");
+        => TimeSpan.FromSeconds(Math.Max(0, seconds)).ToString(seconds >= 3600 ? @"h\:mm\:ss\.fff" : @"m\:ss\.fff");
 }

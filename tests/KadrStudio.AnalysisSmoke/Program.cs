@@ -50,6 +50,80 @@ if (args is ["--timeline-cache-smoke", var cacheInput] && File.Exists(cacheInput
     return 0;
 }
 
+if (args is ["--subtitle-smoke", var subtitleInput] && File.Exists(subtitleInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var subtitleAsset = await probe.ProbeAsync(Path.GetFullPath(subtitleInput));
+    var service = new AutoSubtitleService(ffmpegLocator, processRunner);
+    var result = await service.TranscribeLocalAsync(subtitleAsset, 0, subtitleAsset.Duration);
+    if (result.Cues.Count == 0 || result.Cues.Any(cue => cue.End <= cue.Start))
+    {
+        throw new InvalidOperationException("Локальные субтитры не извлечены.");
+    }
+    Console.WriteLine($"SUBTITLE_SMOKE_OK cues={result.Cues.Count} engine={result.Engine}");
+    return 0;
+}
+
+if (args is ["--boundary-smoke"])
+{
+    var directory = Path.Combine(Path.GetTempPath(), "KadrStudio", "boundary-smoke", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var input = Path.Combine(directory, "cuts.mp4");
+    try
+    {
+        var make = await processRunner.RunAsync(ffmpegLocator.FfmpegPath,
+            ["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=red:s=640x360:r=25:d=2",
+             "-f", "lavfi", "-i", "color=blue:s=640x360:r=25:d=2", "-f", "lavfi", "-i", "color=green:s=640x360:r=25:d=2",
+             "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", input]);
+        if (make.ExitCode != 0) throw new InvalidOperationException(make.StandardError);
+        var probe = new MediaProbeService(ffmpegLocator, processRunner);
+        var boundaryAsset = await probe.ProbeAsync(input);
+        var analysis = new VideoAnalysisService(ffmpegLocator, processRunner);
+        var boundaryBaseline = new VideoAnalysisResult("known cuts", 0, 6,
+            [new DetectedVideoRange(MarkerKind.Opening, 1.65, 2.7, "Опенинг", "грубая зона", 0.6)]);
+        var refined = await analysis.RefineSemanticBoundariesAsync(boundaryAsset, boundaryBaseline);
+        var range = refined.Ranges.Single();
+        if (Math.Abs(range.SourceStart - 2) > 1d / 25 + 0.001 || Math.Abs(range.SourceStart + range.Duration - 4) > 1d / 25 + 0.001)
+        {
+            throw new InvalidOperationException($"Покадровая граница неверна: {range.SourceStart:0.###}–{range.SourceStart + range.Duration:0.###}");
+        }
+        Console.WriteLine($"BOUNDARY_SMOKE_OK {range.SourceStart:0.###}-{range.SourceStart + range.Duration:0.###} {range.Description}");
+        return 0;
+    }
+    finally
+    {
+        try { Directory.Delete(directory, true); } catch { }
+    }
+}
+
+if (args is ["--final-structure-smoke", var finalInput] && File.Exists(finalInput))
+{
+    var probe = new MediaProbeService(ffmpegLocator, processRunner);
+    var finalAsset = await probe.ProbeAsync(Path.GetFullPath(finalInput));
+    var fallbackEnding = new DetectedVideoRange(
+        MarkerKind.Ending, Math.Max(0, finalAsset.Duration - 110), 106,
+        "Эндинг", "Грубая граница vision-модели.", 0.72);
+    var finalBaseline = new VideoAnalysisResult(
+        "final structure smoke", 0, finalAsset.Duration, [fallbackEnding]);
+    var finalRanges = await ollamaService.InferFinalRangesFromEmbeddedTextAsync(
+        finalAsset, finalBaseline, fallbackEnding);
+    var boundaryService = new VideoAnalysisService(ffmpegLocator, processRunner);
+    var refinedFinal = await boundaryService.RefineSemanticBoundariesAsync(
+        finalAsset, finalBaseline with { Ranges = finalRanges });
+    var ordered = refinedFinal.Ranges.OrderBy(range => range.SourceStart).ToList();
+    if (ordered.Count < 3 ||
+        ordered[0].Kind != MarkerKind.Ending ||
+        ordered[1].Kind != MarkerKind.PostCredits ||
+        ordered[2].Kind != MarkerKind.Preview ||
+        ordered.Zip(ordered.Skip(1), (left, right) => left.SourceStart + left.Duration <= right.SourceStart + 0.001).Any(valid => !valid))
+    {
+        throw new InvalidOperationException("Финальные блоки не разделены в правильном порядке.");
+    }
+    Console.WriteLine("FINAL_STRUCTURE_SMOKE_OK " + string.Join(" | ", ordered.Select(range =>
+        $"{range.Kind}={TimeSpan.FromSeconds(range.SourceStart):mm\\:ss\\.fff}–{TimeSpan.FromSeconds(range.SourceStart + range.Duration):mm\\:ss\\.fff}")));
+    return 0;
+}
+
 if (args is ["--make-ui-project", var uiInput, var uiOutput] && File.Exists(uiInput))
 {
     var probe = new MediaProbeService(ffmpegLocator, processRunner);
@@ -332,6 +406,11 @@ var ranges = baseline.Ranges
     .OrderBy(range => range.SourceStart)
     .ThenBy(range => range.Kind)
     .ToList();
+var frameRefined = await analysisService.RefineSemanticBoundariesAsync(
+    asset,
+    baseline with { Ranges = ranges },
+    progress);
+ranges = frameRefined.Ranges.ToList();
 if (args.Contains("--semantic-only", StringComparer.OrdinalIgnoreCase))
 {
     ranges = ranges

@@ -35,7 +35,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var rangeEnd = Math.Clamp(requestedRange.End, rangeStart + 0.1, sourceDuration);
         var rangeDuration = rangeEnd - rangeStart;
 
-        progress?.Report(new VideoAnalysisProgress(3, "Шаг 1/4: подготовка видео"));
+        progress?.Report(new VideoAnalysisProgress(3, "Шаг 1/5: общий проход по всему диапазону"));
         var detectorLines = new List<string>();
         var videoResult = await processRunner.RunAsync(
             locator.FfmpegPath,
@@ -53,7 +53,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             cancellationToken);
         EnsureSuccess(videoResult, "Не удалось выполнить анализ изображения");
 
-        progress?.Report(new VideoAnalysisProgress(62, "Шаг 2/4: поиск пауз и тишины"));
+        progress?.Report(new VideoAnalysisProgress(55, "Шаг 2/5: поиск пауз и тишины"));
         var audioLines = new List<string>();
         if (request.Asset.HasAudio)
         {
@@ -68,7 +68,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             EnsureSuccess(audioResult, "Не удалось выполнить анализ звука");
         }
 
-        progress?.Report(new VideoAnalysisProgress(82, "Шаг 3/4: уточнение границ по склейкам и затемнениям"));
+        progress?.Report(new VideoAnalysisProgress(72, "Шаг 3/5: уточнение зон по склейкам и затемнениям"));
         var sceneCuts = ParseTimes(detectorLines, SceneTimeRegex, rangeStart, rangeDuration);
         var blackRanges = ParsePairedRanges(detectorLines, BlackRegex, rangeStart, rangeDuration);
         var silenceRanges = ParseSplitRanges(audioLines, SilenceStartRegex, SilenceEndRegex, rangeStart, rangeDuration);
@@ -80,9 +80,124 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             $"границ сцен — {sceneCuts.Count}, затемнений — {blackRanges.Count}, " +
             $"пауз — {silenceRanges.Count}, стоп-кадров — {freezeRanges.Count}. " +
             "Метки опенинга, эндинга и превью являются вероятностной оценкой по структуре монтажа.";
-        progress?.Report(new VideoAnalysisProgress(100, "Шаг 4/4: технический анализ завершён"));
+        progress?.Report(new VideoAnalysisProgress(84, "Шаг 4/5: грубые смысловые зоны готовы для проверки ИИ"));
         return new VideoAnalysisResult(summary, rangeStart, rangeEnd, detected);
     }
+
+    public async Task<VideoAnalysisResult> RefineSemanticBoundariesAsync(
+        MediaAsset asset,
+        VideoAnalysisResult result,
+        IProgress<VideoAnalysisProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var semanticKinds = new HashSet<MarkerKind>
+        {
+            MarkerKind.Opening, MarkerKind.Ending, MarkerKind.PostCredits,
+            MarkerKind.Preview, MarkerKind.Recap, MarkerKind.Note
+        };
+        var semantic = result.Ranges.Where(range => semanticKinds.Contains(range.Kind)).ToList();
+        if (semantic.Count == 0)
+        {
+            return result;
+        }
+
+        var refined = new List<DetectedVideoRange>();
+        for (var index = 0; index < semantic.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var range = semantic[index];
+            progress?.Report(new VideoAnalysisProgress(
+                84 + 15d * index / Math.Max(1, semantic.Count),
+                $"Шаг 5/5: покадровая проверка — {range.Title}"));
+            var coarseStart = range.SourceStart;
+            var coarseEnd = range.SourceStart + range.Duration;
+            var start = await FindExactCutAsync(asset.Path, coarseStart, result.SourceStart, result.SourceEnd, cancellationToken);
+            var end = await FindExactCutAsync(asset.Path, coarseEnd, result.SourceStart, result.SourceEnd, cancellationToken);
+            if (end <= start + 0.1)
+            {
+                start = coarseStart;
+                end = coarseEnd;
+            }
+            var fps = asset.FrameRate > 0 ? asset.FrameRate : 25;
+            start = Math.Round(start * fps) / fps;
+            end = Math.Round(end * fps) / fps;
+            var startDelta = start - coarseStart;
+            var endDelta = end - coarseEnd;
+            var startFrames = (int)Math.Round(startDelta * fps);
+            var endFrames = (int)Math.Round(endDelta * fps);
+            var precision = 1d / fps;
+            var description = string.Join(" ", new[]
+            {
+                range.Description,
+                $"Каскад: общий обзор → точная зона → проверка соседних кадров.",
+                $"Начало сдвинуто на {Signed(startDelta)} с ({Signed(startFrames)} кадр.), конец — на {Signed(endDelta)} с ({Signed(endFrames)} кадр.).",
+                $"Расчётная точность ±{precision:0.###} с (1 кадр при {fps:0.###} fps)."
+            }.Where(value => !string.IsNullOrWhiteSpace(value)));
+            refined.Add(range with
+            {
+                SourceStart = start,
+                Duration = Math.Max(0.1, end - start),
+                Description = description,
+                Confidence = Math.Clamp(range.Confidence + 0.07, 0.05, 0.99)
+            });
+        }
+
+        var refinedIds = semantic.Select(range => (range.Kind, range.SourceStart, range.Duration)).ToHashSet();
+        var merged = result.Ranges
+            .Where(range => !refinedIds.Contains((range.Kind, range.SourceStart, range.Duration)))
+            .Concat(refined)
+            .OrderBy(range => range.SourceStart)
+            .ThenBy(range => range.Kind)
+            .ToList();
+        progress?.Report(new VideoAnalysisProgress(100, "Покадровое уточнение границ завершено"));
+        return result with
+        {
+            Summary = result.Summary + " Смысловые границы уточнены до ближайшей подтверждённой склейки и округлены к кадру.",
+            Ranges = merged
+        };
+    }
+
+    private async Task<double> FindExactCutAsync(
+        string path,
+        double target,
+        double minimum,
+        double maximum,
+        CancellationToken cancellationToken)
+    {
+        if (target <= minimum + 0.05) return minimum;
+        if (target >= maximum - 0.05) return maximum;
+        var coarseCandidates = await ScanSceneCutsAsync(path, target, minimum, maximum, 12, 0.18, cancellationToken);
+        var coarse = coarseCandidates.OrderBy(time => Math.Abs(time - target)).FirstOrDefault(target);
+        var fineCandidates = await ScanSceneCutsAsync(path, coarse, minimum, maximum, 3, 0.07, cancellationToken);
+        return fineCandidates.OrderBy(time => Math.Abs(time - coarse)).FirstOrDefault(coarse);
+    }
+
+    private async Task<IReadOnlyList<double>> ScanSceneCutsAsync(
+        string path,
+        double center,
+        double minimum,
+        double maximum,
+        double radius,
+        double threshold,
+        CancellationToken cancellationToken)
+    {
+        var windowStart = Math.Max(minimum, center - radius);
+        var windowEnd = Math.Min(maximum, center + radius);
+        if (windowEnd <= windowStart + 0.1) return Array.Empty<double>();
+        var lines = new List<string>();
+        var scan = await processRunner.RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-ss", Format(windowStart), "-t", Format(windowEnd - windowStart), "-i", path,
+                "-vf", $"scale=640:-2,select='gt(scene,{Format(threshold)})',showinfo", "-an", "-f", "null", "-"
+            ], line => lines.Add(line), cancellationToken);
+        if (scan.ExitCode != 0) return Array.Empty<double>();
+        return ParseTimes(lines, SceneTimeRegex, windowStart, windowEnd - windowStart)
+            .Where(time => Math.Abs(time - center) <= radius)
+            .ToList();
+    }
+
+    private static string Signed(double value) => value.ToString("+0.###;-0.###;0", CultureInfo.InvariantCulture);
+    private static string Signed(int value) => value.ToString("+0;-0;0", CultureInfo.InvariantCulture);
 
     public static bool TryParseRange(string prompt, out double start, out double end)
     {

@@ -64,6 +64,33 @@ public sealed class RenderPlanTests
     }
 
     [Fact]
+    public void Pipeline_signatures_change_only_for_their_own_content()
+    {
+        var project = CreateProject();
+        var builder = new RenderPlanBuilder();
+        var initial = builder.Build(project);
+        var audio = project.MediaClips.Single(item => item.Audio is not null);
+        var audioChanged = builder.Build(project with
+        {
+            MediaClips = project.MediaClips.Replace(audio,
+                audio with { Audio = audio.Audio! with { Volume = 0.35 } })
+        });
+
+        Assert.Equal(initial.VideoContentSignature, audioChanged.VideoContentSignature);
+        Assert.NotEqual(initial.AudioContentSignature, audioChanged.AudioContentSignature);
+        Assert.Equal(initial.OverlaySignature, audioChanged.OverlaySignature);
+
+        var text = project.TextClips.Single();
+        var textChanged = builder.Build(project with
+        {
+            TextClips = project.TextClips.Replace(text, text with { Text = "Changed" })
+        });
+        Assert.Equal(initial.VideoContentSignature, textChanged.VideoContentSignature);
+        Assert.Equal(initial.AudioContentSignature, textChanged.AudioContentSignature);
+        Assert.NotEqual(initial.OverlaySignature, textChanged.OverlaySignature);
+    }
+
+    [Fact]
     public void Preview_and_export_commands_use_the_same_plan_signature_and_graph()
     {
         var plan = new RenderPlanBuilder().Build(CreateProject());
@@ -73,8 +100,8 @@ public sealed class RenderPlanTests
         var export = builder.Build(plan, new RenderOutputOptions(
             RenderPurpose.Export, "F:\\output folder\\export.mp4", 1920, 1080, 18));
 
-        Assert.Equal(plan.ContentSignature, preview.PlanSignature);
-        Assert.Equal(plan.ContentSignature, export.PlanSignature);
+        Assert.Equal(plan.GetPipelineSignature(true, true, true), preview.PlanSignature);
+        Assert.Equal(plan.GetPipelineSignature(true, true, true), export.PlanSignature);
         Assert.Contains("-filter_complex", preview.Arguments);
         Assert.Contains("-filter_complex", export.Arguments);
         Assert.Contains("[vout]", preview.Arguments);

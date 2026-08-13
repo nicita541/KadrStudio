@@ -42,9 +42,24 @@ public sealed record RenderPlan(
     ImmutableArray<RenderVisualLayer> VisualLayers,
     ImmutableArray<RenderAudioLayer> AudioLayers,
     ImmutableArray<RenderTextLayer> TextLayers,
+    string VideoContentSignature,
+    string AudioContentSignature,
+    string OverlaySignature,
     string ContentSignature)
 {
     public TimelineTime Duration => Range.Duration;
+
+    public string GetPipelineSignature(bool includeVideo, bool includeAudio, bool includeOverlays)
+    {
+        if (!includeVideo && !includeAudio)
+            throw new ArgumentException("At least one media pipeline is required.");
+        var components = new List<string>(3);
+        if (includeVideo) components.Add($"V:{VideoContentSignature}");
+        if (includeAudio) components.Add($"A:{AudioContentSignature}");
+        if (includeVideo && includeOverlays) components.Add($"O:{OverlaySignature}");
+        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(string.Join('|', components))));
+    }
 
     public RenderFrame GetFrame(TimelineTime timelineTime)
     {
@@ -85,7 +100,8 @@ public sealed record RenderOutputOptions(
     int VideoQuality = 20,
     bool UseHardwareEncoding = false,
     bool IncludeVideo = true,
-    bool IncludeAudio = true);
+    bool IncludeAudio = true,
+    bool IncludeOverlays = true);
 
 public sealed record ExternalRenderCommand(
     string ExecutableRole,

@@ -60,10 +60,14 @@ public sealed class RenderPlanBuilder(IProjectValidator? validator = null) : IRe
                 item.Clip.Range, item.Clip.Text, item.Clip.Style))
             .ToImmutableArray();
 
-        var signature = ComputeSignature(project, range, visual, audio, text);
+        var videoSignature = ComputeVideoSignature(project, range, visual);
+        var audioSignature = ComputeAudioSignature(project, range, audio);
+        var overlaySignature = ComputeOverlaySignature(project, range, text);
+        var signature = Hash($"V:{videoSignature}|A:{audioSignature}|O:{overlaySignature}");
         return new RenderPlan(
             project.Id, project.Revision, project.CanvasWidth, project.CanvasHeight,
-            project.FrameRate, range, visual, audio, text, signature);
+            project.FrameRate, range, visual, audio, text,
+            videoSignature, audioSignature, overlaySignature, signature);
     }
 
     private static TimeRange ResolveRange(ProjectState project, TimeRange? requestedRange)
@@ -78,35 +82,58 @@ public sealed class RenderPlanBuilder(IProjectValidator? validator = null) : IRe
     private static bool Intersects(TimeRange left, TimeRange right)
         => left.Start < right.End && left.End > right.Start;
 
-    private static string ComputeSignature(
+    private static string ComputeVideoSignature(
         ProjectState project,
         TimeRange range,
-        IEnumerable<RenderVisualLayer> visual,
-        IEnumerable<RenderAudioLayer> audio,
-        IEnumerable<RenderTextLayer> text)
+        IEnumerable<RenderVisualLayer> visual)
     {
         var builder = new StringBuilder(4096);
-        builder.Append(project.CanvasWidth).Append('|').Append(project.CanvasHeight).Append('|')
+        builder.Append("video|").Append(project.CanvasWidth).Append('|').Append(project.CanvasHeight).Append('|')
             .Append(project.FrameRate.Numerator).Append('/').Append(project.FrameRate.Denominator).Append('|')
             .Append(range.Start.Ticks).Append('|').Append(range.Duration.Ticks);
         foreach (var item in visual)
         {
+            var source = project.Sources[item.SourceId];
             builder.Append("|V|").Append(item.ClipId.ToString("N")).Append('|').Append(item.TrackIndex)
-                .Append('|').Append(item.SourcePath).Append('|').Append(item.TimelineRange.Start.Ticks)
+                .Append('|').Append(item.SourcePath).Append('|').Append(source.Fingerprint)
+                .Append('|').Append(item.TimelineRange.Start.Ticks)
                 .Append('|').Append(item.TimelineRange.Duration.Ticks).Append('|').Append(item.SourceIn.Ticks)
                 .Append('|').Append(F(item.Parameters.Brightness)).Append('|').Append(F(item.Parameters.Contrast))
                 .Append('|').Append(F(item.Parameters.Saturation)).Append('|').Append(F(item.Parameters.Temperature));
         }
+        return Hash(builder.ToString());
+    }
+
+    private static string ComputeAudioSignature(
+        ProjectState project,
+        TimeRange range,
+        IEnumerable<RenderAudioLayer> audio)
+    {
+        var builder = new StringBuilder(4096);
+        builder.Append("audio|").Append(range.Start.Ticks).Append('|').Append(range.Duration.Ticks);
         foreach (var item in audio)
         {
+            var source = project.Sources[item.SourceId];
             builder.Append("|A|").Append(item.ClipId.ToString("N")).Append('|').Append(item.TrackIndex)
-                .Append('|').Append(item.SourcePath).Append('|').Append(item.TimelineRange.Start.Ticks)
+                .Append('|').Append(item.SourcePath).Append('|').Append(source.Fingerprint)
+                .Append('|').Append(item.TimelineRange.Start.Ticks)
                 .Append('|').Append(item.TimelineRange.Duration.Ticks).Append('|').Append(item.SourceIn.Ticks)
                 .Append('|').Append(F(item.Parameters.Volume)).Append('|').Append(F(item.Parameters.Pan))
                 .Append('|').Append(item.Parameters.FadeIn.Ticks).Append('|').Append(item.Parameters.FadeOut.Ticks)
                 .Append('|').Append(F(item.Parameters.Bass)).Append('|').Append(F(item.Parameters.Mid))
                 .Append('|').Append(F(item.Parameters.Treble));
         }
+        return Hash(builder.ToString());
+    }
+
+    private static string ComputeOverlaySignature(
+        ProjectState project,
+        TimeRange range,
+        IEnumerable<RenderTextLayer> text)
+    {
+        var builder = new StringBuilder(2048);
+        builder.Append("overlay|").Append(project.CanvasWidth).Append('|').Append(project.CanvasHeight).Append('|')
+            .Append(range.Start.Ticks).Append('|').Append(range.Duration.Ticks);
         foreach (var item in text)
         {
             builder.Append("|T|").Append(item.ClipId.ToString("N")).Append('|').Append(item.TrackIndex)
@@ -117,8 +144,11 @@ public sealed class RenderPlanBuilder(IProjectValidator? validator = null) : IRe
                 .Append('|').Append(F(item.Style.Rotation)).Append('|').Append(F(item.Style.BoxWidth))
                 .Append('|').Append(F(item.Style.BoxHeight)).Append('|').Append(item.Style.IsSubtitle);
         }
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString())));
+        return Hash(builder.ToString());
     }
+
+    private static string Hash(string value)
+        => Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
 
     private static string F(double value) => value.ToString("R", CultureInfo.InvariantCulture);
 }

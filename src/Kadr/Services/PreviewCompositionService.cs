@@ -39,13 +39,13 @@ public sealed class PreviewCompositionService
     public string GetVideoSignature(EditorProject project, bool halfQuality)
     {
         if (project.Duration <= 0) return $"empty-video-{halfQuality}";
-        return $"{_coordinator.CreatePlan(project).ContentSignature}-v-{(halfQuality ? "half" : "full")}";
+        return $"{_coordinator.CreatePlan(project).VideoContentSignature}-v-{(halfQuality ? "half" : "full")}";
     }
 
     public string GetAudioSignature(EditorProject project)
     {
         if (project.Duration <= 0) return "empty-audio";
-        return $"{_coordinator.CreatePlan(project).ContentSignature}-a";
+        return $"{_coordinator.CreatePlan(project).AudioContentSignature}-a";
     }
 
     public bool HasRenderableVideo(EditorProject project)
@@ -66,21 +66,22 @@ public sealed class PreviewCompositionService
     {
         var range = SegmentRange(project, timelinePosition);
         var plan = _coordinator.CreatePlan(project, range);
-        var signature = $"{plan.ContentSignature}-v-{(halfQuality ? "half" : "full")}";
+        var generationSignature = GetVideoSignature(project, halfQuality);
+        var artifactSignature = $"{plan.VideoContentSignature}-v-{(halfQuality ? "half" : "full")}";
         Directory.CreateDirectory(_videoDirectory);
-        var output = Path.Combine(_videoDirectory, $"{signature}.mp4");
+        var output = Path.Combine(_videoDirectory, $"{artifactSignature}.mp4");
         if (!IsUsable(output))
         {
-            var width = halfQuality ? 960 : project.CanvasWidth;
-            var height = halfQuality ? 540 : project.CanvasHeight;
+            var (width, height) = ResolvePreviewSize(project, halfQuality);
             await _coordinator.RenderAsync(
                 plan,
                 new RenderOutputOptions(RenderPurpose.Preview, output, width, height, 24,
-                    IncludeVideo: true, IncludeAudio: false),
+                    IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
         }
         return new TimelinePreviewSegment(
-            PreviewPipeline.Video, signature, output, range.Start.TotalSeconds, range.Duration.TotalSeconds);
+            PreviewPipeline.Video, generationSignature, artifactSignature, output,
+            range.Start.TotalSeconds, range.Duration.TotalSeconds);
     }
 
     public async Task<TimelinePreviewSegment> EnsureAudioSegmentAsync(
@@ -90,19 +91,21 @@ public sealed class PreviewCompositionService
     {
         var range = SegmentRange(project, timelinePosition);
         var plan = _coordinator.CreatePlan(project, range);
-        var signature = $"{plan.ContentSignature}-a";
+        var generationSignature = GetAudioSignature(project);
+        var artifactSignature = $"{plan.AudioContentSignature}-a";
         Directory.CreateDirectory(_audioDirectory);
-        var output = Path.Combine(_audioDirectory, $"{signature}.m4a");
+        var output = Path.Combine(_audioDirectory, $"{artifactSignature}.m4a");
         if (!IsUsable(output))
         {
             await _coordinator.RenderAsync(
                 plan,
                 new RenderOutputOptions(RenderPurpose.AudioPreview, output, 16, 16, 24,
-                    IncludeVideo: false, IncludeAudio: true),
+                    IncludeVideo: false, IncludeAudio: true, IncludeOverlays: false),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
         }
         return new TimelinePreviewSegment(
-            PreviewPipeline.Audio, signature, output, range.Start.TotalSeconds, range.Duration.TotalSeconds);
+            PreviewPipeline.Audio, generationSignature, artifactSignature, output,
+            range.Start.TotalSeconds, range.Duration.TotalSeconds);
     }
 
     public async Task<CompositedStillFrame> EnsureStillFrameAsync(
@@ -125,9 +128,9 @@ public sealed class PreviewCompositionService
                 plan,
                 new RenderOutputOptions(
                     RenderPurpose.StillFrame, output,
-                    halfQuality ? 960 : project.CanvasWidth,
-                    halfQuality ? 540 : project.CanvasHeight,
-                    IncludeVideo: true, IncludeAudio: false),
+                    ResolvePreviewSize(project, halfQuality).Width,
+                    ResolvePreviewSize(project, halfQuality).Height,
+                    IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
         }
         return new CompositedStillFrame(signature, output, exact.TotalSeconds);
@@ -153,6 +156,16 @@ public sealed class PreviewCompositionService
     private static bool IsUsable(string path, long minimumLength = 1024)
         => File.Exists(path) && new FileInfo(path).Length > minimumLength;
 
+    internal static (int Width, int Height) ResolvePreviewSize(EditorProject project, bool halfQuality)
+    {
+        if (!halfQuality)
+            return (project.CanvasWidth, project.CanvasHeight);
+        var scale = Math.Min(0.5, Math.Min(960d / project.CanvasWidth, 540d / project.CanvasHeight));
+        var width = Math.Max(2, (int)Math.Round(project.CanvasWidth * scale / 2) * 2);
+        var height = Math.Max(2, (int)Math.Round(project.CanvasHeight * scale / 2) * 2);
+        return (width, height);
+    }
+
     private static bool IsUnder(string path, string root)
         => path.StartsWith(Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
             StringComparison.OrdinalIgnoreCase);
@@ -167,6 +180,7 @@ public enum PreviewPipeline
 public sealed record TimelinePreviewSegment(
     PreviewPipeline Pipeline,
     string Signature,
+    string ArtifactSignature,
     string Path,
     double TimelineStart,
     double Duration)

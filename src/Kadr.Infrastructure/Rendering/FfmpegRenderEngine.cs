@@ -34,9 +34,10 @@ public sealed partial class FfmpegRenderEngine(
         var isExport = options.Purpose == RenderPurpose.Export;
         var request = new JobRequest<string>(
             JobKey.Create(
-                "render", plan.ContentSignature, options.Purpose, options.Width, options.Height,
+                "render", plan.GetPipelineSignature(options.IncludeVideo, options.IncludeAudio, options.IncludeOverlays),
+                options.Purpose, options.Width, options.Height,
                 options.VideoQuality, options.UseHardwareEncoding, options.IncludeVideo, options.IncludeAudio,
-                fullOutput),
+                options.IncludeOverlays, fullOutput),
             isExport ? JobLane.Export : JobLane.MediaDecode,
             isExport ? JobPriority.UserInitiated : JobPriority.Realtime,
             async token =>

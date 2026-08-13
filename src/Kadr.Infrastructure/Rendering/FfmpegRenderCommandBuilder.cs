@@ -29,7 +29,8 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         arguments.AddRange(["-t", Format(plan.Duration.TotalSeconds)]);
         AddEncoding(arguments, plan, options, videoOutput is not null, audioOutput is not null);
         arguments.Add(outputPath);
-        return new ExternalRenderCommand("ffmpeg", arguments.ToImmutableArray(), outputPath, plan.ContentSignature);
+        return new ExternalRenderCommand("ffmpeg", arguments.ToImmutableArray(), outputPath,
+            plan.GetPipelineSignature(options.IncludeVideo, options.IncludeAudio, options.IncludeOverlays));
     }
 
     private static Dictionary<Guid, int> AddInputs(
@@ -101,7 +102,7 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
                 $"enable='between(t,{Format(start)},{Format(end)})'[{composed}]");
             previous = composed;
         }
-        for (var index = 0; index < plan.TextLayers.Length; index++)
+        for (var index = 0; options.IncludeOverlays && index < plan.TextLayers.Length; index++)
         {
             var layer = plan.TextLayers[index];
             var output = $"vtext{index}";

@@ -1331,7 +1331,7 @@ public partial class MainWindow : Window
         _playbackClock.Restart();
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         _playbackTimer.Start();
-        PlayPauseButton.Content = "Ⅱ";
+        PlayPauseButton.Content = "\uE769";
     }
 
     private void PausePlayback()
@@ -1345,7 +1345,7 @@ public partial class MainWindow : Window
         _playbackTimer.Stop();
         _playbackClock.Stop();
         UpdateAudioMeters(null);
-        PlayPauseButton.Content = "▶";
+        PlayPauseButton.Content = "\uE768";
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
     }
 
@@ -1773,8 +1773,6 @@ public partial class MainWindow : Window
     private void ResetPreviewState()
     {
         _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
-        _ = _previewPresenter.InvalidateAsync(video: true, audio: true, overlay: true);
-        PreviewImage.Source = null;
         TimelineEditor.Project = _viewModel.Project;
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
         TimelineEditor.PlayheadSeconds = _viewModel.Playhead;

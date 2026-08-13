@@ -220,7 +220,7 @@ public sealed class EditorProjectMapper
         tracks.Add(new TimelineTrack(id, kind, index, name));
     }
 
-    private static MediaSource ToCoreSource(MediaAsset asset)
+    public MediaSource ToCoreSource(MediaAsset asset)
         => new(
             asset.Id, Path.GetFullPath(asset.Path), asset.Name, (CoreMediaKind)(int)asset.Kind,
             Time(asset.Duration), asset.HasAudio, asset.Width, asset.Height,

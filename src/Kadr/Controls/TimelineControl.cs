@@ -13,6 +13,7 @@ namespace KadrStudio.Controls;
 public sealed class TimelineControl : FrameworkElement
 {
     private readonly WaveformRenderer _waveformRenderer = new();
+    private readonly ThumbnailRenderer _thumbnailRenderer;
     public const string MediaAssetDataFormat = "KadrStudio.MediaAssetId";
     public const double LeftGutterWidth = 96;
 
@@ -39,7 +40,6 @@ public sealed class TimelineControl : FrameworkElement
     private TimelineClip? _dragClip;
     private TimelineClip? _dragOriginal;
     private readonly List<(TimelineClip Clip, TimelineClip Original)> _dragLinkedClips = [];
-    private readonly Dictionary<string, ImageSource> _imageCache = new(StringComparer.OrdinalIgnoreCase);
     private TextOverlay? _dragTextOverlay;
     private TextOverlay? _dragTextOriginal;
     private Guid? _selectedTextOverlayId;
@@ -48,6 +48,7 @@ public sealed class TimelineControl : FrameworkElement
 
     public TimelineControl()
     {
+        _thumbnailRenderer = new ThumbnailRenderer(Dispatcher, InvalidateVisual);
         Focusable = true;
         AllowDrop = true;
         ClipToBounds = false;
@@ -710,27 +711,7 @@ public sealed class TimelineControl : FrameworkElement
 
         var visible = GetVisibleContentRectangle(rectangle, 1);
         if (visible.IsEmpty) return;
-        context.PushClip(new RectangleGeometry(visible));
-        context.PushOpacity(0.88);
-        const double tileWidth = 82;
-        var firstTile = rectangle.Left + Math.Floor((visible.Left - rectangle.Left) / tileWidth) * tileWidth;
-        for (var left = firstTile; left < visible.Right; left += tileWidth)
-        {
-            var center = Math.Min(rectangle.Right, left + tileWidth / 2);
-            var localRatio = rectangle.Width <= 0 ? 0 : (center - rectangle.Left) / rectangle.Width;
-            var sourceTime = clip.SourceStart + localRatio * clip.Duration;
-            var sourceRatio = asset.Duration <= 0 ? 0 : Math.Clamp(sourceTime / asset.Duration, 0, 1);
-            var frameIndex = Math.Clamp((int)Math.Round(sourceRatio * (asset.TimelineFramePaths.Count - 1)),
-                0, asset.TimelineFramePaths.Count - 1);
-            if (TryLoadImage(asset.TimelineFramePaths[frameIndex]) is not { } image)
-            {
-                continue;
-            }
-            context.DrawImage(image,
-                new Rect(left, rectangle.Top, Math.Min(tileWidth, rectangle.Right - left), rectangle.Height));
-        }
-        context.Pop();
-        context.Pop();
+        _thumbnailRenderer.Draw(context, clip, asset, rectangle, visible);
     }
 
     private void DrawClipAnalysisOverlays(DrawingContext context, TimelineClip clip, Rect rectangle, double dpi)
@@ -849,9 +830,6 @@ public sealed class TimelineControl : FrameworkElement
                 Math.Max(0, rectangle.Width - 8), Math.Max(0, rectangle.Height - 26));
             var waveformArea = GetVisibleContentRectangle(wholeWaveformArea, 3);
             if (waveformArea.IsEmpty) return;
-            context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(74, 5, 48, 35)), null,
-                waveformArea, 3, 3);
-
             var visibleClipStartRatio = rectangle.Width <= 0 ? 0 : Math.Clamp((waveformArea.Left - rectangle.Left) / rectangle.Width, 0, 1);
             var visibleClipEndRatio = rectangle.Width <= 0 ? 1 : Math.Clamp((waveformArea.Right - rectangle.Left) / rectangle.Width, 0, 1);
             var sourceStartRatio = asset.Duration <= 0 ? 0 : Math.Clamp((clip.SourceStart + visibleClipStartRatio * clip.Duration) / asset.Duration, 0, 1);
@@ -873,33 +851,6 @@ public sealed class TimelineControl : FrameworkElement
     private Rect GetVisibleContentRectangle(Rect source, double inset)
     {
         return Viewport.ClipToVisible(source, inset);
-    }
-
-    private ImageSource? TryLoadImage(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-        {
-            return null;
-        }
-        if (_imageCache.TryGetValue(path, out var cached))
-        {
-            return cached;
-        }
-        try
-        {
-            var image = new BitmapImage();
-            image.BeginInit();
-            image.CacheOption = BitmapCacheOption.OnLoad;
-            image.UriSource = new Uri(path, UriKind.Absolute);
-            image.EndInit();
-            image.Freeze();
-            _imageCache[path] = image;
-            return image;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     private void DrawPlayhead(DrawingContext context)

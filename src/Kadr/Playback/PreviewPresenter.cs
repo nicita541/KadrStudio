@@ -46,15 +46,20 @@ public sealed class PreviewPresenter : IAsyncDisposable
 
     public void SetProject(EditorProject project, bool halfQuality)
     {
+        var identityChanged = _project is null || _project.Id != project.Id;
+        var qualityChanged = _halfQuality != halfQuality;
         _project = project;
         _halfQuality = halfQuality;
-        _prepared = false;
-        _videoSignature = null;
-        _audioSignature = null;
-        _overlaySignature = null;
-        _videoGeneration++;
-        _audioGeneration++;
-        _overlayGeneration++;
+        if (identityChanged || qualityChanged)
+        {
+            _prepared = false;
+            _videoSignature = null;
+            _audioSignature = null;
+            _overlaySignature = null;
+            _videoGeneration++;
+            _audioGeneration++;
+            _overlayGeneration++;
+        }
         _proxies.Configure(project);
         if (halfQuality) _proxies.Queue(project);
     }

@@ -44,6 +44,31 @@ public sealed record AddMediaClipsCommand(IReadOnlyList<MediaClip> Clips) : IEdi
         => project with { MediaClips = project.MediaClips.AddRange(Clips) };
 }
 
+public sealed record EnsureTrackAndAddMediaClipsCommand(
+    IReadOnlyList<(TrackKind Kind, int Index, MediaClip Clip)> Items) : IEditCommand
+{
+    public string Description => "Добавить клипы на дорожки";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var tracks = project.Tracks;
+        var clips = project.MediaClips;
+        foreach (var (kind, index, template) in Items)
+        {
+            var track = tracks.FirstOrDefault(item => item.Kind == kind && item.Index == index);
+            if (track is null)
+            {
+                track = new TimelineTrack(Guid.NewGuid(), kind, index, $"{(kind == TrackKind.Visual ? 'V' : 'A')}{index + 1}");
+                tracks = tracks.Add(track);
+            }
+            if (!project.Sources.ContainsKey(template.SourceId))
+                throw new EditRejectedException("Исходник клипа не найден в проекте.");
+            clips = clips.Add(template with { TrackId = track.Id });
+        }
+        return project with { Tracks = tracks, MediaClips = clips };
+    }
+}
+
 public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool IncludeLinked = true) : IEditCommand
 {
     public string Description => "Удалить клипы";
@@ -188,6 +213,42 @@ public sealed record SplitMediaClipsCommand(TimelineTime Position) : IEditComman
         {
             MediaClips = project.MediaClips.Select(item => replacements.GetValueOrDefault(item.Id, item))
                 .Concat(additions).ToImmutableArray()
+        };
+    }
+}
+
+public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Position, Guid? SelectedRightId = null) : IEditCommand
+{
+    public string Description => "Разрезать выбранный клип";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var selected = RequireClip(project, ClipId);
+        if (Position <= selected.Start || Position >= selected.End) return project;
+        var targets = selected.LinkGroupId is { } group
+            ? project.MediaClips.Where(item => item.LinkGroupId == group && Position > item.Start && Position < item.End).ToArray()
+            : [selected];
+        var rightGroup = targets.Length > 1 ? Guid.NewGuid() : (Guid?)null;
+        var left = new Dictionary<Guid, MediaClip>();
+        var right = new List<MediaClip>();
+        foreach (var clip in targets)
+        {
+            var source = project.Sources[clip.SourceId];
+            var leftDuration = Position - clip.Start;
+            var rightDuration = clip.Duration - leftDuration;
+            left[clip.Id] = clip with { Duration = leftDuration, Audio = ClampAudioFades(clip.Audio, leftDuration) };
+            right.Add(clip with
+            {
+                Id = clip.Id == selected.Id && SelectedRightId.HasValue ? SelectedRightId.Value : Guid.NewGuid(),
+                LinkGroupId = rightGroup, Start = Position,
+                SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + leftDuration,
+                Duration = rightDuration, Audio = ClampAudioFades(clip.Audio, rightDuration)
+            });
+        }
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item => left.GetValueOrDefault(item.Id, item))
+                .Concat(right).ToImmutableArray()
         };
     }
 }

@@ -21,10 +21,9 @@
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="42" />
-            <RowDefinition Height="*" MinHeight="200" />
-            <RowDefinition Height="0" />
-            <!-- 52 px toolbar + 278 px viewport = exactly V1, V2, A1 and A2. -->
-            <RowDefinition Height="330" MinHeight="330" MaxHeight="330" />
+            <RowDefinition Height="3*" MinHeight="220" />
+            <RowDefinition Height="6" />
+            <RowDefinition Height="2*" MinHeight="220" />
             <RowDefinition Height="26" />
         </Grid.RowDefinitions>
         <Grid.ColumnDefinitions>
@@ -728,12 +727,12 @@
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" HorizontalAlignment="Right" Text="{Binding PlayheadLabel}" FontFamily="Consolas" FontSize="12" Margin="0,0,13,0" />
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
-                    <Button Style="{StaticResource IconButton}" Click="PreviousFrame_Click" ToolTip="Предыдущий кадр" Content="❮" FontFamily="Segoe UI Symbol" FontSize="18" Margin="0,0,7,0" />
-                    <Button x:Name="PlayPauseButton" Style="{StaticResource IconButton}" Click="PlayPause_Click" ToolTip="Воспроизведение (Пробел)" Content="▶" FontFamily="Segoe UI Symbol" Width="44" Height="44" FontSize="19" />
-                    <Button Style="{StaticResource IconButton}" Click="NextFrame_Click" ToolTip="Следующий кадр" Content="❯" FontFamily="Segoe UI Symbol" FontSize="18" Margin="7,0,0,0" />
-                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomOut_Click" ToolTip="Отдалить предпросмотр" Content="−" FontFamily="Segoe UI" FontWeight="Bold" Margin="14,7,3,7" />
+                    <Button Style="{StaticResource IconButton}" Click="PreviousFrame_Click" ToolTip="Предыдущий кадр" Content="&#xE892;" Margin="0,0,7,0" />
+                    <Button x:Name="PlayPauseButton" Style="{StaticResource IconButton}" Click="PlayPause_Click" ToolTip="Воспроизведение (Пробел)" Content="&#xE768;" Width="44" Height="44" FontSize="18" />
+                    <Button Style="{StaticResource IconButton}" Click="NextFrame_Click" ToolTip="Следующий кадр" Content="&#xE893;" Margin="7,0,0,0" />
+                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomOut_Click" ToolTip="Отдалить предпросмотр" Content="&#xE738;" Margin="14,7,3,7" />
                     <TextBlock x:Name="PreviewZoomLabel" Text="100%" Foreground="{StaticResource MutedTextBrush}" FontSize="10" VerticalAlignment="Center" Width="38" TextAlignment="Center" />
-                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomIn_Click" ToolTip="Приблизить предпросмотр" Content="+" FontFamily="Segoe UI" FontWeight="Bold" Margin="3,7,12,7" />
+                    <Button Style="{StaticResource CompactIconButton}" Click="PreviewZoomIn_Click" ToolTip="Приблизить предпросмотр" Content="&#xE710;" Margin="3,7,12,7" />
                     <ComboBox x:Name="PreviewQualityComboBox"
                               Width="105"
                               Height="30"
@@ -847,7 +846,6 @@
 
         <GridSplitter Grid.Row="2"
                       Grid.ColumnSpan="6"
-                      Visibility="Collapsed"
                       Style="{StaticResource PaneSplitter}"
                       HorizontalAlignment="Stretch"
                       VerticalAlignment="Stretch"
@@ -930,7 +928,10 @@
                             <RowDefinition Height="*" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
-                        <TextBlock Text="🎧" FontSize="17" HorizontalAlignment="Center" ToolTip="Уровни левого и правого каналов" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center" ToolTip="Уровни левого и правого каналов">
+                            <Path Data="M3,12 A9,9 0 0 1 21,12 M3,12 L3,19 L7,19 L7,13 L3,13 M21,12 L21,19 L17,19 L17,13 L21,13"
+                                  Stroke="{StaticResource TextBrush}" StrokeThickness="1.8" Fill="Transparent" StrokeLineJoin="Round" />
+                        </Viewbox>
                         <Grid Grid.Row="1" HorizontalAlignment="Center" Margin="0,8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />

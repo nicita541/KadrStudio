@@ -330,7 +330,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        CaptureUndoPoint();
         var clip = new TimelineClip
         {
             AssetId = asset.Id,
@@ -350,28 +349,24 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 requestedStart ?? Project.GetTrackClips(clip.Track, clip.TrackIndex).Select(item => item.End).DefaultIfEmpty(0).Max());
         clip.Start = FindAvailableTrackStart(clip.Track, clip.TrackIndex, desiredStart, clip.Duration);
 
+        var additions = new List<(KadrStudio.Core.Domain.TrackKind Kind, int Index, KadrStudio.Core.Domain.MediaClip Clip)>();
         if (asset.Kind == MediaKind.Video && asset.HasAudio)
         {
             var linkGroupId = Guid.NewGuid();
             clip.LinkGroupId = linkGroupId;
             var audioTrackIndex = FindAvailableTrackIndex(TrackKind.Audio, clip.Start, clip.Duration, 0);
-            Project.Clips.Add(new TimelineClip
-            {
-                AssetId = asset.Id,
-                Track = TrackKind.Audio,
-                TrackIndex = audioTrackIndex,
-                LinkGroupId = linkGroupId,
-                Start = clip.Start,
-                SourceStart = clip.SourceStart,
-                Duration = clip.Duration,
-                Volume = 1
-            });
+            additions.Add((KadrStudio.Core.Domain.TrackKind.Audio, audioTrackIndex,
+                CreateCoreClip(asset.Id, Guid.NewGuid(), clip.Start, clip.SourceStart, clip.Duration,
+                    linkGroupId, video: false)));
         }
-        Project.Clips.Add(clip);
-
-        SubscribeClip(clip);
-        SelectedClip = clip;
-        CommitChange("Клип добавлен на таймлайн");
+        additions.Add((clip.Track == TrackKind.Visual
+                ? KadrStudio.Core.Domain.TrackKind.Visual
+                : KadrStudio.Core.Domain.TrackKind.Audio,
+            clip.TrackIndex,
+            CreateCoreClip(asset.Id, clip.Id, clip.Start, clip.SourceStart, clip.Duration,
+                clip.LinkGroupId, clip.Track == TrackKind.Visual)));
+        ExecuteCoreCommand("Клип добавлен на таймлайн",
+            new EnsureTrackAndAddMediaClipsCommand(additions), clip.Id);
     }
 
     public void DeleteSelectedClip()
@@ -381,17 +376,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        CaptureUndoPoint();
-        var clipsToDelete = SelectedClip.LinkGroupId is Guid groupId
-            ? Project.Clips.Where(clip => clip.LinkGroupId == groupId).ToList()
-            : [SelectedClip];
-        foreach (var clip in clipsToDelete)
-        {
-            Project.Clips.Remove(clip);
-        }
-        SelectedClip = null;
-
-        CommitChange("Клип удалён");
+        ExecuteCoreCommand("Клип удалён",
+            new DeleteMediaClipsCommand(new HashSet<Guid> { SelectedClip.Id }, IncludeLinked: true));
     }
 
     public bool SplitSelectedAtPlayhead()
@@ -402,32 +388,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return false;
         }
 
-        CaptureUndoPoint();
-        var linkedClips = clip.LinkGroupId is Guid linkGroupId
-            ? Project.Clips.Where(item => item.LinkGroupId == linkGroupId && Playhead > item.Start + 0.1 && Playhead < item.End - 0.1).ToList()
-            : [clip];
-        var rightLinkGroup = linkedClips.Count > 1 ? Guid.NewGuid() : (Guid?)null;
-        TimelineClip? selectedRight = null;
-        foreach (var linkedClip in linkedClips)
-        {
-            var firstDuration = Playhead - linkedClip.Start;
-            var second = linkedClip.Clone();
-            second.Id = Guid.NewGuid();
-            second.LinkGroupId = rightLinkGroup;
-            second.Start = Playhead;
-            second.SourceStart = linkedClip.SourceStart + firstDuration;
-            second.Duration = linkedClip.Duration - firstDuration;
-            linkedClip.Duration = firstDuration;
-            Project.Clips.Add(second);
-            if (linkedClip.Id == clip.Id)
-            {
-                selectedRight = second;
-            }
-        }
-
-        SelectedClip = selectedRight;
-        CommitChange("Клип разделён");
-        return true;
+        var rightId = Guid.NewGuid();
+        return ExecuteCoreCommand("Клип разделён",
+            new SplitSelectedMediaClipCommand(clip.Id,
+                KadrStudio.Core.Domain.TimelineTime.FromSeconds(Playhead), rightId), rightId);
     }
 
     public bool UnlinkSelectedClip()
@@ -437,21 +401,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return false;
         }
 
-        var linked = Project.Clips.Where(clip => clip.LinkGroupId == groupId).ToList();
-        if (linked.Count < 2)
-        {
-            SelectedClip.LinkGroupId = null;
-            return false;
-        }
-
-        BeginEdit();
-        foreach (var clip in linked)
-        {
-            clip.LinkGroupId = null;
-        }
-        CommitEdit("Связь видео и звука разорвана");
+        if (Project.Clips.Count(clip => clip.LinkGroupId == groupId) < 2) return false;
+        var selectedId = SelectedClip.Id;
+        var changed = ExecuteCoreCommand("Связь видео и звука разорвана",
+            new UnlinkMediaClipCommand(selectedId), selectedId);
         OnPropertyChanged(nameof(IsSelectedClipLinked));
-        return true;
+        return changed;
     }
 
     public void NormalizeSelectedClip()
@@ -499,9 +454,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        BeginEdit();
-        Project.Markers.Clear();
-        CommitEdit("Метки анализа удалены");
+        ExecuteCoreCommand("Метки анализа удалены", new ReplaceMarkersCommand([]));
     }
 
     public int BeginEditPlanReview(EditCommandPlan plan)
@@ -1054,14 +1007,56 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CommitEdit(status);
     }
 
-    private void RestoreFromCoreState(KadrStudio.Core.Domain.ProjectState state)
+    private bool ExecuteCoreCommand(string description, IEditCommand command, Guid? selectedClipId = null)
+    {
+        var result = _editorSession.Execute(new EditTransaction(description, command));
+        if (!result.Changed) return false;
+        RestoreFromCoreState(result.State, selectedClipId);
+        StatusText = description;
+        return true;
+    }
+
+    private static KadrStudio.Core.Domain.MediaClip CreateCoreClip(
+        Guid sourceId,
+        Guid clipId,
+        double start,
+        double sourceStart,
+        double duration,
+        Guid? linkGroupId,
+        bool video)
+        => new(
+            clipId,
+            sourceId,
+            Guid.Empty,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(start),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(sourceStart),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(duration),
+            linkGroupId,
+            video ? new KadrStudio.Core.Domain.VideoParameters() : null,
+            video ? null : new KadrStudio.Core.Domain.AudioParameters());
+
+    private void RestoreFromCoreState(KadrStudio.Core.Domain.ProjectState state, Guid? selectedClipId = null)
     {
         var filePath = Project.FilePath;
+        var derivedMedia = Project.Media.ToDictionary(
+            asset => asset.Id,
+            asset => new DerivedMediaState(
+                asset.ThumbnailPath, asset.TimelineFramePaths, asset.Waveform, asset.IsMissing));
+        var restored = _projectMapper.ToUi(state, filePath);
+        foreach (var asset in restored.Media)
+        {
+            if (!derivedMedia.TryGetValue(asset.Id, out var derived)) continue;
+            asset.ThumbnailPath = derived.ThumbnailPath;
+            asset.TimelineFramePaths = derived.TimelineFrames;
+            asset.Waveform = derived.Waveform;
+            asset.IsMissing = derived.IsMissing;
+        }
         _suppressDirtyTracking = true;
         try
         {
             SelectedClip = null;
-            Project = _projectMapper.ToUi(state, filePath);
+            Project = restored;
+            SelectedClip = selectedClipId is Guid id ? Project.FindClip(id) : null;
             Playhead = Math.Min(Playhead, Project.Duration);
             IsDirty = true;
         }
@@ -1073,6 +1068,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         ScheduleAutosave();
         NotifyHistoryChanged();
     }
+
+    private sealed record DerivedMediaState(
+        string? ThumbnailPath,
+        IReadOnlyList<string> TimelineFrames,
+        KadrStudio.Application.Caching.WaveformPyramid Waveform,
+        bool IsMissing);
 
     private void AttachProject(EditorProject project)
     {

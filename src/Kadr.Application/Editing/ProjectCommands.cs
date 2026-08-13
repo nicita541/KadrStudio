@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using KadrStudio.Core.Domain;
 using static KadrStudio.Application.Editing.CommandHelpers;
+using KadrStudio.Application.Media;
 
 namespace KadrStudio.Application.Editing;
 
@@ -28,6 +29,39 @@ public sealed record AddSourcesCommand(IReadOnlyList<MediaSource> Sources) : IEd
         }
         return project with { Sources = sources };
     }
+}
+
+public sealed record RelinkSourcesCommand(IReadOnlyList<RelinkCandidate> Candidates) : IEditCommand
+{
+    public string Description => "Relink media";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var sources = project.Sources;
+        foreach (var candidate in Candidates)
+        {
+            if (!candidate.CanApply || candidate.Probe is null)
+                throw new EditRejectedException($"Source {candidate.SourceId} has no compatible relink candidate.");
+            if (!sources.TryGetValue(candidate.SourceId, out var source))
+                throw new EditRejectedException($"Source {candidate.SourceId} does not exist in the project.");
+            sources = sources.SetItem(source.Id, MediaRelink.Apply(source, candidate.Probe));
+        }
+        return project with { Sources = sources };
+    }
+}
+
+public sealed record RefreshMediaOnlineStateCommand(IReadOnlyDictionary<Guid, bool> OnlineBySource) : IEditCommand
+{
+    public string Description => "Refresh media online state";
+
+    public ProjectState Apply(ProjectState project) => project with
+    {
+        Sources = project.Sources.ToImmutableDictionary(
+            pair => pair.Key,
+            pair => OnlineBySource.TryGetValue(pair.Key, out var online)
+                ? pair.Value with { OnlineState = online ? MediaOnlineState.Online : MediaOnlineState.Offline }
+                : pair.Value)
+    };
 }
 
 public sealed record AddTrackCommand(TimelineTrack Track) : IEditCommand

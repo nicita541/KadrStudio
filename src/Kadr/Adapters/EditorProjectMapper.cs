@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using KadrStudio.Core.Domain;
 using KadrStudio.Models;
+using KadrStudio.Application.Media;
 using CoreMarkerKind = KadrStudio.Core.Domain.MarkerKind;
 using CoreMediaKind = KadrStudio.Core.Domain.MediaKind;
 using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
@@ -232,7 +233,8 @@ public sealed class EditorProjectMapper
                 Query = marker.Query
             });
         }
-        foreach (var asset in result.Media) asset.IsMissing = !File.Exists(asset.Path);
+        foreach (var asset in result.Media)
+            asset.IsMissing = project.Sources[asset.Id].OnlineState != MediaOnlineState.Online || !File.Exists(asset.Path);
         return result;
     }
 
@@ -284,12 +286,28 @@ public sealed class EditorProjectMapper
     };
 
     public MediaSource ToCoreSource(MediaAsset asset)
-        => new(
+    {
+        if (asset.ProbeResult is { } probe)
+        {
+            var video = probe.Streams.FirstOrDefault(item => item.Kind == MediaStreamKind.Video);
+            var audio = probe.Streams.FirstOrDefault(item => item.Kind == MediaStreamKind.Audio);
+            return new MediaSource(
+                asset.Id, probe.Path, asset.Name, probe.Kind, probe.Duration, audio is not null,
+                probe.Width, probe.Height, probe.FrameRate, video?.Codec ?? string.Empty,
+                audio?.Codec ?? string.Empty, probe.Fingerprint.Length, probe.Fingerprint.LastWriteUtcTicks,
+                probe.Fingerprint.FastHash, OnlineState: MediaOnlineState.Online,
+                FastFingerprint: probe.Fingerprint.FastHash,
+                VerifiedFingerprint: probe.Fingerprint.VerifiedHash ?? string.Empty,
+                Streams: probe.Streams, IsVariableFrameRate: probe.IsVariableFrameRate);
+        }
+        return new MediaSource(
             asset.Id, Path.GetFullPath(asset.Path), asset.Name, (CoreMediaKind)(int)asset.Kind,
             Time(asset.Duration), asset.HasAudio, asset.Width, asset.Height,
             asset.FrameRate > 0 ? ApproximateFrameRate(asset.FrameRate) : null,
             asset.VideoCodec, asset.AudioCodec, asset.FileSizeBytes,
-            SafeLastWriteTicks(asset.Path), BuildFingerprint(asset));
+            SafeLastWriteTicks(asset.Path), BuildFingerprint(asset),
+            OnlineState: File.Exists(asset.Path) ? MediaOnlineState.Online : MediaOnlineState.Offline);
+    }
 
     private static MediaAsset ToUiSource(MediaSource source)
         => new()
@@ -305,7 +323,14 @@ public sealed class EditorProjectMapper
             HasAudio = source.HasAudio,
             VideoCodec = source.VideoCodec,
             AudioCodec = source.AudioCodec,
-            FileSizeBytes = source.FileSize
+            FileSizeBytes = source.FileSize,
+            ProbeResult = new MediaProbeResult(
+                source.Path, source.Kind, source.Duration,
+                source.Streams.IsDefault ? [] : source.Streams,
+                new MediaFingerprint(source.FileSize, source.LastWriteUtcTicks,
+                    string.IsNullOrWhiteSpace(source.FastFingerprint) ? source.Fingerprint : source.FastFingerprint,
+                    string.IsNullOrWhiteSpace(source.VerifiedFingerprint) ? null : source.VerifiedFingerprint),
+                source.Width, source.Height, source.FrameRate, source.IsVariableFrameRate)
         };
 
     private static FrameRate ApproximateFrameRate(double fps)

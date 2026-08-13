@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using KadrStudio.ViewModels;
 using KadrStudio.Application.Caching;
+using KadrStudio.Application.Media;
 
 namespace KadrStudio.Models;
 
@@ -30,6 +31,9 @@ public sealed class MediaAsset : ObservableObject
     public string VideoCodec { get; set; } = string.Empty;
     public string AudioCodec { get; set; } = string.Empty;
     public long FileSizeBytes { get; set; }
+
+    [JsonIgnore]
+    public MediaProbeResult? ProbeResult { get; set; }
 
     public string? ThumbnailPath
     {

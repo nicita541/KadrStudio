@@ -2,6 +2,8 @@ using KadrStudio.Application.Rendering;
 using KadrStudio.Models;
 using KadrStudio.Playback;
 using KadrStudio.Services;
+using KadrStudio.Application.Media;
+using KadrStudio.Core.Domain;
 using UiMediaKind = KadrStudio.Models.MediaKind;
 using UiTrackKind = KadrStudio.Models.TrackKind;
 using Xunit;
@@ -118,6 +120,39 @@ public sealed class MediaPipelineIntegrationTests
             Assert.Contains(basePeaks, peak => peak.MaximumLeft > 0.7f && peak.MaximumRight == 0);
             Assert.Contains(basePeaks, peak => peak.MaximumRight > 0.3f);
             Assert.Equal(800, asset.Waveform.ReadColumns(0, 1, 800).Length);
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task Ffprobe_ingest_preserves_fractional_rate_and_stream_layout()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var source = Path.Combine(root, "fractional.mp4");
+            var create = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=s=320x180:r=24000/1001:d=1",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", source
+            ]);
+            Assert.Equal(0, create.ExitCode);
+            IMediaProbe probe = new MediaProbeService(locator, new ProcessRunner());
+
+            var result = await probe.ProbeAsync(source, verifyContent: true);
+
+            Assert.Equal(FrameRate.Fps23976, result.FrameRate);
+            var video = result.Streams.Single(item => item.Kind == MediaStreamKind.Video);
+            var audio = result.Streams.Single(item => item.Kind == MediaStreamKind.Audio);
+            Assert.Equal(FrameRate.Fps23976, video.FrameRate);
+            Assert.Equal(48_000, audio.SampleRate);
+            Assert.Equal(2, audio.Channels);
+            Assert.NotNull(result.Fingerprint.VerifiedHash);
         }
         finally { DeleteRoot(root); }
     }

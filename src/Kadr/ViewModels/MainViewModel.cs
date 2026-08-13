@@ -5,6 +5,8 @@ using System.Windows.Data;
 using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
+using KadrStudio.Application.Media;
+using KadrStudio.Infrastructure.Media;
 using KadrStudio.Models;
 using KadrStudio.Services;
 
@@ -20,6 +22,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private readonly EditorProjectMapper _projectMapper = new();
     private readonly AutomationProposalApplier _automationProposalApplier = new();
     private readonly AutomationProposalValidator _automationProposalValidator = new();
+    private readonly IMediaRegistry _mediaRegistry;
     private EditorSession _editorSession;
     private readonly List<TimelineClip> _subscribedClips = new();
     private readonly List<TextOverlay> _subscribedTextOverlays = new();
@@ -47,6 +50,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _project = EditorProject.CreateNew();
         _editorSession = new EditorSession(_projectMapper.ToCore(_project));
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
+        _mediaRegistry = new MediaRegistry(MediaProbeService);
         ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
         _renderCoordinator = new TimelineRenderCoordinator(_ffmpegLocator);
         TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
@@ -367,6 +371,38 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 clip.LinkGroupId, clip.Track == TrackKind.Visual)));
         ExecuteCoreCommand("Клип добавлен на таймлайн",
             new EnsureTrackAndAddMediaClipsCommand(additions), clip.Id);
+    }
+
+    public void RefreshMediaOnlineState()
+    {
+        var online = _editorSession.State.Sources.ToDictionary(pair => pair.Key, pair => File.Exists(pair.Value.Path));
+        ExecuteCoreCommand("Media availability refreshed", new RefreshMediaOnlineStateCommand(online));
+    }
+
+    public async Task<RelinkCandidate> RelinkMediaAsync(
+        Guid sourceId,
+        string candidatePath,
+        bool verifyContent = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (!_editorSession.State.Sources.TryGetValue(sourceId, out var source))
+            throw new KeyNotFoundException($"Media source {sourceId} was not found.");
+        var candidate = await _mediaRegistry.ValidateRelinkAsync(
+            source, candidatePath, verifyContent, cancellationToken);
+        if (candidate.CanApply)
+            ExecuteCoreCommand("Media relinked", new RelinkSourcesCommand([candidate]));
+        return candidate;
+    }
+
+    public async Task<IReadOnlyList<RelinkCandidate>> FindAndRelinkMissingMediaAsync(
+        IEnumerable<string> searchRoots,
+        CancellationToken cancellationToken = default)
+    {
+        var candidates = await _mediaRegistry.FindRelinkCandidatesAsync(
+            _editorSession.State, searchRoots, cancellationToken);
+        if (!candidates.IsDefaultOrEmpty)
+            ExecuteCoreCommand("Missing media relinked", new RelinkSourcesCommand(candidates));
+        return candidates;
     }
 
     public void DeleteSelectedClip()
@@ -759,7 +795,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             SelectedAsset = null;
             Playhead = 0;
             Project = project;
-            _editorSession = new EditorSession(_projectMapper.ToCore(Project));
+            var refreshed = _mediaRegistry.RefreshOnlineState(_projectMapper.ToCore(Project));
+            _editorSession = new EditorSession(refreshed);
+            Project = _projectMapper.ToUi(refreshed, path);
             IsDirty = false;
             StatusText = $"Открыт проект: {Path.GetFileName(path)}";
             NotifyHistoryChanged();
@@ -801,7 +839,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         SelectedAsset = null;
         Playhead = 0;
         Project = project;
-        _editorSession = new EditorSession(_projectMapper.ToCore(Project));
+        var refreshed = _mediaRegistry.RefreshOnlineState(_projectMapper.ToCore(Project));
+        _editorSession = new EditorSession(refreshed);
+        Project = _projectMapper.ToUi(refreshed, project.FilePath);
         IsDirty = true;
         StatusText = "Несохранённый проект восстановлен";
         NotifyHistoryChanged();
@@ -899,7 +939,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         var derivedMedia = Project.Media.ToDictionary(
             asset => asset.Id,
             asset => new DerivedMediaState(
-                asset.ThumbnailPath, asset.TimelineFramePaths, asset.Waveform, asset.IsMissing));
+                asset.ThumbnailPath, asset.TimelineFramePaths, asset.Waveform));
         var restored = _projectMapper.ToUi(state, filePath);
         foreach (var asset in restored.Media)
         {
@@ -907,7 +947,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             asset.ThumbnailPath = derived.ThumbnailPath;
             asset.TimelineFramePaths = derived.TimelineFrames;
             asset.Waveform = derived.Waveform;
-            asset.IsMissing = derived.IsMissing;
         }
         _suppressDirtyTracking = true;
         try
@@ -930,8 +969,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private sealed record DerivedMediaState(
         string? ThumbnailPath,
         IReadOnlyList<string> TimelineFrames,
-        KadrStudio.Application.Caching.WaveformPyramid Waveform,
-        bool IsMissing);
+        KadrStudio.Application.Caching.WaveformPyramid Waveform);
 
     private void AttachProject(EditorProject project)
     {

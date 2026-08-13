@@ -1,5 +1,6 @@
 using KadrStudio.Adapters;
 using KadrStudio.Models;
+using KadrStudio.Playback;
 using KadrStudio.Services;
 using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
 using UiTrackKind = KadrStudio.Models.TrackKind;
@@ -8,6 +9,24 @@ namespace KadrStudio.UiAdapters.Tests;
 
 public sealed class EditorProjectMapperTests
 {
+    [Fact]
+    public void Published_libvlc_runtime_location_is_resolved_explicitly()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "libvlc-path-tests", Guid.NewGuid().ToString("N"));
+        var runtime = Path.Combine(root, "libvlc", "win-x64");
+        Directory.CreateDirectory(Path.Combine(runtime, "plugins"));
+        File.WriteAllBytes(Path.Combine(runtime, "libvlc.dll"), [1]);
+        File.WriteAllBytes(Path.Combine(runtime, "libvlccore.dll"), [1]);
+        try
+        {
+            Assert.Equal(runtime, PreviewPlaybackController.ResolveNativeDirectory(root));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public void Mutable_ui_project_roundtrips_through_immutable_core()
     {
@@ -101,15 +120,42 @@ public sealed class EditorProjectMapperTests
             await projectService.SaveAsync(project, path);
             var history = new ProjectHistoryService(Path.Combine(root, "local"));
 
-            var entry = history.CreateCheckpoint(project, "before rename");
+            var entry = await history.CreateCheckpointAsync(project, "before rename");
             project.Name = "After";
             await projectService.SaveAsync(project, path);
-            var restored = history.RestoreCheckpoint(entry, path);
+            var restored = await history.RestoreCheckpointAsync(entry, path);
 
             Assert.Equal("Before", restored.Name);
-            Assert.Single(history.GetCheckpoints(project));
-            history.DeleteCheckpoint(entry);
-            Assert.Empty(history.GetCheckpoints(project));
+            Assert.Single(await history.GetCheckpointsAsync(project));
+            await history.DeleteCheckpointAsync(entry);
+            Assert.Empty(await history.GetCheckpointsAsync(project));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Concurrent_autosaves_are_serialized_and_latest_snapshot_wins()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "autosave-adapter-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var service = new ProjectService(root);
+            var project = EditorProject.CreateNew();
+            project.Name = "Revision 1";
+            var first = service.SaveAutosaveAsync(project);
+            project.Name = "Revision 2";
+            var second = service.SaveAutosaveAsync(project);
+
+            await Task.WhenAll(first, second);
+            var restored = await service.OpenAutosaveAsync();
+
+            Assert.Equal("Revision 2", restored.Name);
+            await service.DeleteAutosaveAsync();
+            Assert.False(await service.HasAutosaveAsync());
         }
         finally
         {

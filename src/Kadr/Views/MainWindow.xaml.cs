@@ -28,6 +28,7 @@ public partial class MainWindow : Window
     private bool _isPlaying;
     private bool _allowClose;
     private bool _isCloseConfirmationPending;
+    private bool _isShutdownComplete;
     private double _playbackStartSeconds;
     private PreviewPlaybackController? _previewPlayback;
     private TimelinePreviewSession? _previewSession;
@@ -114,7 +115,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_viewModel.HasAutosave)
+        if (await _viewModel.HasAutosaveAsync())
         {
             var result = MessageBox.Show(
                 this,
@@ -131,13 +132,13 @@ public partial class MainWindow : Window
                 }
                 catch (Exception exception)
                 {
-                    _viewModel.DiscardAutosave();
+                    await _viewModel.DiscardAutosaveAsync();
                     ShowError("Не удалось восстановить проект", exception);
                 }
             }
             else
             {
-                _viewModel.DiscardAutosave();
+                await _viewModel.DiscardAutosaveAsync();
             }
         }
     }
@@ -179,7 +180,7 @@ public partial class MainWindow : Window
         }
 
         StopPlayback();
-        _viewModel.NewProject();
+        await _viewModel.NewProjectAsync();
         ResetPreviewState();
     }
 
@@ -243,10 +244,10 @@ public partial class MainWindow : Window
         new ProjectHistoryWindow(_viewModel) { Owner = this }.ShowDialog();
     }
 
-    private void ShowHistory_Click(object sender, RoutedEventArgs e)
+    private async void ShowHistory_Click(object sender, RoutedEventArgs e)
     {
         SetLeftPanel(showAnalysis: false, showHistory: true, showText: false);
-        RefreshInlineHistory();
+        await RefreshInlineHistoryAsync();
     }
 
     private void OpenAudioWorkspace_Click(object sender, RoutedEventArgs e)
@@ -558,10 +559,10 @@ public partial class MainWindow : Window
         TextNavButton.Tag = showText ? "Selected" : null;
     }
 
-    private void RefreshInlineHistory(Guid? selectedId = null)
+    private async Task RefreshInlineHistoryAsync(Guid? selectedId = null)
     {
         _inlineHistoryEntries.Clear();
-        foreach (var entry in _viewModel.GetHistoryCheckpoints())
+        foreach (var entry in await _viewModel.GetHistoryCheckpointsAsync())
         {
             _inlineHistoryEntries.Add(entry);
         }
@@ -572,12 +573,12 @@ public partial class MainWindow : Window
             : _inlineHistoryEntries.FirstOrDefault();
     }
 
-    private void CreateInlineCheckpoint_Click(object sender, RoutedEventArgs e)
+    private async void CreateInlineCheckpoint_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            var entry = _viewModel.CreateHistoryCheckpoint(InlineHistoryMessageTextBox.Text);
-            RefreshInlineHistory(entry.Id);
+            var entry = await _viewModel.CreateHistoryCheckpointAsync(InlineHistoryMessageTextBox.Text);
+            await RefreshInlineHistoryAsync(entry.Id);
             InlineHistoryMessageTextBox.SelectAll();
         }
         catch (Exception exception)
@@ -586,11 +587,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private void RestoreInlineCheckpoint_Click(object sender, RoutedEventArgs e) => RestoreInlineCheckpoint();
+    private async void RestoreInlineCheckpoint_Click(object sender, RoutedEventArgs e) => await RestoreInlineCheckpointAsync();
 
-    private void InlineHistoryList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => RestoreInlineCheckpoint();
+    private async void InlineHistoryList_MouseDoubleClick(object sender, MouseButtonEventArgs e) => await RestoreInlineCheckpointAsync();
 
-    private void RestoreInlineCheckpoint()
+    private async Task RestoreInlineCheckpointAsync()
     {
         if (InlineHistoryList.SelectedItem is not ProjectHistoryEntry entry)
         {
@@ -608,9 +609,9 @@ public partial class MainWindow : Window
         }
         try
         {
-            _viewModel.RestoreHistoryCheckpoint(entry);
+            await _viewModel.RestoreHistoryCheckpointAsync(entry);
             ResetPreviewState();
-            RefreshInlineHistory();
+            await RefreshInlineHistoryAsync();
         }
         catch (Exception exception)
         {
@@ -678,7 +679,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ImportSrt_Click(object sender, RoutedEventArgs e)
+    private async void ImportSrt_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
         {
@@ -698,13 +699,14 @@ public partial class MainWindow : Window
                 throw new InvalidDataException("В SRT не найдено корректных реплик.");
             }
             var offset = _viewModel.Project.InPoint ?? 0;
-            _viewModel.CreateHistoryCheckpoint("Авто: перед импортом субтитров");
-            _viewModel.BeginEdit();
-            foreach (var cue in cues)
-            {
-                _viewModel.Project.TextOverlays.Add(CreateSubtitleOverlay(offset + cue.Start, cue.End - cue.Start, cue.Text));
-            }
-            _viewModel.CommitEdit($"Импортировано субтитров: {cues.Count}");
+            var snapshot = _viewModel.CaptureAutomationSnapshot();
+            var overlays = cues
+                .Select(cue => CreateSubtitleOverlay(offset + cue.Start, cue.End - cue.Start, cue.Text))
+                .ToArray();
+            var proposal = _viewModel.CreateSubtitleProposal(snapshot, overlays, "srt-import");
+            var applied = await _viewModel.ApplyAutomationProposalAsync(proposal);
+            if (!applied.Applied) throw new InvalidOperationException(applied.Message);
+            _viewModel.StatusText = $"Импортировано субтитров: {cues.Count}";
             TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.LastOrDefault();
         }
         catch (Exception exception)
@@ -749,16 +751,15 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException(
                     "Субтитры не найдены. Добавьте русскую дорожку субтитров в файл либо положите whisper-cli.exe и модель ggml-*.bin в папку tools.");
             }
-            _viewModel.CreateHistoryCheckpoint("Авто: перед созданием автосубтитров");
-            _viewModel.BeginEdit();
-            foreach (var cue in cues)
-            {
-                _viewModel.Project.TextOverlays.Add(CreateSubtitleOverlay(
+            var overlays = cues
+                .Select(cue => CreateSubtitleOverlay(
                     audioClip.Start + cue.Start,
                     cue.End - cue.Start,
-                    cue.Text));
-            }
-            _viewModel.CommitEdit($"Создано автосубтитров: {cues.Count}");
+                    cue.Text))
+                .ToArray();
+            var proposal = _viewModel.CreateSubtitleProposal(automationSnapshot, overlays, transcription.Engine);
+            var applied = await _viewModel.ApplyAutomationProposalAsync(proposal);
+            if (!applied.Applied) throw new InvalidOperationException(applied.Message);
             TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.LastOrDefault();
             _viewModel.StatusText = $"Создано субтитров: {cues.Count} ({transcription.Engine})";
         }
@@ -875,32 +876,6 @@ public partial class MainWindow : Window
             string? localAiWarning = pipeline.Warning;
             if (!_viewModel.IsAutomationSnapshotCurrent(automationSnapshot))
                 throw new InvalidOperationException("Project changed while video analysis was running. Run the analysis again.");
-#if false
-            string? legacyLocalAiWarning = null;
-            if (false && UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo model)
-            {
-                try
-                {
-                    var enhancement = await _viewModel.OllamaVideoAnalysisService.EnhanceAsync(
-                        asset,
-                        result,
-                        query,
-                        model.Name,
-                        progress,
-                        _analysisCancellation.Token);
-                    result = MergeLocalAiEnhancement(result, enhancement);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception exception)
-                {
-                    localAiWarning = $"Локальный ИИ пропущен: {exception.Message}";
-                }
-            }
-
-#endif
             var mappedMarkers = MapAnalysisMarkers(asset, timelineClips, result, query);
             if (mappedMarkers.Count == 0)
             {
@@ -912,8 +887,11 @@ public partial class MainWindow : Window
 
             var mappedStart = mappedMarkers.Min(marker => marker.Start);
             var mappedEnd = mappedMarkers.Max(marker => marker.End);
-            _viewModel.CreateHistoryCheckpoint("Авто: перед AI-анализом видео");
-            _viewModel.ReplaceAnalysisMarkers(asset.Id, mappedStart, mappedEnd, mappedMarkers);
+            var proposal = _viewModel.CreateAnalysisProposal(
+                automationSnapshot, asset.Id, mappedStart, mappedEnd, mappedMarkers,
+                UseLocalAiCheckBox.IsChecked == true ? "local-ai-analysis" : "technical-analysis");
+            var applied = await _viewModel.ApplyAutomationProposalAsync(proposal, _analysisCancellation.Token);
+            if (!applied.Applied) throw new InvalidOperationException(applied.Message);
             TimelineEditor.InvalidateVisual();
             AnalysisSummaryTextBlock.Text = string.Join(" ",
                 new[] { result.Summary, localAiWarning }.Where(value => !string.IsNullOrWhiteSpace(value)));
@@ -985,24 +963,6 @@ public partial class MainWindow : Window
             _isRefreshingLocalAiModels = false;
             RefreshLocalAiModelsButton.IsEnabled = true;
         }
-    }
-
-    private static VideoAnalysisResult MergeLocalAiEnhancement(
-        VideoAnalysisResult baseline,
-        OllamaAnalysisEnhancement enhancement)
-    {
-        var refinedKinds = enhancement.Ranges.Select(range => range.Kind).ToHashSet();
-        var ranges = baseline.Ranges
-            .Where(range => !refinedKinds.Contains(range.Kind))
-            .Concat(enhancement.Ranges)
-            .OrderBy(range => range.SourceStart)
-            .ThenBy(range => range.Kind)
-            .ToList();
-        var detail = enhancement.UsedVision ? "с просмотром кадров" : "по технической сводке";
-        var summary = string.IsNullOrWhiteSpace(enhancement.Summary)
-            ? $"{baseline.Summary} Локальный ИИ {enhancement.Model} выполнен {detail}."
-            : $"{baseline.Summary} Локальный ИИ {enhancement.Model} ({detail}): {enhancement.Summary}";
-        return baseline with { Summary = summary, Ranges = ranges };
     }
 
     private static List<TimelineMarker> MapAnalysisMarkers(
@@ -1132,9 +1092,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private void AcceptEditReview_Click(object sender, RoutedEventArgs e)
+    private async void AcceptEditReview_Click(object sender, RoutedEventArgs e)
     {
-        _viewModel.AcceptEditPlanReview();
+        await _viewModel.AcceptEditPlanReviewAsync();
         EditReviewPanel.Visibility = Visibility.Collapsed;
         ApplyEditPromptButton.IsEnabled = true;
         RunAnalysisButton.IsEnabled = true;
@@ -2063,7 +2023,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> ConfirmCanLoseChangesAsync()
     {
-        if (!ConfirmPendingEditReview())
+        if (!await ConfirmPendingEditReviewAsync())
         {
             return false;
         }
@@ -2086,14 +2046,14 @@ public partial class MainWindow : Window
 
         if (result == MessageBoxResult.No)
         {
-            _viewModel.DiscardAutosave();
+            await _viewModel.DiscardAutosaveAsync();
             return true;
         }
 
         return false;
     }
 
-    private bool ConfirmPendingEditReview()
+    private async Task<bool> ConfirmPendingEditReviewAsync()
     {
         if (!_viewModel.HasPendingEditReview)
         {
@@ -2113,7 +2073,7 @@ public partial class MainWindow : Window
 
         if (result == MessageBoxResult.Yes)
         {
-            _viewModel.AcceptEditPlanReview();
+            await _viewModel.AcceptEditPlanReviewAsync();
         }
         else
         {
@@ -2129,21 +2089,8 @@ public partial class MainWindow : Window
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
         _analysisCancellation?.Cancel();
-        if (_allowClose || !_viewModel.IsDirty)
+        if (_isShutdownComplete)
         {
-            StopPlayback();
-            if (_previewPlayback is not null)
-            {
-                _previewPlayback.VideoPresented -= PreviewPlayback_VideoPresented;
-                _previewPlayback.VideoEnded -= PreviewPlayback_VideoEnded;
-                _previewPlayback.VideoFailed -= PreviewPlayback_VideoFailed;
-                _previewPlayback.AudioFailed -= PreviewPlayback_AudioFailed;
-                _previewPlayback.Dispose();
-                _previewPlayback = null;
-            }
-            _previewSession?.Dispose();
-            _previewSession = null;
-            _viewModel.Dispose();
             return;
         }
 
@@ -2163,12 +2110,14 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (!await ConfirmCanLoseChangesAsync())
+            if (!_allowClose && !await ConfirmCanLoseChangesAsync())
             {
                 return;
             }
 
             _allowClose = true;
+            await ShutdownAsync();
+            _isShutdownComplete = true;
             Close();
         }
         catch (Exception exception)
@@ -2179,6 +2128,23 @@ public partial class MainWindow : Window
         {
             _isCloseConfirmationPending = false;
         }
+    }
+
+    private async Task ShutdownAsync()
+    {
+        StopPlayback();
+        if (_previewPlayback is not null)
+        {
+            _previewPlayback.VideoPresented -= PreviewPlayback_VideoPresented;
+            _previewPlayback.VideoEnded -= PreviewPlayback_VideoEnded;
+            _previewPlayback.VideoFailed -= PreviewPlayback_VideoFailed;
+            _previewPlayback.AudioFailed -= PreviewPlayback_AudioFailed;
+            _previewPlayback.Dispose();
+            _previewPlayback = null;
+        }
+        _previewSession?.Dispose();
+        _previewSession = null;
+        await _viewModel.DisposeAsync();
     }
 
     private void Window_KeyDown(object sender, KeyEventArgs e)

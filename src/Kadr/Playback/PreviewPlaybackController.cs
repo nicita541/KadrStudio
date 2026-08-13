@@ -29,7 +29,8 @@ public sealed class PreviewPlaybackController : IDisposable
     public PreviewPlaybackController(VideoView videoView)
     {
         ArgumentNullException.ThrowIfNull(videoView);
-        LibVLCSharp.Shared.Core.Initialize();
+        var nativeDirectory = ResolveNativeDirectory();
+        LibVLCSharp.Shared.Core.Initialize(nativeDirectory);
         _videoView = videoView;
         _libVlc = new LibVLC("--no-video-title-show", "--quiet", "--no-snapshot-preview");
         _videoPlayer = new MediaPlayer(_libVlc) { Mute = true, Volume = 0 };
@@ -188,6 +189,27 @@ public sealed class PreviewPlaybackController : IDisposable
         var fullPath = Path.GetFullPath(path);
         if (!File.Exists(fullPath)) throw new FileNotFoundException("Preview segment was not found.", fullPath);
         return new Media(_libVlc, fullPath, FromType.FromPath);
+    }
+
+    public static string ResolveNativeDirectory(string? applicationDirectory = null)
+    {
+        var root = Path.GetFullPath(applicationDirectory ?? AppContext.BaseDirectory);
+        var architecture = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
+        {
+            System.Runtime.InteropServices.Architecture.X64 => "win-x64",
+            System.Runtime.InteropServices.Architecture.X86 => "win-x86",
+            System.Runtime.InteropServices.Architecture.Arm64 => "win-arm64",
+            var value => throw new PlatformNotSupportedException($"LibVLC is not packaged for {value}.")
+        };
+        var directory = Path.Combine(root, "libvlc", architecture);
+        if (!File.Exists(Path.Combine(directory, "libvlc.dll")) ||
+            !File.Exists(Path.Combine(directory, "libvlccore.dll")) ||
+            !Directory.Exists(Path.Combine(directory, "plugins")))
+        {
+            throw new FileNotFoundException(
+                $"LibVLC runtime is incomplete for {architecture}. Rebuild the release package.", directory);
+        }
+        return directory;
     }
 
     private void VideoPlayer_Playing(object? sender, EventArgs e)

@@ -13,6 +13,7 @@ public sealed class ProjectHistoryService
     private readonly SqliteProjectStore _store = new();
     private readonly EditorProjectMapper _mapper = new();
     private readonly string _historyRoot;
+    private readonly SemaphoreSlim _operationGate = new(1, 1);
 
     public ProjectHistoryService(string? historyRoot = null)
     {
@@ -22,50 +23,84 @@ public sealed class ProjectHistoryService
         Directory.CreateDirectory(_historyRoot);
     }
 
-    public ProjectHistoryEntry CreateCheckpoint(
+    public async Task<ProjectHistoryEntry> CreateCheckpointAsync(
         EditorProject project,
         string message,
-        string? existingSnapshot = null)
+        string? existingSnapshot = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(project);
         var checkpointProject = existingSnapshot is null ? project : ProjectJson.Deserialize(existingSnapshot);
-        var path = EnsureHistoryDocument(project);
         var core = _mapper.ToCore(checkpointProject);
-        var info = _store.CreateCheckpointAsync(path, core, NormalizeMessage(message)).GetAwaiter().GetResult();
-        return ToEntry(info.Id, info.ProjectId, info.CreatedAt, info.Name, path);
+        var path = GetHistoryPath(project);
+        await _operationGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!File.Exists(path))
+                await _store.SaveAsync(path, core, cancellationToken);
+            var info = await _store.CreateCheckpointAsync(path, core, NormalizeMessage(message), cancellationToken);
+            return ToEntry(info.Id, info.ProjectId, info.CreatedAt, info.Name, path);
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
     }
 
-    public IReadOnlyList<ProjectHistoryEntry> GetCheckpoints(EditorProject project)
+    public async Task<IReadOnlyList<ProjectHistoryEntry>> GetCheckpointsAsync(
+        EditorProject project,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(project);
         var path = GetHistoryPath(project);
         if (!File.Exists(path)) return [];
-        return _store.GetCheckpointsAsync(path).GetAwaiter().GetResult()
-            .Select(item => ToEntry(item.Id, item.ProjectId, item.CreatedAt, item.Name, path))
-            .ToArray();
+        await _operationGate.WaitAsync(cancellationToken);
+        try
+        {
+            return (await _store.GetCheckpointsAsync(path, cancellationToken))
+                .Select(item => ToEntry(item.Id, item.ProjectId, item.CreatedAt, item.Name, path))
+                .ToArray();
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
     }
 
-    public EditorProject RestoreCheckpoint(ProjectHistoryEntry entry, string? projectFilePath)
+    public async Task<EditorProject> RestoreCheckpointAsync(
+        ProjectHistoryEntry entry,
+        string? projectFilePath,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
         var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
-        var core = _store.RestoreCheckpointAsync(path, entry.Id).GetAwaiter().GetResult();
-        return _mapper.ToUi(core, projectFilePath);
+        await _operationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var core = await _store.RestoreCheckpointAsync(path, entry.Id, cancellationToken);
+            return _mapper.ToUi(core, projectFilePath);
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
     }
 
-    public void DeleteCheckpoint(ProjectHistoryEntry entry)
+    public async Task DeleteCheckpointAsync(
+        ProjectHistoryEntry entry,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
         var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
-        _store.DeleteCheckpointAsync(path, entry.Id).GetAwaiter().GetResult();
-    }
-
-    private string EnsureHistoryDocument(EditorProject project)
-    {
-        var path = GetHistoryPath(project);
-        if (!File.Exists(path))
-            _store.SaveAsync(path, _mapper.ToCore(project)).GetAwaiter().GetResult();
-        return path;
+        await _operationGate.WaitAsync(cancellationToken);
+        try
+        {
+            await _store.DeleteCheckpointAsync(path, entry.Id, cancellationToken);
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
     }
 
     private string GetHistoryPath(EditorProject project)

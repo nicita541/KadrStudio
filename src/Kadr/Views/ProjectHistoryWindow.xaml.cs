@@ -13,15 +13,15 @@ public partial class ProjectHistoryWindow : Window
     {
         InitializeComponent();
         _viewModel = viewModel;
-        RefreshHistory();
+        Loaded += async (_, _) => await RefreshHistoryAsync();
     }
 
-    private void CreateCheckpoint_Click(object sender, RoutedEventArgs e)
+    private async void CreateCheckpoint_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            var entry = _viewModel.CreateHistoryCheckpoint(CheckpointMessageTextBox.Text);
-            RefreshHistory(entry.Id);
+            var entry = await _viewModel.CreateHistoryCheckpointAsync(CheckpointMessageTextBox.Text);
+            await RefreshHistoryAsync(entry.Id);
             CheckpointMessageTextBox.SelectAll();
             CheckpointMessageTextBox.Focus();
         }
@@ -31,11 +31,11 @@ public partial class ProjectHistoryWindow : Window
         }
     }
 
-    private void RestoreCheckpoint_Click(object sender, RoutedEventArgs e) => RestoreSelectedCheckpoint();
+    private async void RestoreCheckpoint_Click(object sender, RoutedEventArgs e) => await RestoreSelectedCheckpointAsync();
 
-    private void HistoryListBox_MouseDoubleClick(object sender, MouseButtonEventArgs e) => RestoreSelectedCheckpoint();
+    private async void HistoryListBox_MouseDoubleClick(object sender, MouseButtonEventArgs e) => await RestoreSelectedCheckpointAsync();
 
-    private void RestoreSelectedCheckpoint()
+    private async Task RestoreSelectedCheckpointAsync()
     {
         if (HistoryListBox.SelectedItem is not ProjectHistoryEntry entry)
         {
@@ -56,8 +56,8 @@ public partial class ProjectHistoryWindow : Window
 
         try
         {
-            _viewModel.RestoreHistoryCheckpoint(entry);
-            RefreshHistory();
+            await _viewModel.RestoreHistoryCheckpointAsync(entry);
+            await RefreshHistoryAsync();
         }
         catch (Exception exception)
         {
@@ -65,7 +65,7 @@ public partial class ProjectHistoryWindow : Window
         }
     }
 
-    private void DeleteCheckpoint_Click(object sender, RoutedEventArgs e)
+    private async void DeleteCheckpoint_Click(object sender, RoutedEventArgs e)
     {
         if (HistoryListBox.SelectedItem is not ProjectHistoryEntry entry)
         {
@@ -85,8 +85,8 @@ public partial class ProjectHistoryWindow : Window
 
         try
         {
-            _viewModel.DeleteHistoryCheckpoint(entry);
-            RefreshHistory();
+            await _viewModel.DeleteHistoryCheckpointAsync(entry);
+            await RefreshHistoryAsync();
         }
         catch (Exception exception)
         {
@@ -94,9 +94,9 @@ public partial class ProjectHistoryWindow : Window
         }
     }
 
-    private void RefreshHistory(Guid? selectId = null)
+    private async Task RefreshHistoryAsync(Guid? selectId = null)
     {
-        var entries = _viewModel.GetHistoryCheckpoints();
+        var entries = await _viewModel.GetHistoryCheckpointsAsync();
         HistoryListBox.ItemsSource = entries;
         EmptyHistoryTextBlock.Visibility = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         if (selectId is Guid id)

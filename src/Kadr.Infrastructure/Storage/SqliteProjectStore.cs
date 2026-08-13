@@ -9,7 +9,8 @@ namespace KadrStudio.Infrastructure.Storage;
 
 public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IProjectStore
 {
-    private const int CurrentSchemaVersion = 1;
+    private const int CurrentSchemaVersion = 2;
+    private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
     public async Task SaveAsync(string path, ProjectState project, CancellationToken cancellationToken = default)
@@ -158,13 +159,15 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ("$updatedAt", project.UpdatedAt.ToString("O", CultureInfo.InvariantCulture)),
             ("$inPoint", project.InPoint?.Ticks), ("$outPoint", project.OutPoint?.Ticks)).ConfigureAwait(false);
 
-        foreach (var track in project.Tracks)
+        for (var ordinal = 0; ordinal < project.Tracks.Length; ordinal++)
         {
+            var track = project.Tracks[ordinal];
             await ExecuteAsync(connection, transaction, """
-                INSERT INTO tracks(id, kind, track_index, name, is_muted, is_locked, is_visible)
-                VALUES($id, $kind, $index, $name, $muted, $locked, $visible);
+                INSERT INTO tracks(id, track_order, kind, track_index, name, is_muted, is_locked, is_visible)
+                VALUES($id, $order, $kind, $index, $name, $muted, $locked, $visible);
                 """, token,
-                ("$id", track.Id.ToString("N")), ("$kind", (int)track.Kind), ("$index", track.Index),
+                ("$id", track.Id.ToString("N")), ("$order", ordinal),
+                ("$kind", (int)track.Kind), ("$index", track.Index),
                 ("$name", track.Name), ("$muted", track.IsMuted), ("$locked", track.IsLocked),
                 ("$visible", track.IsVisible)).ConfigureAwait(false);
         }
@@ -288,7 +291,11 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
         var tracks = ImmutableArray.CreateBuilder<TimelineTrack>();
         await using (var command = connection.CreateCommand())
         {
-            command.CommandText = """
+            var hasStoredOrder = await HasColumnAsync(connection, "tracks", "track_order", token).ConfigureAwait(false);
+            command.CommandText = hasStoredOrder ? """
+                SELECT id, kind, track_index, name, is_muted, is_locked, is_visible
+                FROM tracks ORDER BY track_order;
+                """ : """
                 SELECT id, kind, track_index, name, is_muted, is_locked, is_visible
                 FROM tracks ORDER BY kind, track_index;
                 """;
@@ -462,6 +469,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ) STRICT;
             CREATE TABLE IF NOT EXISTS tracks(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                track_order INTEGER NOT NULL UNIQUE CHECK(track_order >= 0),
                 kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
                 track_index INTEGER NOT NULL CHECK(track_index >= 0),
                 name TEXT NOT NULL CHECK(length(name) > 0),
@@ -574,8 +582,23 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             throw new InvalidDataException("Файл не является проектом Kadr Studio SQLite.");
         if (version > CurrentSchemaVersion)
             throw new InvalidDataException("Проект создан более новой версией Kadr Studio.");
-        if (version < CurrentSchemaVersion)
+        if (version < OldestReadableSchemaVersion)
             throw new InvalidDataException($"Для схемы проекта {version} отсутствует миграция до {CurrentSchemaVersion}.");
+    }
+
+    private static async Task<bool> HasColumnAsync(
+        SqliteConnection connection,
+        string table,
+        string column,
+        CancellationToken token)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info({table});";
+        await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+        while (await reader.ReadAsync(token).ConfigureAwait(false))
+            if (reader.GetString(1).Equals(column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
     }
 
     private static async Task<CheckpointDocument[]> ReadCheckpointDocumentsAsync(string path, CancellationToken token)

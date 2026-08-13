@@ -10,7 +10,7 @@ using KadrStudio.Services;
 
 namespace KadrStudio.ViewModels;
 
-public sealed class MainViewModel : ObservableObject, IDisposable
+public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 {
     private readonly FfmpegLocator _ffmpegLocator = new();
     private readonly ProcessRunner _processRunner = new();
@@ -40,6 +40,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private double _editReviewPlayhead;
     private bool _editReviewWasDirty;
     private bool _suppressDirtyTracking;
+    private int _disposeState;
 
     public MainViewModel()
     {
@@ -189,8 +190,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string TimelineDurationLabel => FormatTime(Project.Duration);
     public bool CanUndo => _editorSession.CanUndo;
     public bool CanRedo => _editorSession.CanRedo;
-    public bool HasAutosave => _projectService.AutosaveExists;
     public bool HasPendingEditReview => _editReviewSnapshot is not null;
+
+    public Task<bool> HasAutosaveAsync(CancellationToken cancellationToken = default)
+        => _projectService.HasAutosaveAsync(cancellationToken);
 
     public ProjectAutomationSnapshot CaptureAutomationSnapshot()
         => ProposalFactory.Capture(_editorSession.State);
@@ -198,7 +201,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsAutomationSnapshotCurrent(ProjectAutomationSnapshot snapshot)
         => snapshot.ProjectId == _editorSession.State.Id && snapshot.BaseRevision == _editorSession.State.Revision;
 
-    public AutomationApplyResult ApplyAutomationProposal(AutomationProposal proposal)
+    public async Task<AutomationApplyResult> ApplyAutomationProposalAsync(
+        AutomationProposal proposal,
+        CancellationToken cancellationToken = default)
     {
         var validation = _automationProposalValidator.Validate(_editorSession.State, proposal);
         if (!validation.IsValid)
@@ -209,8 +214,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 _editorSession.State,
                 string.Join("; ", validation.Errors.Select(item => item.Message)));
         }
+        var checkpointSnapshot = _projectService.CreateSnapshot(Project);
         if (proposal.CreateCheckpoint)
-            ProjectHistoryService.CreateCheckpoint(Project, $"Before: {proposal.Title}");
+            await ProjectHistoryService.CreateCheckpointAsync(
+                Project, $"Before: {proposal.Title}", checkpointSnapshot, cancellationToken);
         var result = _automationProposalApplier.Apply(_editorSession, proposal);
         if (!result.Applied) return result;
         _suppressDirtyTracking = true;
@@ -486,28 +493,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         clip.Duration = Math.Clamp(clip.Duration, 0.1, maximumDuration);
     }
 
-    public void ReplaceAnalysisMarkers(
-        Guid assetId,
-        double timelineStart,
-        double timelineEnd,
-        IEnumerable<TimelineMarker> markers)
-    {
-        BeginEdit();
-        var oldMarkers = Project.Markers
-            .Where(marker => marker.AssetId == assetId && marker.End > timelineStart && marker.Start < timelineEnd)
-            .ToList();
-        foreach (var marker in oldMarkers)
-        {
-            Project.Markers.Remove(marker);
-        }
-
-        foreach (var marker in markers.OrderBy(marker => marker.Start))
-        {
-            Project.Markers.Add(marker);
-        }
-        CommitEdit("Анализ добавлен на таймлайн");
-    }
-
     public void ClearAnalysisMarkers()
     {
         if (Project.Markers.Count == 0)
@@ -565,17 +550,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return completed;
     }
 
-    public void AcceptEditPlanReview()
+    public async Task AcceptEditPlanReviewAsync(CancellationToken cancellationToken = default)
     {
         if (_editReviewSnapshot is null)
         {
             return;
         }
 
-        ProjectHistoryService.CreateCheckpoint(
+        await ProjectHistoryService.CreateCheckpointAsync(
             Project,
             $"До ИИ: {_editReviewReason ?? "команда монтажа"}",
-            _editReviewSnapshot);
+            _editReviewSnapshot,
+            cancellationToken);
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
@@ -623,17 +609,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NotifyHistoryChanged();
     }
 
-    public ProjectHistoryEntry CreateHistoryCheckpoint(string message)
+    public async Task<ProjectHistoryEntry> CreateHistoryCheckpointAsync(
+        string message,
+        CancellationToken cancellationToken = default)
     {
-        var entry = ProjectHistoryService.CreateCheckpoint(Project, message);
+        var entry = await ProjectHistoryService.CreateCheckpointAsync(Project, message, cancellationToken: cancellationToken);
         StatusText = $"Создана контрольная точка: {entry.Message}";
         return entry;
     }
 
-    public IReadOnlyList<ProjectHistoryEntry> GetHistoryCheckpoints()
-        => ProjectHistoryService.GetCheckpoints(Project);
+    public Task<IReadOnlyList<ProjectHistoryEntry>> GetHistoryCheckpointsAsync(CancellationToken cancellationToken = default)
+        => ProjectHistoryService.GetCheckpointsAsync(Project, cancellationToken);
 
-    public void RestoreHistoryCheckpoint(ProjectHistoryEntry entry)
+    public async Task RestoreHistoryCheckpointAsync(
+        ProjectHistoryEntry entry,
+        CancellationToken cancellationToken = default)
     {
         if (entry.ProjectId != Project.Id)
         {
@@ -645,10 +635,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var currentSnapshot = _projectService.CreateSnapshot(Project);
-        ProjectHistoryService.CreateCheckpoint(Project, $"Авто: перед откатом к «{entry.Message}»", currentSnapshot);
+        await ProjectHistoryService.CreateCheckpointAsync(
+            Project, $"Авто: перед откатом к «{entry.Message}»", currentSnapshot, cancellationToken);
 
         var filePath = Project.FilePath;
-        var restored = ProjectHistoryService.RestoreCheckpoint(entry, filePath);
+        var restored = await ProjectHistoryService.RestoreCheckpointAsync(entry, filePath, cancellationToken);
         var restoredCore = _projectMapper.ToCore(restored, _editorSession.State.Revision);
         _editorSession.Execute(new EditTransaction(
             $"Restore checkpoint: {entry.Message}",
@@ -671,13 +662,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NotifyHistoryChanged();
     }
 
-    public void DeleteHistoryCheckpoint(ProjectHistoryEntry entry)
+    public async Task DeleteHistoryCheckpointAsync(
+        ProjectHistoryEntry entry,
+        CancellationToken cancellationToken = default)
     {
         if (entry.ProjectId != Project.Id)
         {
             return;
         }
-        ProjectHistoryService.DeleteCheckpoint(entry);
+        await ProjectHistoryService.DeleteCheckpointAsync(entry, cancellationToken);
         StatusText = $"Контрольная точка удалена: {entry.Message}";
     }
 
@@ -923,10 +916,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         StatusText = "Изменение повторено";
     }
 
-    public void NewProject()
+    public async Task NewProjectAsync(CancellationToken cancellationToken = default)
     {
         CancelAutosave();
-        _projectService.DeleteAutosave();
+        await _projectService.DeleteAutosaveAsync(cancellationToken);
         _editTransactionActive = false;
         _editReviewSnapshot = null;
         _editReviewReason = null;
@@ -947,7 +940,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             CancelAutosave();
-            _projectService.DeleteAutosave();
+            await _projectService.DeleteAutosaveAsync(cancellationToken);
             var project = await _projectService.OpenAsync(path, cancellationToken);
             _editTransactionActive = false;
             _editReviewSnapshot = null;
@@ -986,7 +979,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task RecoverAutosaveAsync(CancellationToken cancellationToken = default)
     {
-        if (!_projectService.AutosaveExists)
+        if (!await _projectService.HasAutosaveAsync(cancellationToken))
         {
             return;
         }
@@ -1004,10 +997,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NotifyHistoryChanged();
     }
 
-    public void DiscardAutosave()
+    public async Task DiscardAutosaveAsync(CancellationToken cancellationToken = default)
     {
         CancelAutosave();
-        _projectService.DeleteAutosave();
+        await _projectService.DeleteAutosaveAsync(cancellationToken);
     }
 
     public void MarkChanged()
@@ -1024,13 +1017,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ScheduleAutosave();
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+            return;
         _autosaveCancellation?.Cancel();
         _autosaveCancellation?.Dispose();
+        await _automationScheduler.DisposeAsync();
+        await _renderCoordinator.DisposeAsync();
         OllamaVideoAnalysisService.Dispose();
-        _renderCoordinator.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        _automationScheduler.DisposeAsync().AsTask().GetAwaiter().GetResult();
         DetachProject(Project);
     }
 

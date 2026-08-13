@@ -7,6 +7,7 @@ using KadrStudio.Services;
 Console.OutputEncoding = Encoding.UTF8;
 var ffmpegLocator = new FfmpegLocator();
 var processRunner = new ProcessRunner();
+await using var renderCoordinator = new TimelineRenderCoordinator(ffmpegLocator);
 using var ollamaService = new OllamaVideoAnalysisService(ffmpegLocator, processRunner);
 if (args is ["--models"])
 {
@@ -16,6 +17,15 @@ if (args is ["--models"])
         Console.WriteLine(availableModel.DisplayName);
     }
     return availableModels.Count > 0 ? 0 : 1;
+}
+
+if (args is ["--make-empty-project", var emptyProjectOutput])
+{
+    var project = EditorProject.CreateNew();
+    project.Name = "Runtime smoke";
+    await new ProjectService().SaveAsync(project, Path.GetFullPath(emptyProjectOutput));
+    Console.WriteLine($"EMPTY_PROJECT_OK {Path.GetFullPath(emptyProjectOutput)}");
+    return 0;
 }
 
 if (args is ["--preview-smoke", var previewInput] && File.Exists(previewInput))
@@ -30,7 +40,8 @@ if (args is ["--preview-smoke", var previewInput] && File.Exists(previewInput))
         Start = 0, SourceStart = 0, Duration = previewAsset.Duration
     });
     var service = new PreviewCompositionService(
-        ffmpegLocator, processRunner, Path.Combine(Path.GetTempPath(), "KadrStudio", "preview-smoke"));
+        ffmpegLocator, processRunner, renderCoordinator,
+        Path.Combine(Path.GetTempPath(), "KadrStudio", "preview-smoke"));
     var started = System.Diagnostics.Stopwatch.StartNew();
     var segment = await service.EnsureVideoSegmentAsync(project, Math.Min(39, previewAsset.Duration / 2), halfQuality: true);
     var segmentAsset = await probe.ProbeAsync(segment.Path);
@@ -70,7 +81,8 @@ if (args is ["--still-frame-smoke", var stillInput] && File.Exists(stillInput))
         Start = 0, SourceStart = 0, Duration = stillAsset.Duration
     });
     var service = new PreviewCompositionService(
-        ffmpegLocator, processRunner, Path.Combine(Path.GetTempPath(), "KadrStudio", "still-smoke"));
+        ffmpegLocator, processRunner, renderCoordinator,
+        Path.Combine(Path.GetTempPath(), "KadrStudio", "still-smoke"));
     var positions = new[] { 9.2, Math.Min(stillAsset.Duration - 0.1, 47.3) };
     foreach (var position in positions)
     {
@@ -189,7 +201,7 @@ if (args is ["--make-ui-project", var uiInput, var uiOutput] && File.Exists(uiIn
     {
         Start = 15, Duration = 12, Text = "Текст можно двигать и растягивать", X = 0.5, Y = 0.78
     });
-    await File.WriteAllTextAsync(Path.GetFullPath(uiOutput), ProjectJson.Serialize(uiProject), Encoding.UTF8);
+    await new ProjectService().SaveAsync(uiProject, Path.GetFullPath(uiOutput));
     Console.WriteLine($"UI_PROJECT_OK {Path.GetFullPath(uiOutput)}");
     return 0;
 }
@@ -202,22 +214,22 @@ if (args is ["--history-smoke"])
         var history = new ProjectHistoryService(testRoot);
         var project = EditorProject.CreateNew();
         project.Name = "До изменения";
-        var checkpoint = history.CreateCheckpoint(project, "Первая версия");
+        var checkpoint = await history.CreateCheckpointAsync(project, "Первая версия");
         project.Name = "После изменения";
-        var entries = history.GetCheckpoints(project);
+        var entries = await history.GetCheckpointsAsync(project);
         if (entries.Count != 1 || entries[0].Id != checkpoint.Id)
         {
             throw new InvalidOperationException("Контрольная точка не появилась в истории.");
         }
 
-        var restored = history.RestoreCheckpoint(entries[0], null);
+        var restored = await history.RestoreCheckpointAsync(entries[0], null);
         if (restored.Name != "До изменения" || restored.Id != project.Id)
         {
             throw new InvalidOperationException("Восстановленный снимок не совпадает с исходным проектом.");
         }
 
-        history.DeleteCheckpoint(entries[0]);
-        if (history.GetCheckpoints(project).Count != 0)
+        await history.DeleteCheckpointAsync(entries[0]);
+        if ((await history.GetCheckpointsAsync(project)).Count != 0)
         {
             throw new InvalidOperationException("Контрольная точка не удалилась.");
         }
@@ -278,7 +290,7 @@ if (args is ["--preview-composition-smoke"])
         project.Clips.Add(audioClip);
 
         var composition = new PreviewCompositionService(
-            ffmpegLocator, processRunner, Path.Combine(testRoot, "preview-cache"));
+            ffmpegLocator, processRunner, renderCoordinator, Path.Combine(testRoot, "preview-cache"));
         using var previewSession = new TimelinePreviewSession(composition);
         var initialVideoSignature = composition.GetVideoSignature(project, halfQuality: true);
         var initialAudioSignature = composition.GetAudioSignature(project);
@@ -357,7 +369,7 @@ if (args is ["--preview-composition-smoke"])
         if (!previewSession.IsCurrentVideo(project, halfQuality: true, currentVideoJob.Result.Signature))
             throw new InvalidOperationException("Сессия не приняла актуальное поколение видеокэша.");
 
-        using (var revisionViewModel = new KadrStudio.ViewModels.MainViewModel())
+        await using (var revisionViewModel = new KadrStudio.ViewModels.MainViewModel())
         {
             var revisionAsset = new MediaAsset
             {
@@ -476,7 +488,7 @@ if (args is ["--export-smoke"])
             BoxHeight = 0.2
         });
 
-        var exporter = new ExportService(ffmpegLocator, processRunner);
+        var exporter = new ExportService(ffmpegLocator, processRunner, renderCoordinator);
         await exporter.ExportAsync(project, outputPath, new ExportSettings
         {
             Resolution = ExportResolution.P480,
@@ -504,7 +516,7 @@ if (args is ["--export-smoke"])
 
 if (args is ["--linked-smoke"])
 {
-    using var viewModel = new KadrStudio.ViewModels.MainViewModel();
+    await using var viewModel = new KadrStudio.ViewModels.MainViewModel();
     var video = new MediaAsset
     {
         Name = "linked.mp4",
@@ -535,7 +547,7 @@ if (args is ["--linked-smoke"])
 
 if (args is ["--edit-smoke"])
 {
-    using var viewModel = new KadrStudio.ViewModels.MainViewModel();
+    await using var viewModel = new KadrStudio.ViewModels.MainViewModel();
     var testAsset = new MediaAsset
     {
         Name = "test.mp4",

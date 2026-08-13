@@ -92,6 +92,32 @@ public sealed class BackgroundJobSchedulerTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await second.Completion);
     }
 
+    [Fact]
+    public async Task Dispose_cancels_running_and_queued_work_without_leaving_tasks_alive()
+    {
+        var scheduler = CreateSingleLaneScheduler();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var running = scheduler.Schedule(new JobRequest<int>(
+            JobKey.Create("long-running"), JobLane.Analysis, JobPriority.Normal,
+            async token =>
+            {
+                started.SetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return 1;
+            }));
+        var queued = scheduler.Schedule(new JobRequest<int>(
+            JobKey.Create("queued"), JobLane.Analysis, JobPriority.Background,
+            _ => ValueTask.FromResult(2)));
+        await started.Task;
+
+        await scheduler.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await running.Completion);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await queued.Completion);
+        Assert.True(running.Completion.IsCompleted);
+        Assert.True(queued.Completion.IsCompleted);
+    }
+
     private static BackgroundJobScheduler CreateSingleLaneScheduler()
         => new(Enum.GetValues<JobLane>().ToDictionary(item => item, _ => 1));
 }

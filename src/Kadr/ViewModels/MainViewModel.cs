@@ -920,6 +920,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         {
             CancelAutosave();
             await _projectService.SaveAsync(Project, path, cancellationToken);
+            TimelineMediaCacheService.ConfigureProject(Project);
             IsDirty = false;
             StatusText = $"Проект сохранён: {Path.GetFileName(path)}";
         }
@@ -1077,6 +1078,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private void AttachProject(EditorProject project)
     {
+        TimelineMediaCacheService.ConfigureProject(project);
         project.PropertyChanged += OnProjectPropertyChanged;
         project.Clips.CollectionChanged += OnClipsCollectionChanged;
         project.TextOverlays.CollectionChanged += OnTextOverlaysCollectionChanged;

@@ -41,6 +41,8 @@ public sealed class WaveformPyramidTests
         }
         encoded[0] ^= 0x7f;
         Assert.Throws<InvalidDataException>(() => WaveformPyramidCodec.Decode(encoded));
+        var truncated = encoded[..^17];
+        Assert.Throws<InvalidDataException>(() => WaveformPyramidCodec.Decode(truncated));
     }
 
     [Fact]

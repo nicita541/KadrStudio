@@ -27,6 +27,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
     private string? _videoSignature;
     private string? _audioSignature;
     private string? _overlaySignature;
+    private bool _disposed;
 
     public PreviewPresenter(Image image, FrameworkElement emptyState, FfmpegLocator locator,
         TimelineRenderCoordinator coordinator)
@@ -38,6 +39,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
         _proxies = new PreviewProxyStore(locator);
         _engine.FramePresented += Engine_FramePresented;
         _engine.Failed += Engine_Failed;
+        _proxies.ProxyReady += Proxies_ProxyReady;
     }
 
     public event EventHandler<Exception>? Failed;
@@ -143,8 +145,11 @@ public sealed class PreviewPresenter : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (_disposed) return;
+        _disposed = true;
         _engine.FramePresented -= Engine_FramePresented;
         _engine.Failed -= Engine_Failed;
+        _proxies.ProxyReady -= Proxies_ProxyReady;
         await _engine.DisposeAsync().ConfigureAwait(false);
         await _proxies.DisposeAsync().ConfigureAwait(false);
         _operationGate.Dispose();
@@ -165,6 +170,23 @@ public sealed class PreviewPresenter : IAsyncDisposable
     }
 
     private void Engine_Failed(object? sender, Exception exception) => Failed?.Invoke(this, exception);
+
+    private void Proxies_ProxyReady(object? sender, Guid sourceId)
+    {
+        if (_disposed || _project?.Media.All(asset => asset.Id != sourceId) != false) return;
+        _videoSignature = null;
+        _ = ActivateReadyProxyAsync();
+    }
+
+    private async Task ActivateReadyProxyAsync()
+    {
+        try
+        {
+            await UpdateAsync(Position.TotalSeconds, forceSeek: true, playing: State == PreviewState.Playing)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or ObjectDisposedException) { }
+    }
 
     private void RememberSignatures(KadrStudio.Application.Rendering.RenderPlan plan)
     {

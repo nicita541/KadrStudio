@@ -198,11 +198,14 @@ public sealed class PreviewFrameServer(
 
     private Task StartVideoAsync(RenderPlan plan, TimelineTime position, bool play, CancellationToken cancellationToken)
     {
-        if (plan.VisualLayers.Length == 0) return Task.CompletedTask;
+        // A project that contains video must also emit a real black frame on empty gaps.
+        // Audio-only projects never start the video pipeline.
+        if (plan.VisualLayers.Length == 0 && (_plan?.VisualLayers.Length ?? 0) == 0) return Task.CompletedTask;
+        var request = _request;
         _videoCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = _videoCancellation.Token;
         var command = coordinator.CreateCommand(plan, new RenderOutputOptions(
-            RenderPurpose.FrameServer, "pipe:1", _request.Width, _request.Height,
+            RenderPurpose.FrameServer, "pipe:1", request.Width, request.Height,
             IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false));
         _videoProcess = Start(command, redirectOutput: true);
         if (play)
@@ -211,12 +214,12 @@ public sealed class PreviewFrameServer(
             {
                 SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait
             });
-            _videoTask = PumpVideoAsync(_videoProcess, position, continuous: true, _videoFrames.Writer, token);
-            _presentationTask = PresentFramesAsync(_videoFrames.Reader, token);
+            _videoTask = PumpVideoAsync(_videoProcess, position, request, continuous: true, _videoFrames.Writer, token);
+            _presentationTask = PresentFramesAsync(_videoFrames.Reader, request.FrameRate, token);
         }
         else
         {
-            _videoTask = PumpVideoAsync(_videoProcess, position, continuous: false, null, token);
+            _videoTask = PumpVideoAsync(_videoProcess, position, request, continuous: false, null, token);
         }
         return Task.CompletedTask;
     }
@@ -247,22 +250,23 @@ public sealed class PreviewFrameServer(
     private async Task PumpVideoAsync(
         Process process,
         TimelineTime start,
+        PreviewRequest request,
         bool continuous,
         ChannelWriter<VideoFrame>? writer,
         CancellationToken token)
     {
-        var frameSize = checked(_request.Width * _request.Height * 4);
+        var frameSize = checked(request.Width * request.Height * 4);
         var bytes = GC.AllocateUninitializedArray<byte>(frameSize);
         var frameIndex = 0L;
         try
         {
             while (await ReadExactlyAsync(process.StandardOutput.BaseStream, bytes, token).ConfigureAwait(false))
             {
-                var timestamp = start + TimelineTime.FromFrames(frameIndex++, _request.FrameRate);
+                var timestamp = start + TimelineTime.FromFrames(frameIndex++, request.FrameRate);
                 var owned = GC.AllocateUninitializedArray<byte>(frameSize);
                 Buffer.BlockCopy(bytes, 0, owned, 0, frameSize);
-                var frame = new VideoFrame(timestamp, _request.Width, _request.Height, _request.Width * 4,
-                    owned, _request.Generation.Video);
+                var frame = new VideoFrame(timestamp, request.Width, request.Height, request.Width * 4,
+                    owned, request.Generation.Video);
                 if (!continuous)
                 {
                     Present(frame);
@@ -280,9 +284,9 @@ public sealed class PreviewFrameServer(
         }
     }
 
-    private async Task PresentFramesAsync(ChannelReader<VideoFrame> reader, CancellationToken token)
+    private async Task PresentFramesAsync(ChannelReader<VideoFrame> reader, FrameRate frameRate, CancellationToken token)
     {
-        var frameDuration = TimelineTime.FromFrames(1, _request.FrameRate);
+        var frameDuration = TimelineTime.FromFrames(1, frameRate);
         try
         {
             await foreach (var frame in reader.ReadAllAsync(token).ConfigureAwait(false))
@@ -406,6 +410,7 @@ public sealed class PreviewFrameServer(
 
     private void Present(VideoFrame frame)
     {
+        if (frame.Generation != _request.Generation.Video) return;
         _lastFrame = frame;
         _position = frame.Position;
         FramePresented?.Invoke(this, frame);

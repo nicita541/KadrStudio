@@ -43,4 +43,22 @@ public sealed class TimelineGeometryTests
         Assert.Equal(new TrackAddress(TrackKind.Audio, 0),
             layout.GetTrackAt(layout.GetTrackTop(TrackKind.Audio, 0) + 10));
     }
+
+    [Fact]
+    public void Interaction_controller_resets_all_transient_drag_state()
+    {
+        var controller = new TimelineInteractionController();
+        controller.BeginDrag(TimelineDragOperation.TrimRight, 1.25);
+        controller.BeginPlayheadDrag();
+
+        Assert.Equal(TimelineDragOperation.TrimRight, controller.DragOperation);
+        Assert.Equal(1.25, controller.PointerOffsetSeconds);
+        Assert.True(controller.IsDraggingPlayhead);
+
+        controller.EndDrag();
+        controller.EndPlayheadDrag();
+        Assert.Equal(TimelineDragOperation.None, controller.DragOperation);
+        Assert.Equal(0, controller.PointerOffsetSeconds);
+        Assert.False(controller.IsDraggingPlayhead);
+    }
 }

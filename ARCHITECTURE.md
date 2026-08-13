@@ -27,7 +27,7 @@ Kadr (WPF adapters and views)
 
 1. Add domain rules and exact types to `Kadr.Core`; do not reference WPF models there.
 2. Add a command, query or proposal contract to `Kadr.Application` before adding an external implementation.
-3. Put SQLite, FFmpeg, LibVLC, local-model, disk-cache and process code in infrastructure or a WPF edge adapter.
+3. Put SQLite, FFmpeg, WASAPI, local-model, disk-cache and process code in infrastructure or a WPF edge adapter.
 4. Do not make one feature mutate another feature's cache or playback objects. Communicate with immutable state, plans, proposals and scheduler jobs.
 5. Add a regression test for every fixed failure. Large-project tests must continue to cover a four-hour, 18-track project with thousands of clips.
 6. Keep `dotnet build KadrStudio.sln -c Release -warnaserror` and `dotnet test KadrStudio.sln -c Release -m:1` green.

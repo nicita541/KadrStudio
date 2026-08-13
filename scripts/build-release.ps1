@@ -5,13 +5,14 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$solutionPath = Join-Path $repoRoot 'KadrStudio.sln'
 $projectPath = Join-Path $repoRoot 'src\Kadr\KadrStudio.csproj'
 $releaseRoot = Join-Path $repoRoot 'release'
 $publishPath = Join-Path $releaseRoot 'KadrStudio-win-x64'
 $zipPath = Join-Path $releaseRoot 'KadrStudio-win-x64.zip'
 
-if (-not (Test-Path -LiteralPath $projectPath)) {
-    throw "Не найден проект: $projectPath"
+if (-not (Test-Path -LiteralPath $solutionPath) -or -not (Test-Path -LiteralPath $projectPath)) {
+    throw "Не найдены solution или WPF-проект в $repoRoot"
 }
 
 $dotnetCommand = Get-Command dotnet.exe -ErrorAction SilentlyContinue
@@ -47,15 +48,21 @@ if (Test-Path -LiteralPath $publishPath) {
 }
 New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
 
-Write-Host 'Проверка проекта…' -ForegroundColor Cyan
-& $dotnetExe restore $projectPath --runtime win-x64
-if ($LASTEXITCODE -ne 0) { throw "dotnet restore завершился с кодом $LASTEXITCODE" }
+Write-Host 'Восстановление, сборка и тестирование всего решения…' -ForegroundColor Cyan
+& $dotnetExe restore $solutionPath --disable-parallel
+if ($LASTEXITCODE -ne 0) { throw "dotnet restore solution завершился с кодом $LASTEXITCODE" }
 
-& $dotnetExe build $projectPath -c Release --runtime win-x64 --no-restore
-if ($LASTEXITCODE -ne 0) { throw "dotnet build завершился с кодом $LASTEXITCODE" }
+& $dotnetExe build $solutionPath -c Release --no-restore -m:1 -nr:false -warnaserror
+if ($LASTEXITCODE -ne 0) { throw "dotnet build solution завершился с кодом $LASTEXITCODE" }
+
+& $dotnetExe test $solutionPath -c Release --no-build --no-restore -m:1 -nr:false
+if ($LASTEXITCODE -ne 0) { throw "dotnet test завершился с кодом $LASTEXITCODE" }
+
+& $dotnetExe restore $projectPath --runtime win-x64 --disable-parallel
+if ($LASTEXITCODE -ne 0) { throw "dotnet restore win-x64 завершился с кодом $LASTEXITCODE" }
 
 Write-Host 'Создание переносимой Windows-сборки…' -ForegroundColor Cyan
-& $dotnetExe publish $projectPath -c Release --runtime win-x64 --self-contained true --no-restore -o $publishPath
+& $dotnetExe publish $projectPath -c Release --runtime win-x64 --self-contained true --no-restore -warnaserror -o $publishPath
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish завершился с кодом $LASTEXITCODE" }
 
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'KadrStudio.exe'))) {

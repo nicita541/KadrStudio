@@ -303,6 +303,7 @@ public partial class MainWindow : Window
         try
         {
             await _viewModel.SaveProjectAsync(path);
+            _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
             _recentProjectsService.Add(path, _viewModel.Project.Name);
             return true;
         }

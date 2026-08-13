@@ -17,6 +17,8 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     private readonly ProcessRunner _runner = new();
     private readonly ConcurrentDictionary<Guid, string> _validated = [];
     private readonly ConcurrentDictionary<Guid, Task> _jobs = [];
+    private readonly ConcurrentBag<Task> _allJobs = [];
+    private readonly ConcurrentBag<CancellationTokenSource> _retiredGenerations = [];
     private readonly SemaphoreSlim _encoderGate = new(1, 1);
     private CancellationTokenSource _generation = new();
     private string _root = string.Empty;
@@ -30,15 +32,15 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     public void Configure(EditorProject project)
     {
         ArgumentNullException.ThrowIfNull(project);
-        if (_projectId == project.Id && !string.IsNullOrEmpty(_root)) return;
+        var desiredRoot = Path.GetFullPath(ResolveRoot(project));
+        if (_projectId == project.Id && string.Equals(_root, desiredRoot, StringComparison.OrdinalIgnoreCase)) return;
         _generation.Cancel();
-        _generation.Dispose();
-        _encoderGate.Dispose();
+        _retiredGenerations.Add(_generation);
         _generation = new CancellationTokenSource();
         _validated.Clear();
         _jobs.Clear();
         _projectId = project.Id;
-        _root = ResolveRoot(project);
+        _root = desiredRoot;
         Directory.CreateDirectory(_root);
     }
 
@@ -58,8 +60,20 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         foreach (var asset in project.Media.Where(asset =>
                      asset.Kind == MediaKind.Video && !asset.IsMissing && File.Exists(asset.Path)))
         {
-            _jobs.GetOrAdd(asset.Id, _ => BuildOrValidateAsync(asset, project.FrameRate, _generation.Token));
+            _jobs.GetOrAdd(asset.Id, _ =>
+            {
+                var job = BuildOrValidateAsync(asset, project.FrameRate, _projectId, _root, _generation.Token);
+                _allJobs.Add(job);
+                return job;
+            });
         }
+    }
+
+    public async Task PrepareAsync(EditorProject project, CancellationToken cancellationToken = default)
+    {
+        Queue(project);
+        var jobs = _jobs.Values.ToArray();
+        if (jobs.Length > 0) await Task.WhenAll(jobs).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()
@@ -67,20 +81,24 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _generation.Cancel();
-        var jobs = _jobs.Values.ToArray();
+        var jobs = _allJobs.ToArray();
         if (jobs.Length > 0)
-            try { await Task.WhenAll(jobs).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); } catch { }
+            try { await Task.WhenAll(jobs).ConfigureAwait(false); } catch { }
         _generation.Dispose();
+        foreach (var generation in _retiredGenerations) generation.Dispose();
+        _encoderGate.Dispose();
     }
 
-    private async Task BuildOrValidateAsync(MediaAsset asset, int frameRate, CancellationToken token)
+    private async Task BuildOrValidateAsync(MediaAsset asset, int frameRate, Guid projectId, string root, CancellationToken token)
     {
-        await _encoderGate.WaitAsync(token).ConfigureAwait(false);
+        var lockTaken = false;
         try
         {
+            await _encoderGate.WaitAsync(token).ConfigureAwait(false);
+            lockTaken = true;
             var fingerprint = Fingerprint(asset);
             var hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{fingerprint}|{frameRate}|proxy-v1")));
-            var path = ResolveInsideRoot(Path.Combine(_root, $"{asset.Id:N}-{hash}.mp4"));
+            var path = ResolveInsideRoot(root, Path.Combine(root, $"{asset.Id:N}-{hash}.mp4"));
             var metadataPath = path + ".json";
             if (!await IsValidAsync(path, metadataPath, fingerprint, token).ConfigureAwait(false))
             {
@@ -108,16 +126,22 @@ public sealed class PreviewProxyStore : IAsyncDisposable
                 finally { TryDelete(temporary); }
             }
             File.SetLastAccessTimeUtc(path, DateTime.UtcNow);
-            _validated[asset.Id] = path;
-            await TrimAsync(DefaultDiskLimit, token).ConfigureAwait(false);
-            ProxyReady?.Invoke(this, asset.Id);
+            if (_projectId == projectId)
+            {
+                _validated[asset.Id] = path;
+                await TrimAsync(root, DefaultDiskLimit, token).ConfigureAwait(false);
+                ProxyReady?.Invoke(this, asset.Id);
+            }
         }
         catch (OperationCanceledException) { }
         catch
         {
             // The original remains the reliable fallback while a proxy is unavailable.
         }
-        finally { _encoderGate.Release(); }
+        finally
+        {
+            if (lockTaken) _encoderGate.Release();
+        }
     }
 
     private async Task<bool> IsValidAsync(string path, string metadataPath, string fingerprint, CancellationToken token)
@@ -140,19 +164,21 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         return result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StandardOutput) && result.StandardOutput.Contains("video", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task TrimAsync(long limit, CancellationToken token)
+    private async Task TrimAsync(string root, long limit, CancellationToken token)
     {
-        var files = Directory.EnumerateFiles(_root, "*.mp4").Select(path => new FileInfo(path))
+        var files = Directory.EnumerateFiles(root, "*.mp4").Select(path => new FileInfo(path))
             .OrderBy(file => file.LastAccessTimeUtc).ToArray();
         var total = files.Sum(file => file.Length);
         foreach (var file in files)
         {
             token.ThrowIfCancellationRequested();
             if (total <= limit) break;
-            if (_validated.Values.Contains(file.FullName, StringComparer.OrdinalIgnoreCase)) continue;
             total -= file.Length;
             TryDelete(file.FullName);
             TryDelete(file.FullName + ".json");
+            foreach (var entry in _validated.Where(entry =>
+                         string.Equals(entry.Value, file.FullName, StringComparison.OrdinalIgnoreCase)).ToArray())
+                _validated.TryRemove(entry.Key, out _);
             await Task.Yield();
         }
     }
@@ -165,9 +191,9 @@ public sealed class PreviewProxyStore : IAsyncDisposable
             "Kadr Studio", "Cache", "Projects", project.Id.ToString("N"), "proxies");
     }
 
-    private string ResolveInsideRoot(string path)
+    private static string ResolveInsideRoot(string configuredRoot, string path)
     {
-        var root = Path.GetFullPath(_root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var root = Path.GetFullPath(configuredRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var full = Path.GetFullPath(path);
         if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Proxy path escaped the configured cache root.");

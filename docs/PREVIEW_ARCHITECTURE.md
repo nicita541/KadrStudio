@@ -1,27 +1,34 @@
-# Preview architecture
+# Архитектура предпросмотра
 
-The editor preview is split into independent layers. Keep these boundaries when adding features:
+Интерактивный просмотр и экспорт строятся из одного неизменяемого `RenderPlan`, но не делят изменяемое состояние проигрывателя.
 
-1. `ProjectState` is the validated source of truth; `EditorProjectMapper` is the compatibility boundary for current WPF controls.
-2. `RenderPlanBuilder` creates one immutable composition plan used by both preview and export.
-3. `TimelineRenderCoordinator` owns the FFmpeg render engine and typed scheduler lanes. `PreviewCompositionService` is only a WPF adapter over that coordinator.
-4. `TimelinePreviewSession` owns cache generations, jobs, cancellation, and prefetch. Video invalidation never clears audio state and audio invalidation never clears video state.
-5. `PreviewPlaybackController` owns two independent LibVLC players: one video-only presentation player and one audio-only player. Replacing either source cannot reset the other.
-6. `MainWindow` supplies the project, playhead, quality, and Play/Pause state. It does not construct FFmpeg graphs or own cache keys.
+## Потоки данных
 
-Hard invariants:
+1. `EditorSession` хранит единственный рабочий снимок `ProjectState` и применяет команды с undo/redo.
+2. `RenderPlanBuilder` создаёт независимые `VideoContentSignature`, `AudioContentSignature` и `OverlaySignature`.
+3. `PreviewPresenter` сравнивает подписи и увеличивает только изменившееся поколение.
+4. `PreviewFrameServer` запускает независимые FFmpeg-процессы: BGRA-видео и stereo PCM 48 kHz.
+5. Ограниченная очередь отдаёт кадры в WPF `WriteableBitmap`; текст остаётся отдельным WPF-слоем.
+6. PCM выводится через WASAPI. Позиция аудиоустройства является главным таймером, а в video-only проекте используется монотонный таймер.
 
-- V tracks produce video only (`-an`).
-- A tracks produce audio only (`-vn`).
-- Track index defines the video layer order; higher V tracks are overlaid later.
-- All active A tracks are mixed; there is no “single active audio clip” shortcut.
-- Cache signatures include only properties that affect that pipeline.
-- A stale render generation cannot replace a current source.
-- Decoder failure invalidates and restarts only the failed pipeline.
-- Text is a render-plan layer. It remains an interactive WPF overlay during editing and uses the same plan data for FFmpeg export.
+## Инварианты
 
-Regression command:
+- V-дорожки создают только изображение, A-дорожки — только звук.
+- Верхняя V-дорожка перекрывает нижние, все активные A-дорожки микшируются.
+- Изменение громкости, pan или mute не меняет видеопоколение.
+- Цветокоррекция не меняет аудиопоколение, текст не перезапускает декодеры.
+- Отменённое поколение не может попасть в `WriteableBitmap`.
+- Опоздавший видеокадр пропускается; аудиочасы не сдвигаются.
+- При паузе и seek запрашивается точный кадр. Последний правильный кадр сохраняется во время buffering/error.
+- Пустой участок видеопроекта выдаёт настоящий чёрный кадр; A-only проект вообще не запускает видеопроцесс.
+- Прокси содержат H.264 video-only 960×540 CFR, GOP 12. Аудио всегда читается из оригинала.
+- Прокси лежат рядом с сохранённым проектом в `.kadr-cache/proxies`, проверяются FFprobe и автоматически перестраиваются при повреждении.
+- Экспорт всегда читает оригиналы и запекает overlay через FFmpeg.
+
+## Проверка
 
 ```powershell
-dotnet run --project tests\KadrStudio.AnalysisSmoke\KadrStudio.AnalysisSmoke.csproj -c Release -- --preview-composition-smoke
+dotnet test KadrStudio.sln -c Release --no-restore -m:1
 ```
+
+`KadrStudio.Integration.Tests` создаёт реальные FFmpeg-источники и проверяет точный кадр, V-only/A-only, прокси, stereo waveform и экспорт.

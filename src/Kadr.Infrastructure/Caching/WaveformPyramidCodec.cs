@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Security.Cryptography;
 using KadrStudio.Application.Caching;
 
 namespace KadrStudio.Infrastructure.Caching;
@@ -24,12 +25,25 @@ public static class WaveformPyramidCodec
             }
         }
         writer.Flush();
-        return stream.ToArray();
+        var bytes = stream.ToArray();
+        var checksum = SHA256.HashData(bytes);
+        var result = GC.AllocateUninitializedArray<byte>(bytes.Length + checksum.Length);
+        bytes.CopyTo(result, 0);
+        checksum.CopyTo(result, bytes.Length);
+        return result;
     }
 
     public static WaveformPyramid Decode(ReadOnlySpan<byte> payload)
     {
-        using var stream = new MemoryStream(payload.ToArray(), writable: false);
+        const int checksumLength = 32;
+        if (payload.Length <= checksumLength) throw new InvalidDataException("Waveform cache is truncated.");
+        var content = payload[..^checksumLength];
+        var expected = payload[^checksumLength..];
+        Span<byte> actual = stackalloc byte[checksumLength];
+        SHA256.HashData(content, actual);
+        if (!CryptographicOperations.FixedTimeEquals(actual, expected))
+            throw new InvalidDataException("Waveform cache checksum is invalid.");
+        using var stream = new MemoryStream(content.ToArray(), writable: false);
         using var reader = new BinaryReader(stream);
         if (reader.ReadUInt64() != 0x325641574452414BUL || reader.ReadInt32() != Version)
             throw new InvalidDataException("Unsupported waveform cache format.");

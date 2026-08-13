@@ -14,6 +14,7 @@ public sealed class TimelineControl : FrameworkElement
 {
     private readonly WaveformRenderer _waveformRenderer = new();
     private readonly ThumbnailRenderer _thumbnailRenderer;
+    private readonly TimelineInteractionController _interaction = new();
     public const string MediaAssetDataFormat = "KadrStudio.MediaAssetId";
     public const double LeftGutterWidth = 96;
 
@@ -34,16 +35,13 @@ public sealed class TimelineControl : FrameworkElement
     private Guid? _selectedClipId;
     private double _playheadSeconds;
     private double _pixelsPerSecond = 72;
-    private DragOperation _dragOperation;
     private Point _dragOrigin;
-    private double _dragPointerOffsetSeconds;
     private TimelineClip? _dragClip;
     private TimelineClip? _dragOriginal;
     private readonly List<(TimelineClip Clip, TimelineClip Original)> _dragLinkedClips = [];
     private TextOverlay? _dragTextOverlay;
     private TextOverlay? _dragTextOriginal;
     private Guid? _selectedTextOverlayId;
-    private bool _isDraggingPlayhead;
     private bool _dragChanged;
 
     public TimelineControl()
@@ -254,12 +252,13 @@ public sealed class TimelineControl : FrameworkElement
         _dragOrigin = point;
         _dragChanged = false;
         var rectangle = GetClipRectangle(hit);
-        _dragPointerOffsetSeconds = Math.Max(0, (point.X - rectangle.Left) / PixelsPerSecond);
-        _dragOperation = Math.Abs(point.X - rectangle.Left) <= ClipEdgeGrip
-            ? DragOperation.TrimLeft
+        var pointerOffset = Math.Max(0, (point.X - rectangle.Left) / PixelsPerSecond);
+        var operation = Math.Abs(point.X - rectangle.Left) <= ClipEdgeGrip
+            ? TimelineDragOperation.TrimLeft
             : Math.Abs(point.X - rectangle.Right) <= ClipEdgeGrip
-                ? DragOperation.TrimRight
-                : DragOperation.Move;
+                ? TimelineDragOperation.TrimRight
+                : TimelineDragOperation.Move;
+        _interaction.BeginDrag(operation, pointerOffset);
         EditStarted?.Invoke(this, new TimelineEditEventArgs(hit.Id, false));
         CaptureMouse();
         e.Handled = true;
@@ -286,7 +285,7 @@ public sealed class TimelineControl : FrameworkElement
     {
         base.OnMouseMove(e);
         var point = e.GetPosition(this);
-        if (_isDraggingPlayhead && e.LeftButton == MouseButtonState.Pressed)
+        if (_interaction.IsDraggingPlayhead && e.LeftButton == MouseButtonState.Pressed)
         {
             SetPlayheadFromPoint(point);
             e.Handled = true;
@@ -328,9 +327,9 @@ public sealed class TimelineControl : FrameworkElement
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
     {
         base.OnMouseLeftButtonUp(e);
-        if (_isDraggingPlayhead)
+        if (_interaction.IsDraggingPlayhead)
         {
-            _isDraggingPlayhead = false;
+            _interaction.EndPlayheadDrag();
             if (IsMouseCaptured) ReleaseMouseCapture();
             Cursor = Cursors.Arrow;
             e.Handled = true;
@@ -343,7 +342,7 @@ public sealed class TimelineControl : FrameworkElement
             Cursor = Cursors.Arrow;
             _dragTextOverlay = null;
             _dragTextOriginal = null;
-            _dragOperation = DragOperation.None;
+            _interaction.EndDrag();
             EditCompleted?.Invoke(this, new TimelineEditEventArgs(overlayId, _dragChanged));
             _dragChanged = false;
             e.Handled = true;
@@ -359,7 +358,7 @@ public sealed class TimelineControl : FrameworkElement
         _dragClip = null;
         _dragOriginal = null;
         _dragLinkedClips.Clear();
-        _dragOperation = DragOperation.None;
+        _interaction.EndDrag();
         EditCompleted?.Invoke(this, new TimelineEditEventArgs(clipId, _dragChanged));
         _dragChanged = false;
         e.Handled = true;
@@ -367,7 +366,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void BeginPlayheadDrag()
     {
-        _isDraggingPlayhead = true;
+        _interaction.BeginPlayheadDrag();
         CaptureMouse();
         Cursor = Cursors.SizeWE;
     }
@@ -387,12 +386,13 @@ public sealed class TimelineControl : FrameworkElement
         _dragOrigin = point;
         _dragChanged = false;
         var rectangle = GetTextOverlayRectangle(overlay);
-        _dragPointerOffsetSeconds = Math.Max(0, (point.X - rectangle.Left) / PixelsPerSecond);
-        _dragOperation = Math.Abs(point.X - rectangle.Left) <= ClipEdgeGrip
-            ? DragOperation.TrimLeft
+        var pointerOffset = Math.Max(0, (point.X - rectangle.Left) / PixelsPerSecond);
+        var operation = Math.Abs(point.X - rectangle.Left) <= ClipEdgeGrip
+            ? TimelineDragOperation.TrimLeft
             : Math.Abs(point.X - rectangle.Right) <= ClipEdgeGrip
-                ? DragOperation.TrimRight
-                : DragOperation.Move;
+                ? TimelineDragOperation.TrimRight
+                : TimelineDragOperation.Move;
+        _interaction.BeginDrag(operation, pointerOffset);
         EditStarted?.Invoke(this, new TimelineEditEventArgs(overlay.Id, false));
         CaptureMouse();
     }
@@ -404,21 +404,21 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
         var delta = SnapDuration((point.X - _dragOrigin.X) / PixelsPerSecond);
-        switch (_dragOperation)
+        switch (_interaction.DragOperation)
         {
-            case DragOperation.TrimLeft:
+            case TimelineDragOperation.TrimLeft:
             {
                 var applied = Math.Clamp(delta, -_dragTextOriginal.Start, _dragTextOriginal.Duration - MinimumClipDuration);
                 _dragTextOverlay.Start = _dragTextOriginal.Start + applied;
                 _dragTextOverlay.Duration = _dragTextOriginal.Duration - applied;
                 break;
             }
-            case DragOperation.TrimRight:
+            case TimelineDragOperation.TrimRight:
                 _dragTextOverlay.Duration = Math.Max(MinimumClipDuration, _dragTextOriginal.Duration + delta);
                 break;
-            case DragOperation.Move:
+            case TimelineDragOperation.Move:
                 _dragTextOverlay.Start = SnapTime(Math.Max(0,
-                    Viewport.ContentXToTime(point.X) - _dragPointerOffsetSeconds));
+                    Viewport.ContentXToTime(point.X) - _interaction.PointerOffsetSeconds));
                 break;
         }
         _dragChanged |= !TextOverlayEquals(_dragTextOverlay, _dragTextOriginal);
@@ -468,9 +468,9 @@ public sealed class TimelineControl : FrameworkElement
         }
         var deltaSeconds = (point.X - _dragOrigin.X) / PixelsPerSecond;
         var asset = Project.FindAsset(_dragClip.AssetId);
-        switch (_dragOperation)
+        switch (_interaction.DragOperation)
         {
-            case DragOperation.TrimLeft:
+            case TimelineDragOperation.TrimLeft:
             {
                 var minimumDelta = Math.Max(-_dragOriginal.SourceStart, -_dragOriginal.Start);
                 var previous = GetPreviousClip(_dragOriginal);
@@ -485,7 +485,7 @@ public sealed class TimelineControl : FrameworkElement
                 _dragClip.Start = Math.Max(0, _dragOriginal.Start + applied);
                 break;
             }
-            case DragOperation.TrimRight:
+            case TimelineDragOperation.TrimRight:
             {
                 var maximumDuration = asset?.Kind == MediaKind.Image
                     ? 3600
@@ -501,7 +501,7 @@ public sealed class TimelineControl : FrameworkElement
                     maximumDuration);
                 break;
             }
-            case DragOperation.Move:
+            case TimelineDragOperation.Move:
                 MoveClip(point);
                 break;
         }
@@ -523,7 +523,7 @@ public sealed class TimelineControl : FrameworkElement
         {
             _dragClip.TrackIndex = target.Index;
         }
-        var desiredStart = SnapTime(Math.Max(0, Viewport.ContentXToTime(point.X) - _dragPointerOffsetSeconds));
+        var desiredStart = SnapTime(Math.Max(0, Viewport.ContentXToTime(point.X) - _interaction.PointerOffsetSeconds));
         _dragClip.Start = FindNonOverlappingStart(_dragClip, desiredStart);
     }
 
@@ -1226,13 +1226,6 @@ public sealed class TimelineControl : FrameworkElement
         => Math.Abs(left.Start - right.Start) < 0.0001 &&
            Math.Abs(left.Duration - right.Duration) < 0.0001;
 
-    private enum DragOperation
-    {
-        None,
-        Move,
-        TrimLeft,
-        TrimRight
-    }
 }
 
 public sealed class ClipSelectedEventArgs(Guid? clipId) : EventArgs

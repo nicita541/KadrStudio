@@ -79,6 +79,39 @@ public sealed class PreviewFrameServerIntegrationTests
         finally { DeleteRoot(root); }
     }
 
+    [Fact(Timeout = 30_000)]
+    public async Task Empty_video_gap_produces_an_explicit_black_frame_instead_of_a_stale_frame()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var source = Path.Combine(root, "gap-source.mp4");
+            await CreateVideoAsync(locator, source);
+            var project = CreateProject(source, includeVideo: true, includeAudio: false);
+            project.Clips[0].Start = 1;
+            project.Clips[0].Duration = 2;
+
+            await using var coordinator = new TimelineRenderCoordinator(locator);
+            await using var engine = new PreviewFrameServer(locator.FfmpegPath, coordinator);
+            var pending = NextFrame(engine);
+            await engine.PrepareAsync(coordinator.CreatePlan(project), new PreviewRequest(
+                TimelineTime.Zero, new FrameRate(10), 160, 90, false, new PreviewGeneration(11, 0, 0)));
+            var frame = await pending.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(11, frame.Generation);
+            var pixels = frame.Bgra.Span;
+            for (var index = 0; index < pixels.Length; index += 4)
+            {
+                Assert.Equal(0, pixels[index]);
+                Assert.Equal(0, pixels[index + 1]);
+                Assert.Equal(0, pixels[index + 2]);
+            }
+        }
+        finally { DeleteRoot(root); }
+    }
+
     private static EditorProject CreateProject(string source, bool includeVideo, bool includeAudio)
     {
         var id = Guid.NewGuid();

@@ -21,6 +21,16 @@ public sealed class TimelineClip : ObservableObject
     private double _contrast = 1;
     private double _saturation = 1;
     private double _temperature;
+    private double _positionX = 0.5;
+    private double _positionY = 0.5;
+    private double _scaleX = 1;
+    private double _scaleY = 1;
+    private double _rotation;
+    private double _cropLeft;
+    private double _cropTop;
+    private double _cropRight;
+    private double _cropBottom;
+    private double _opacity = 1;
 
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid AssetId { get; set; }
@@ -123,6 +133,17 @@ public sealed class TimelineClip : ObservableObject
         set => SetProperty(ref _temperature, Math.Clamp(value, -1, 1));
     }
 
+    public double PositionX { get => _positionX; set => SetProperty(ref _positionX, Math.Clamp(value, -5, 5)); }
+    public double PositionY { get => _positionY; set => SetProperty(ref _positionY, Math.Clamp(value, -5, 5)); }
+    public double ScaleX { get => _scaleX; set => SetProperty(ref _scaleX, Math.Clamp(value, 0.01, 100)); }
+    public double ScaleY { get => _scaleY; set => SetProperty(ref _scaleY, Math.Clamp(value, 0.01, 100)); }
+    public double Rotation { get => _rotation; set => SetProperty(ref _rotation, Math.Clamp(value, -360, 360)); }
+    public double CropLeft { get => _cropLeft; set => SetProperty(ref _cropLeft, Math.Clamp(value, 0, 0.99)); }
+    public double CropTop { get => _cropTop; set => SetProperty(ref _cropTop, Math.Clamp(value, 0, 0.99)); }
+    public double CropRight { get => _cropRight; set => SetProperty(ref _cropRight, Math.Clamp(value, 0, 0.99)); }
+    public double CropBottom { get => _cropBottom; set => SetProperty(ref _cropBottom, Math.Clamp(value, 0, 0.99)); }
+    public double Opacity { get => _opacity; set => SetProperty(ref _opacity, Math.Clamp(value, 0, 1)); }
+
     [JsonIgnore]
     public double End => Start + Duration;
 
@@ -147,6 +168,16 @@ public sealed class TimelineClip : ObservableObject
         Brightness = Brightness,
         Contrast = Contrast,
         Saturation = Saturation,
-        Temperature = Temperature
+        Temperature = Temperature,
+        PositionX = PositionX,
+        PositionY = PositionY,
+        ScaleX = ScaleX,
+        ScaleY = ScaleY,
+        Rotation = Rotation,
+        CropLeft = CropLeft,
+        CropTop = CropTop,
+        CropRight = CropRight,
+        CropBottom = CropBottom,
+        Opacity = Opacity
     };
 }

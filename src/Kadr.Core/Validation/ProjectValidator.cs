@@ -25,6 +25,7 @@ public sealed class ProjectValidator : IProjectValidator
         ValidateSources(project, errors);
         ValidateClips(project, errors);
         ValidateText(project, errors);
+        ValidateTransitions(project, errors);
         ValidateMarkers(project, errors);
         ValidateInOut(project, errors);
         return errors.Count == 0 ? ValidationResult.Valid : new ValidationResult(errors);
@@ -36,6 +37,10 @@ public sealed class ProjectValidator : IProjectValidator
         if (string.IsNullOrWhiteSpace(project.Name)) errors.Add(new("project.name", "Project name cannot be empty."));
         if (project.CanvasWidth is < 320 or > 7680 || project.CanvasHeight is < 240 or > 4320)
             errors.Add(new("project.canvas", "Canvas size is outside the supported range."));
+        if (project.Sequence.AudioSampleRate is < 8_000 or > 192_000)
+            errors.Add(new("project.sample-rate", "Audio sample rate is outside the supported range."));
+        if (project.FrameRate.FramesPerSecond is < 1 or > 120)
+            errors.Add(new("project.frame-rate", "Frame rate is outside the supported range."));
     }
 
     private static void ValidateTracks(ProjectState project, ICollection<ValidationError> errors)
@@ -65,6 +70,16 @@ public sealed class ProjectValidator : IProjectValidator
                 errors.Add(new("source.id", "Media source dictionary key and ID must match.", source.Id));
             if (string.IsNullOrWhiteSpace(source.Path)) errors.Add(new("source.path", "Media source path cannot be empty.", source.Id));
             if (source.Duration <= TimelineTime.Zero) errors.Add(new("source.duration", "Media source duration must be positive.", source.Id));
+            if (!source.Streams.IsDefault)
+            {
+                foreach (var stream in source.Streams)
+                {
+                    if (stream.StreamIndex < 0 || string.IsNullOrWhiteSpace(stream.Codec))
+                        errors.Add(new("source.stream", "Media stream metadata is invalid.", source.Id));
+                    if (stream.Kind == MediaStreamKind.Audio && (stream.SampleRate <= 0 || stream.Channels is < 1 or > 2))
+                        errors.Add(new("source.audio-stream", "Only valid mono/stereo audio streams are supported.", source.Id));
+                }
+            }
         }
     }
 
@@ -126,7 +141,13 @@ public sealed class ProjectValidator : IProjectValidator
     {
         if (clip.Video is { } video &&
             (video.Brightness is < -1 or > 1 || video.Contrast is < 0 or > 3 ||
-             video.Saturation is < 0 or > 3 || video.Temperature is < -1 or > 1))
+             video.Saturation is < 0 or > 3 || video.Temperature is < -1 or > 1 ||
+             video.PositionX is < -5 or > 5 || video.PositionY is < -5 or > 5 ||
+             video.ScaleX is <= 0 or > 100 || video.ScaleY is <= 0 or > 100 ||
+             video.Rotation is < -360 or > 360 || video.CropLeft is < 0 or > 1 ||
+             video.CropTop is < 0 or > 1 || video.CropRight is < 0 or > 1 ||
+             video.CropBottom is < 0 or > 1 || video.CropLeft + video.CropRight >= 1 ||
+             video.CropTop + video.CropBottom >= 1 || video.Opacity is < 0 or > 1))
             errors.Add(new("clip.video-parameters", "Video parameters are outside the supported range.", clip.Id));
         if (clip.Audio is { } audio &&
             (audio.Volume is < 0 or > 2 || audio.Pan is < -1 or > 1 ||
@@ -170,6 +191,33 @@ public sealed class ProjectValidator : IProjectValidator
                 errors.Add(new("marker.time", "Marker timing is invalid.", marker.Id));
             if (marker.Confidence is < 0 or > 1)
                 errors.Add(new("marker.confidence", "Marker confidence must be between 0 and 1.", marker.Id));
+        }
+    }
+
+    private static void ValidateTransitions(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.Transitions.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("transition.duplicate-id", "Transition IDs must be unique.", duplicate.Key));
+        foreach (var transition in project.Transitions)
+        {
+            var track = project.FindTrack(transition.TrackId);
+            var from = project.FindMediaClip(transition.FromClipId);
+            var to = project.FindMediaClip(transition.ToClipId);
+            if (transition.Id == Guid.Empty || track is null || from is null || to is null)
+            {
+                errors.Add(new("transition.reference", "Transition references a missing entity.", transition.Id));
+                continue;
+            }
+            if (from.TrackId != track.Id || to.TrackId != track.Id || from.End != to.Start)
+                errors.Add(new("transition.adjacency", "Transition clips must be adjacent on the same track.", transition.Id));
+            if (transition.Duration <= TimelineTime.Zero || transition.Duration > from.Duration || transition.Duration > to.Duration)
+                errors.Add(new("transition.duration", "Transition duration exceeds available clip material.", transition.Id));
+            if (transition.Start < from.Start || transition.End > to.End || !transition.Range.Contains(from.End))
+                errors.Add(new("transition.range", "Transition must straddle the edit point.", transition.Id));
+            if (track.Kind == TrackKind.Audio && transition.Kind != TransitionKind.ConstantPowerAudio)
+                errors.Add(new("transition.audio-kind", "Audio tracks support Constant Power transitions only.", transition.Id));
+            if (track.Kind == TrackKind.Visual && transition.Kind == TransitionKind.ConstantPowerAudio)
+                errors.Add(new("transition.video-kind", "Visual tracks require a video transition.", transition.Id));
         }
     }
 

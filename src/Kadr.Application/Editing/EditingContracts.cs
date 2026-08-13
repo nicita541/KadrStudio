@@ -25,18 +25,21 @@ public sealed record EditResult(
     bool Changed,
     ProjectState State,
     string Description,
-    long Revision);
+    long Revision,
+    ProjectChangeSet Changes);
 
 public sealed class ProjectStateChangedEventArgs(
     ProjectState previous,
     ProjectState current,
     string description,
-    bool isUndoOrRedo) : EventArgs
+    bool isUndoOrRedo,
+    ProjectChangeSet changes) : EventArgs
 {
     public ProjectState Previous { get; } = previous;
     public ProjectState Current { get; } = current;
     public string Description { get; } = description;
     public bool IsUndoOrRedo { get; } = isUndoOrRedo;
+    public ProjectChangeSet Changes { get; } = changes;
 }
 
 public interface IEditorSession

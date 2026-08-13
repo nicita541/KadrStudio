@@ -4,6 +4,7 @@ using KadrStudio.Services;
 using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
 using CoreFrameRate = KadrStudio.Core.Domain.FrameRate;
 using UiTrackKind = KadrStudio.Models.TrackKind;
+using System.Collections.Immutable;
 
 namespace KadrStudio.UiAdapters.Tests;
 
@@ -85,6 +86,49 @@ public sealed class EditorProjectMapperTests
 
         Assert.Equal(project.Tracks.ToArray(), restored.Tracks.ToArray());
         Assert.Equal(id, restored.Tracks[0].Id);
+    }
+
+    [Fact]
+    public void Adapter_preserves_v3_media_transition_and_transform_fields()
+    {
+        var project = KadrStudio.Core.Domain.ProjectState.CreateNew("v3", CoreFrameRate.Fps2997);
+        var source = new KadrStudio.Core.Domain.MediaSource(
+            Guid.NewGuid(), "F:\\media\\vfr.mkv", "vfr.mkv", KadrStudio.Core.Domain.MediaKind.Video,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(20), false,
+            FastFingerprint: "fast", VerifiedFingerprint: "verified",
+            Streams: ImmutableArray.Create(new KadrStudio.Core.Domain.MediaStreamDescriptor(
+                0, KadrStudio.Core.Domain.MediaStreamKind.Video, "hevc", IsVariableFrameRate: true)),
+            IsVariableFrameRate: true);
+        var track = project.Tracks.Single(item => item.Kind == CoreTrackKind.Visual && item.Index == 0);
+        var first = new KadrStudio.Core.Domain.MediaClip(
+            Guid.NewGuid(), source.Id, track.Id, KadrStudio.Core.Domain.TimelineTime.Zero,
+            KadrStudio.Core.Domain.TimelineTime.Zero, KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+            Video: new KadrStudio.Core.Domain.VideoParameters(
+                PositionX: 0.4, PositionY: 0.6, ScaleX: 1.2, ScaleY: 0.8, Rotation: 12,
+                CropLeft: 0.1, CropRight: 0.05, Opacity: 0.75));
+        var second = new KadrStudio.Core.Domain.MediaClip(
+            Guid.NewGuid(), source.Id, track.Id, KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(5), KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+            Video: new KadrStudio.Core.Domain.VideoParameters());
+        var transition = new KadrStudio.Core.Domain.TimelineTransition(
+            Guid.NewGuid(), KadrStudio.Core.Domain.TransitionKind.CrossDissolve, track.Id, first.Id, second.Id,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(4.5), KadrStudio.Core.Domain.TimelineTime.FromSeconds(1));
+        project = project with
+        {
+            Sources = project.Sources.Add(source.Id, source),
+            MediaClips = [first, second],
+            Transitions = [transition]
+        };
+        var mapper = new EditorProjectMapper();
+
+        var restored = mapper.ToCore(mapper.ToUi(project));
+
+        Assert.Equal(transition, Assert.Single(restored.Transitions));
+        Assert.Equal(first.Video, restored.FindMediaClip(first.Id)!.Video);
+        var restoredSource = restored.Sources[source.Id];
+        Assert.Equal("verified", restoredSource.VerifiedFingerprint);
+        Assert.True(restoredSource.IsVariableFrameRate);
+        Assert.True(source.Streams.SequenceEqual(restoredSource.Streams));
     }
 
     [Fact]

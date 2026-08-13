@@ -104,6 +104,97 @@ public sealed class EditorSessionTests
         Assert.Contains(exception.Errors, item => item.Code == "clip.overlap");
     }
 
+    [Fact]
+    public void Audio_only_edit_invalidates_audio_but_not_video_or_overlay()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+        var changedAudio = fixture.AudioClip with
+        {
+            Audio = fixture.AudioClip.Audio! with { Volume = 0.25 }
+        };
+
+        var result = session.Execute(new EditTransaction(
+            "audio gain",
+            new DeleteMediaClipsCommand(new HashSet<Guid> { fixture.AudioClip.Id }, IncludeLinked: false),
+            new AddMediaClipsCommand([changedAudio])));
+
+        Assert.True(result.Changes.InvalidatesAudio);
+        Assert.False(result.Changes.InvalidatesVideo);
+        Assert.False(result.Changes.InvalidatesOverlay);
+        Assert.Equal(fixture.AudioClip.Range, Assert.Single(result.Changes.AudioRanges));
+    }
+
+    [Fact]
+    public void Text_edit_invalidates_overlay_without_restarting_media_pipelines()
+    {
+        var fixture = CreateLinkedProject();
+        var textTrack = fixture.Project.Tracks.Single(item => item.Kind == TrackKind.Text);
+        var text = new TextClip(
+            Guid.NewGuid(), textTrack.Id, TimelineTime.FromSeconds(3), TimelineTime.FromSeconds(2),
+            "caption", new TextStyle());
+        var session = new EditorSession(fixture.Project);
+
+        var result = session.Execute(new EditTransaction("add text", new UpsertTextClipCommand(text)));
+
+        Assert.True(result.Changes.InvalidatesOverlay);
+        Assert.False(result.Changes.InvalidatesVideo);
+        Assert.False(result.Changes.InvalidatesAudio);
+        Assert.Equal(text.Range, Assert.Single(result.Changes.OverlayRanges));
+    }
+
+    [Fact]
+    public void Undo_reports_the_same_pipeline_range_as_the_original_edit()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+        ProjectChangeSet? undoChanges = null;
+        session.StateChanged += (_, args) =>
+        {
+            if (args.IsUndoOrRedo) undoChanges = args.Changes;
+        };
+        session.Execute(new EditTransaction(
+            "video color",
+            new DeleteMediaClipsCommand(new HashSet<Guid> { fixture.VideoClip.Id }, IncludeLinked: false),
+            new AddMediaClipsCommand([fixture.VideoClip with
+            {
+                Video = fixture.VideoClip.Video! with { Saturation = 0.5 }
+            }])));
+
+        Assert.True(session.Undo());
+
+        Assert.NotNull(undoChanges);
+        Assert.True(undoChanges.InvalidatesVideo);
+        Assert.False(undoChanges.InvalidatesAudio);
+        Assert.Equal(fixture.VideoClip.Range, Assert.Single(undoChanges.VideoRanges));
+    }
+
+    [Fact]
+    public void Video_transition_invalidates_only_its_video_range()
+    {
+        var project = ProjectState.CreateNew();
+        var source = new MediaSource(
+            Guid.NewGuid(), "F:\\media\\episode.mkv", "episode.mkv", MediaKind.Video,
+            TimelineTime.FromSeconds(60), false);
+        project = project with { Sources = project.Sources.Add(source.Id, source) };
+        var track = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var first = new MediaClip(Guid.NewGuid(), source.Id, track.Id, TimelineTime.Zero, TimelineTime.Zero,
+            TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        var second = new MediaClip(Guid.NewGuid(), source.Id, track.Id, TimelineTime.FromSeconds(5), TimelineTime.FromSeconds(5),
+            TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        project = project with { MediaClips = [first, second] };
+        var transition = new TimelineTransition(
+            Guid.NewGuid(), TransitionKind.CrossDissolve, track.Id, first.Id, second.Id,
+            TimelineTime.FromSeconds(4.5), TimelineTime.FromSeconds(1));
+        var session = new EditorSession(project);
+
+        var result = session.Execute(new EditTransaction("transition", new UpsertTransitionCommand(transition)));
+
+        Assert.True(result.Changes.InvalidatesVideo);
+        Assert.False(result.Changes.InvalidatesAudio);
+        Assert.Equal(transition.Range, Assert.Single(result.Changes.VideoRanges));
+    }
+
     private static Fixture CreateLinkedProject(double startSeconds = 2, double durationSeconds = 10)
     {
         var project = ProjectState.CreateNew();

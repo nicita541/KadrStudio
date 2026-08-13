@@ -3,6 +3,7 @@ using KadrStudio.Application.Editing;
 using KadrStudio.Core.Domain;
 using KadrStudio.Infrastructure.Storage;
 using Microsoft.Data.Sqlite;
+using System.Security.Cryptography;
 
 namespace KadrStudio.Core.Tests;
 
@@ -38,9 +39,12 @@ public sealed class SqliteProjectStoreTests
 
         Assert.Equal(5L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM tracks;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM media_sources;"));
-        Assert.Equal(2L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM media_clips;"));
+        Assert.Equal(3L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM media_clips;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM text_clips;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM markers;"));
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM transitions;"));
+        Assert.Equal(3L, await ScalarInt64Async(connection,
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
         Assert.Equal(0L, await ScalarInt64Async(connection,
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='project_state';"));
@@ -114,6 +118,45 @@ public sealed class SqliteProjectStoreTests
         Assert.NotNull(await recovery.LoadAsync(second.Id));
     }
 
+    [Fact]
+    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v3()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "v2.kadr");
+        var store = new SqliteProjectStore();
+        await store.SaveAsync(path, ProjectState.CreateNew("v2", FrameRate.Fps2997));
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                PRAGMA foreign_keys=OFF;
+                DROP TABLE transitions;
+                DROP TABLE video_clip_details;
+                DROP TABLE media_source_details;
+                DROP TABLE sequence_settings;
+                UPDATE metadata SET value='2' WHERE key='schema_version';
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+        var hashBefore = SHA256.HashData(await File.ReadAllBytesAsync(path));
+
+        var loaded = await store.LoadAsync(path);
+
+        Assert.Equal(FrameRate.Fps2997, loaded.FrameRate);
+        Assert.Equal(48_000, loaded.Sequence.AudioSampleRate);
+        Assert.Empty(loaded.Transitions);
+        Assert.Equal(hashBefore, SHA256.HashData(await File.ReadAllBytesAsync(path)));
+
+        await store.SaveAsync(path, loaded);
+        await using var migrated = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
+        await migrated.OpenAsync();
+        Assert.Equal(3L, await ScalarInt64Async(migrated,
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
+        Assert.Equal(1L, await ScalarInt64Async(migrated,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transitions';"));
+    }
+
     private static ProjectState CreateProject()
     {
         var project = ProjectState.CreateNew("SQLite project", FrameRate.Fps23976);
@@ -124,17 +167,40 @@ public sealed class SqliteProjectStoreTests
         var visual = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
         var audio = project.Tracks.Single(item => item.Kind == TrackKind.Audio && item.Index == 0);
         var text = project.Tracks.Single(item => item.Kind == TrackKind.Text);
-        var link = Guid.NewGuid();
+        var firstVideo = new MediaClip(Guid.NewGuid(), source.Id, visual.Id, TimelineTime.Zero, TimelineTime.Zero,
+            TimelineTime.FromSeconds(5), null,
+            new VideoParameters(0.1, 1.1, 0.9, 0, 0.4, 0.6, 1.2, 0.8, 12, 0.1, 0, 0.05, 0, 0.75), null);
+        var secondVideo = new MediaClip(Guid.NewGuid(), source.Id, visual.Id, TimelineTime.FromSeconds(5), TimelineTime.FromSeconds(5),
+            TimelineTime.FromSeconds(5), null, new VideoParameters(), null);
         return project with
         {
+            Sequence = new SequenceSettings(1920, 1080, FrameRate.Fps23976, 48_000),
             Revision = 42,
-            Sources = ImmutableDictionary<Guid, MediaSource>.Empty.Add(source.Id, source),
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty.Add(source.Id, source with
+            {
+                PreviousPath = "E:\\old\\input.mkv",
+                FastFingerprint = "fast",
+                VerifiedFingerprint = "verified",
+                IsVariableFrameRate = true,
+                ProxyPath = "F:\\cache\\input.proxy.mp4",
+                Streams =
+                [
+                    new MediaStreamDescriptor(0, MediaStreamKind.Video, "hevc", "yuv420p", 1920, 1080,
+                        FrameRate: FrameRate.Fps23976, IsVariableFrameRate: true),
+                    new MediaStreamDescriptor(1, MediaStreamKind.Audio, "aac", "fltp", SampleRate: 48_000, Channels: 2)
+                ]
+            }),
             MediaClips =
             [
-                new MediaClip(Guid.NewGuid(), source.Id, visual.Id, TimelineTime.Zero, TimelineTime.FromSeconds(1),
-                    TimelineTime.FromSeconds(10), link, new VideoParameters(0.1, 1.1, 0.9, 0), null),
+                firstVideo,
+                secondVideo,
                 new MediaClip(Guid.NewGuid(), source.Id, audio.Id, TimelineTime.Zero, TimelineTime.FromSeconds(1),
-                    TimelineTime.FromSeconds(10), link, null, new AudioParameters(0.8, false, -0.2))
+                    TimelineTime.FromSeconds(10), null, null, new AudioParameters(0.8, false, -0.2))
+            ],
+            Transitions =
+            [
+                new TimelineTransition(Guid.NewGuid(), TransitionKind.CrossDissolve, visual.Id,
+                    firstVideo.Id, secondVideo.Id, TimelineTime.FromSeconds(4.5), TimelineTime.FromSeconds(1))
             ],
             TextClips = [new TextClip(Guid.NewGuid(), text.Id, TimelineTime.FromSeconds(2), TimelineTime.FromSeconds(3), "line 1\nline 2", new TextStyle())],
             Markers = [new TimelineMarker(Guid.NewGuid(), MarkerKind.Opening, TimelineTime.Zero, TimelineTime.FromSeconds(5), "Opening", Confidence: 0.9)],
@@ -154,9 +220,19 @@ public sealed class SqliteProjectStoreTests
         Assert.Equal(expected.CreatedAt, actual.CreatedAt);
         Assert.Equal(expected.UpdatedAt, actual.UpdatedAt);
         Assert.True(expected.Tracks.SequenceEqual(actual.Tracks));
-        Assert.Equal(expected.Sources.OrderBy(item => item.Key), actual.Sources.OrderBy(item => item.Key));
+        Assert.Equal(expected.Sources.Keys.Order(), actual.Sources.Keys.Order());
+        foreach (var id in expected.Sources.Keys)
+        {
+            var expectedSource = expected.Sources[id];
+            var actualSource = actual.Sources[id];
+            Assert.Equal(expectedSource with { Streams = default }, actualSource with { Streams = default });
+            Assert.True(
+                (expectedSource.Streams.IsDefault ? [] : expectedSource.Streams)
+                .SequenceEqual(actualSource.Streams.IsDefault ? [] : actualSource.Streams));
+        }
         Assert.True(expected.MediaClips.SequenceEqual(actual.MediaClips));
         Assert.True(expected.TextClips.SequenceEqual(actual.TextClips));
+        Assert.True(expected.Transitions.SequenceEqual(actual.Transitions));
         Assert.True(expected.Markers.SequenceEqual(actual.Markers));
         Assert.Equal(expected.InPoint, actual.InPoint);
         Assert.Equal(expected.OutPoint, actual.OutPoint);

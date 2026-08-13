@@ -492,6 +492,32 @@ public sealed record ReplaceMarkersCommand(IReadOnlyList<TimelineMarker> Markers
     public ProjectState Apply(ProjectState project) => project with { Markers = Markers.ToImmutableArray() };
 }
 
+public sealed record UpsertTransitionCommand(TimelineTransition Transition) : IEditCommand
+{
+    public string Description => "Upsert transition";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var exists = project.Transitions.Any(item => item.Id == Transition.Id);
+        return project with
+        {
+            Transitions = exists
+                ? project.Transitions.Select(item => item.Id == Transition.Id ? Transition : item).ToImmutableArray()
+                : project.Transitions.Add(Transition)
+        };
+    }
+}
+
+public sealed record DeleteTransitionsCommand(IReadOnlySet<Guid> TransitionIds) : IEditCommand
+{
+    public string Description => "Delete transitions";
+
+    public ProjectState Apply(ProjectState project) => project with
+    {
+        Transitions = project.Transitions.Where(item => !TransitionIds.Contains(item.Id)).ToImmutableArray()
+    };
+}
+
 public sealed record SetInOutCommand(TimelineTime? InPoint, TimelineTime? OutPoint) : IEditCommand
 {
     public string Description => "Изменить точки входа и выхода";

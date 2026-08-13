@@ -59,7 +59,10 @@ public sealed class EditorProjectMapper
                 Time(clip.Duration),
                 clip.LinkGroupId,
                 kind == CoreTrackKind.Visual
-                    ? new VideoParameters(clip.Brightness, clip.Contrast, clip.Saturation, clip.Temperature)
+                    ? new VideoParameters(
+                        clip.Brightness, clip.Contrast, clip.Saturation, clip.Temperature,
+                        clip.PositionX, clip.PositionY, clip.ScaleX, clip.ScaleY, clip.Rotation,
+                        clip.CropLeft, clip.CropTop, clip.CropRight, clip.CropBottom, clip.Opacity)
                     : null,
                 kind == CoreTrackKind.Audio
                     ? new AudioParameters(
@@ -88,6 +91,27 @@ public sealed class EditorProjectMapper
             marker.Confidence,
             marker.Query)).ToImmutableArray();
 
+        var currentMediaIds = clips.Select(item => item.Id).ToHashSet();
+        var retainedTransitions = project.MigrationSnapshot?.Transitions
+            .Where(item => currentMediaIds.Contains(item.FromClipId) && currentMediaIds.Contains(item.ToClipId))
+            .Where(item => IsTransitionStillValid(item, clips, tracks))
+            .ToImmutableArray() ?? [];
+        var snapshotSources = project.MigrationSnapshot?.Sources ?? ImmutableDictionary<Guid, MediaSource>.Empty;
+        sources = sources.ToImmutableDictionary(
+            pair => pair.Key,
+            pair => snapshotSources.TryGetValue(pair.Key, out var snapshot)
+                ? pair.Value with
+                {
+                    PreviousPath = snapshot.PreviousPath,
+                    OnlineState = snapshot.OnlineState,
+                    FastFingerprint = snapshot.FastFingerprint,
+                    VerifiedFingerprint = snapshot.VerifiedFingerprint,
+                    Streams = snapshot.Streams,
+                    IsVariableFrameRate = snapshot.IsVariableFrameRate,
+                    ProxyPath = snapshot.ProxyPath
+                }
+                : pair.Value);
+
         return new ProjectState
         {
             Id = project.Id,
@@ -102,6 +126,7 @@ public sealed class EditorProjectMapper
             Sources = sources,
             MediaClips = clips,
             TextClips = texts,
+            Transitions = retainedTransitions,
             Markers = markers,
             InPoint = project.InPoint is null ? null : Time(project.InPoint.Value),
             OutPoint = project.OutPoint is null ? null : Time(project.OutPoint.Value)
@@ -123,6 +148,7 @@ public sealed class EditorProjectMapper
             CreatedAt = project.CreatedAt,
             UpdatedAt = project.UpdatedAt,
             FilePath = filePath,
+            MigrationSnapshot = project,
             InPoint = project.InPoint?.TotalSeconds,
             OutPoint = project.OutPoint?.TotalSeconds
         };
@@ -151,6 +177,16 @@ public sealed class EditorProjectMapper
                 Contrast = clip.Video?.Contrast ?? 1,
                 Saturation = clip.Video?.Saturation ?? 1,
                 Temperature = clip.Video?.Temperature ?? 0,
+                PositionX = clip.Video?.PositionX ?? 0.5,
+                PositionY = clip.Video?.PositionY ?? 0.5,
+                ScaleX = clip.Video?.ScaleX ?? 1,
+                ScaleY = clip.Video?.ScaleY ?? 1,
+                Rotation = clip.Video?.Rotation ?? 0,
+                CropLeft = clip.Video?.CropLeft ?? 0,
+                CropTop = clip.Video?.CropTop ?? 0,
+                CropRight = clip.Video?.CropRight ?? 0,
+                CropBottom = clip.Video?.CropBottom ?? 0,
+                Opacity = clip.Video?.Opacity ?? 1,
                 Volume = clip.Audio?.Volume ?? 1,
                 IsMuted = clip.Audio?.IsMuted ?? false,
                 Pan = clip.Audio?.Pan ?? 0,
@@ -281,6 +317,21 @@ public sealed class EditorProjectMapper
     }
 
     private static TimelineTime Time(double seconds) => TimelineTime.FromSeconds(Math.Max(0, seconds));
+
+    private static bool IsTransitionStillValid(
+        TimelineTransition transition,
+        ImmutableArray<MediaClip> clips,
+        IEnumerable<TimelineTrack> tracks)
+    {
+        var from = clips.FirstOrDefault(item => item.Id == transition.FromClipId);
+        var to = clips.FirstOrDefault(item => item.Id == transition.ToClipId);
+        var track = tracks.FirstOrDefault(item => item.Id == transition.TrackId);
+        return from is not null && to is not null && track is not null &&
+               from.TrackId == track.Id && to.TrackId == track.Id && from.End == to.Start &&
+               transition.Duration > TimelineTime.Zero && transition.Duration <= from.Duration &&
+               transition.Duration <= to.Duration && transition.Start >= from.Start &&
+               transition.End <= to.End && transition.Range.Contains(from.End);
+    }
     private static long SafeLastWriteTicks(string path) { try { return File.GetLastWriteTimeUtc(path).Ticks; } catch { return 0; } }
     private static string BuildFingerprint(MediaAsset asset) => $"{asset.FileSizeBytes:x}-{SafeLastWriteTicks(asset.Path):x}";
 

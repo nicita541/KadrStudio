@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Collections.Immutable;
+using System.Text.Json;
 using KadrStudio.Application.Storage;
 using KadrStudio.Core.Domain;
 using KadrStudio.Core.Validation;
@@ -9,7 +10,7 @@ namespace KadrStudio.Infrastructure.Storage;
 
 public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IProjectStore
 {
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
     private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
@@ -159,6 +160,11 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ("$updatedAt", project.UpdatedAt.ToString("O", CultureInfo.InvariantCulture)),
             ("$inPoint", project.InPoint?.Ticks), ("$outPoint", project.OutPoint?.Ticks)).ConfigureAwait(false);
 
+        await ExecuteAsync(connection, transaction, """
+            INSERT INTO sequence_settings(singleton_id, audio_sample_rate)
+            VALUES(1, $sampleRate);
+            """, token, ("$sampleRate", project.Sequence.AudioSampleRate)).ConfigureAwait(false);
+
         for (var ordinal = 0; ordinal < project.Tracks.Length; ordinal++)
         {
             var track = project.Tracks[ordinal];
@@ -189,6 +195,18 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$videoCodec", source.VideoCodec), ("$audioCodec", source.AudioCodec),
                 ("$fileSize", source.FileSize), ("$lastWrite", source.LastWriteUtcTicks),
                 ("$fingerprint", source.Fingerprint)).ConfigureAwait(false);
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO media_source_details(
+                    source_id, previous_path, online_state, fast_fingerprint, verified_fingerprint,
+                    streams_json, is_variable_frame_rate, proxy_path)
+                VALUES($sourceId, $previousPath, $onlineState, $fastFingerprint, $verifiedFingerprint,
+                       $streams, $vfr, $proxyPath);
+                """, token,
+                ("$sourceId", source.Id.ToString("N")), ("$previousPath", source.PreviousPath),
+                ("$onlineState", (int)source.OnlineState), ("$fastFingerprint", source.FastFingerprint),
+                ("$verifiedFingerprint", source.VerifiedFingerprint),
+                ("$streams", JsonSerializer.Serialize(source.Streams.IsDefault ? [] : source.Streams)),
+                ("$vfr", source.IsVariableFrameRate), ("$proxyPath", source.ProxyPath)).ConfigureAwait(false);
         }
 
         for (var ordinal = 0; ordinal < project.MediaClips.Length; ordinal++)
@@ -213,6 +231,21 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$pan", clip.Audio?.Pan), ("$fadeIn", clip.Audio?.FadeIn.Ticks),
                 ("$fadeOut", clip.Audio?.FadeOut.Ticks), ("$bass", clip.Audio?.Bass),
                 ("$mid", clip.Audio?.Mid), ("$treble", clip.Audio?.Treble)).ConfigureAwait(false);
+            if (clip.Video is { } video)
+            {
+                await ExecuteAsync(connection, transaction, """
+                    INSERT INTO video_clip_details(
+                        clip_id, position_x, position_y, scale_x, scale_y, rotation,
+                        crop_left, crop_top, crop_right, crop_bottom, opacity)
+                    VALUES($clipId, $x, $y, $scaleX, $scaleY, $rotation,
+                           $cropLeft, $cropTop, $cropRight, $cropBottom, $opacity);
+                    """, token,
+                    ("$clipId", clip.Id.ToString("N")), ("$x", video.PositionX), ("$y", video.PositionY),
+                    ("$scaleX", video.ScaleX), ("$scaleY", video.ScaleY), ("$rotation", video.Rotation),
+                    ("$cropLeft", video.CropLeft), ("$cropTop", video.CropTop),
+                    ("$cropRight", video.CropRight), ("$cropBottom", video.CropBottom),
+                    ("$opacity", video.Opacity)).ConfigureAwait(false);
+            }
         }
 
         for (var ordinal = 0; ordinal < project.TextClips.Length; ordinal++)
@@ -249,6 +282,20 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$sourceId", marker.SourceId?.ToString("N")), ("$sourceStart", marker.SourceStart.Ticks),
                 ("$confidence", marker.Confidence), ("$query", marker.Query)).ConfigureAwait(false);
         }
+        for (var ordinal = 0; ordinal < project.Transitions.Length; ordinal++)
+        {
+            var transition = project.Transitions[ordinal];
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO transitions(
+                    id, transition_order, kind, track_id, from_clip_id, to_clip_id, start_ticks, duration_ticks)
+                VALUES($id, $order, $kind, $trackId, $fromClipId, $toClipId, $start, $duration);
+                """, token,
+                ("$id", transition.Id.ToString("N")), ("$order", ordinal), ("$kind", (int)transition.Kind),
+                ("$trackId", transition.TrackId.ToString("N")),
+                ("$fromClipId", transition.FromClipId.ToString("N")),
+                ("$toClipId", transition.ToClipId.ToString("N")),
+                ("$start", transition.Start.Ticks), ("$duration", transition.Duration.Ticks)).ConfigureAwait(false);
+        }
         await transaction.CommitAsync(token).ConfigureAwait(false);
     }
 
@@ -264,6 +311,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
         DateTimeOffset updatedAt;
         TimelineTime? inPoint;
         TimelineTime? outPoint;
+        var audioSampleRate = 48_000;
 
         await using (var command = connection.CreateCommand())
         {
@@ -286,6 +334,14 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             updatedAt = ReadDateTimeOffset(reader, 8);
             inPoint = ReadNullableTime(reader, 9);
             outPoint = ReadNullableTime(reader, 10);
+        }
+
+        if (await HasTableAsync(connection, "sequence_settings", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT audio_sample_rate FROM sequence_settings WHERE singleton_id = 1;";
+            var value = await command.ExecuteScalarAsync(token).ConfigureAwait(false);
+            if (value is not null) audioSampleRate = Convert.ToInt32(value, CultureInfo.InvariantCulture);
         }
 
         var tracks = ImmutableArray.CreateBuilder<TimelineTrack>();
@@ -314,6 +370,23 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
         }
 
         var sources = ImmutableDictionary.CreateBuilder<Guid, MediaSource>();
+        var hasSourceDetails = await HasTableAsync(connection, "media_source_details", token).ConfigureAwait(false);
+        var sourceDetails = new Dictionary<Guid, MediaSourceDetails>();
+        if (hasSourceDetails)
+        {
+            await using var detailCommand = connection.CreateCommand();
+            detailCommand.CommandText = """
+                SELECT source_id, previous_path, online_state, fast_fingerprint, verified_fingerprint,
+                       streams_json, is_variable_frame_rate, proxy_path
+                FROM media_source_details;
+                """;
+            await using var detailReader = await detailCommand.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await detailReader.ReadAsync(token).ConfigureAwait(false))
+                sourceDetails.Add(ReadGuid(detailReader, 0), new MediaSourceDetails(
+                    detailReader.GetString(1), (MediaOnlineState)detailReader.GetInt32(2),
+                    detailReader.GetString(3), detailReader.GetString(4), detailReader.GetString(5),
+                    ReadBoolean(detailReader, 6), detailReader.GetString(7)));
+        }
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = """
@@ -329,7 +402,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 var sourceFrameRate = reader.IsDBNull(8)
                     ? (FrameRate?)null
                     : new FrameRate(reader.GetInt32(8), reader.GetInt32(9));
-                sources.Add(id, new MediaSource(
+                var source = new MediaSource(
                     id,
                     reader.GetString(1),
                     reader.GetString(2),
@@ -343,11 +416,43 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                     reader.GetString(11),
                     reader.GetInt64(12),
                     reader.GetInt64(13),
-                    reader.GetString(14)));
+                    reader.GetString(14));
+                if (sourceDetails.TryGetValue(id, out var details))
+                {
+                    source = source with
+                    {
+                        PreviousPath = details.PreviousPath,
+                        OnlineState = details.OnlineState,
+                        FastFingerprint = details.FastFingerprint,
+                        VerifiedFingerprint = details.VerifiedFingerprint,
+                        Streams = JsonSerializer.Deserialize<ImmutableArray<MediaStreamDescriptor>>(details.StreamsJson),
+                        IsVariableFrameRate = details.IsVariableFrameRate,
+                        ProxyPath = details.ProxyPath
+                    };
+                }
+                sources.Add(id, source);
             }
         }
 
         var mediaClips = ImmutableArray.CreateBuilder<MediaClip>();
+        var hasVideoDetails = await HasTableAsync(connection, "video_clip_details", token).ConfigureAwait(false);
+        var videoDetails = new Dictionary<Guid, VideoClipDetails>();
+        if (hasVideoDetails)
+        {
+            await using var detailCommand = connection.CreateCommand();
+            detailCommand.CommandText = """
+                SELECT clip_id, position_x, position_y, scale_x, scale_y, rotation,
+                       crop_left, crop_top, crop_right, crop_bottom, opacity
+                FROM video_clip_details;
+                """;
+            await using var detailReader = await detailCommand.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await detailReader.ReadAsync(token).ConfigureAwait(false))
+                videoDetails.Add(ReadGuid(detailReader, 0), new VideoClipDetails(
+                    detailReader.GetDouble(1), detailReader.GetDouble(2), detailReader.GetDouble(3),
+                    detailReader.GetDouble(4), detailReader.GetDouble(5), detailReader.GetDouble(6),
+                    detailReader.GetDouble(7), detailReader.GetDouble(8), detailReader.GetDouble(9),
+                    detailReader.GetDouble(10)));
+        }
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = """
@@ -362,6 +467,18 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 var video = reader.IsDBNull(7)
                     ? null
                     : new VideoParameters(reader.GetDouble(7), reader.GetDouble(8), reader.GetDouble(9), reader.GetDouble(10));
+                var clipId = ReadGuid(reader, 0);
+                if (video is not null && videoDetails.TryGetValue(clipId, out var details))
+                {
+                    video = video with
+                    {
+                        PositionX = details.PositionX, PositionY = details.PositionY,
+                        ScaleX = details.ScaleX, ScaleY = details.ScaleY, Rotation = details.Rotation,
+                        CropLeft = details.CropLeft, CropTop = details.CropTop,
+                        CropRight = details.CropRight, CropBottom = details.CropBottom,
+                        Opacity = details.Opacity
+                    };
+                }
                 var audio = reader.IsDBNull(11)
                     ? null
                     : new AudioParameters(
@@ -369,7 +486,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                         new TimelineTime(reader.GetInt64(14)), new TimelineTime(reader.GetInt64(15)),
                         reader.GetDouble(16), reader.GetDouble(17), reader.GetDouble(18));
                 mediaClips.Add(new MediaClip(
-                    ReadGuid(reader, 0),
+                    clipId,
                     ReadGuid(reader, 1),
                     ReadGuid(reader, 2),
                     new TimelineTime(reader.GetInt64(3)),
@@ -422,13 +539,27 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             }
         }
 
+        var transitions = ImmutableArray.CreateBuilder<TimelineTransition>();
+        if (await HasTableAsync(connection, "transitions", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT id, kind, track_id, from_clip_id, to_clip_id, start_ticks, duration_ticks
+                FROM transitions ORDER BY transition_order;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+                transitions.Add(new TimelineTransition(
+                    ReadGuid(reader, 0), (TransitionKind)reader.GetInt32(1), ReadGuid(reader, 2),
+                    ReadGuid(reader, 3), ReadGuid(reader, 4), new TimelineTime(reader.GetInt64(5)),
+                    new TimelineTime(reader.GetInt64(6))));
+        }
+
         return new ProjectState
         {
             Id = projectId,
             Name = name,
-            CanvasWidth = canvasWidth,
-            CanvasHeight = canvasHeight,
-            FrameRate = frameRate,
+            Sequence = new SequenceSettings(canvasWidth, canvasHeight, frameRate, audioSampleRate),
             Revision = revision,
             CreatedAt = createdAt,
             UpdatedAt = updatedAt,
@@ -436,6 +567,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             Sources = sources.ToImmutable(),
             MediaClips = mediaClips.ToImmutable(),
             TextClips = textClips.ToImmutable(),
+            Transitions = transitions.ToImmutable(),
             Markers = markers.ToImmutable(),
             InPoint = inPoint,
             OutPoint = outPoint
@@ -467,6 +599,10 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 out_point_ticks INTEGER NULL CHECK(out_point_ticks IS NULL OR out_point_ticks >= 0),
                 CHECK(in_point_ticks IS NULL OR out_point_ticks IS NULL OR out_point_ticks > in_point_ticks)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS sequence_settings(
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                audio_sample_rate INTEGER NOT NULL CHECK(audio_sample_rate BETWEEN 8000 AND 192000)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS tracks(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
                 track_order INTEGER NOT NULL UNIQUE CHECK(track_order >= 0),
@@ -495,6 +631,16 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 last_write_utc_ticks INTEGER NOT NULL,
                 fingerprint TEXT NOT NULL
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS media_source_details(
+                source_id TEXT PRIMARY KEY REFERENCES media_sources(id) ON DELETE CASCADE,
+                previous_path TEXT NOT NULL,
+                online_state INTEGER NOT NULL CHECK(online_state BETWEEN 0 AND 3),
+                fast_fingerprint TEXT NOT NULL,
+                verified_fingerprint TEXT NOT NULL,
+                streams_json TEXT NOT NULL,
+                is_variable_frame_rate INTEGER NOT NULL CHECK(is_variable_frame_rate IN (0,1)),
+                proxy_path TEXT NOT NULL
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS media_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
                 clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
@@ -520,6 +666,21 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             CREATE INDEX IF NOT EXISTS ix_media_clips_track_time ON media_clips(track_id, start_ticks, duration_ticks);
             CREATE INDEX IF NOT EXISTS ix_media_clips_source ON media_clips(source_id);
             CREATE INDEX IF NOT EXISTS ix_media_clips_link ON media_clips(link_group_id) WHERE link_group_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS video_clip_details(
+                clip_id TEXT PRIMARY KEY REFERENCES media_clips(id) ON DELETE CASCADE,
+                position_x REAL NOT NULL CHECK(position_x BETWEEN -5 AND 5),
+                position_y REAL NOT NULL CHECK(position_y BETWEEN -5 AND 5),
+                scale_x REAL NOT NULL CHECK(scale_x > 0 AND scale_x <= 100),
+                scale_y REAL NOT NULL CHECK(scale_y > 0 AND scale_y <= 100),
+                rotation REAL NOT NULL CHECK(rotation BETWEEN -360 AND 360),
+                crop_left REAL NOT NULL CHECK(crop_left BETWEEN 0 AND 1),
+                crop_top REAL NOT NULL CHECK(crop_top BETWEEN 0 AND 1),
+                crop_right REAL NOT NULL CHECK(crop_right BETWEEN 0 AND 1),
+                crop_bottom REAL NOT NULL CHECK(crop_bottom BETWEEN 0 AND 1),
+                opacity REAL NOT NULL CHECK(opacity BETWEEN 0 AND 1),
+                CHECK(crop_left + crop_right < 1),
+                CHECK(crop_top + crop_bottom < 1)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS text_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
                 clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
@@ -552,6 +713,18 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 query TEXT NOT NULL
             ) STRICT;
             CREATE INDEX IF NOT EXISTS ix_markers_time ON markers(start_ticks, duration_ticks);
+            CREATE TABLE IF NOT EXISTS transitions(
+                id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                transition_order INTEGER NOT NULL UNIQUE CHECK(transition_order >= 0),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
+                track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
+                from_clip_id TEXT NOT NULL REFERENCES media_clips(id) ON DELETE CASCADE,
+                to_clip_id TEXT NOT NULL REFERENCES media_clips(id) ON DELETE CASCADE,
+                start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
+                duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
+                CHECK(from_clip_id <> to_clip_id)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS ix_transitions_track_time ON transitions(track_id, start_ticks, duration_ticks);
             CREATE TABLE IF NOT EXISTS checkpoints(
                 id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                 project_id TEXT NOT NULL CHECK(length(project_id) = 32),
@@ -599,6 +772,14 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             if (reader.GetString(1).Equals(column, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
+    }
+
+    private static async Task<bool> HasTableAsync(SqliteConnection connection, string table, CancellationToken token)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = $name;";
+        command.Parameters.AddWithValue("$name", table);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture) > 0;
     }
 
     private static async Task<CheckpointDocument[]> ReadCheckpointDocumentsAsync(string path, CancellationToken token)
@@ -729,4 +910,25 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
     {
         public ProjectCheckpointInfo ToInfo() => new(Id, ProjectId, CreatedAt, Name);
     }
+
+    private sealed record MediaSourceDetails(
+        string PreviousPath,
+        MediaOnlineState OnlineState,
+        string FastFingerprint,
+        string VerifiedFingerprint,
+        string StreamsJson,
+        bool IsVariableFrameRate,
+        string ProxyPath);
+
+    private sealed record VideoClipDetails(
+        double PositionX,
+        double PositionY,
+        double ScaleX,
+        double ScaleY,
+        double Rotation,
+        double CropLeft,
+        double CropTop,
+        double CropRight,
+        double CropBottom,
+        double Opacity);
 }

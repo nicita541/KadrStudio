@@ -83,6 +83,13 @@ public sealed class EditorProject : ObservableObject
     [JsonIgnore]
     public string? FilePath { get; set; }
 
+    /// <summary>
+    /// Immutable v3 state retained only while the legacy WPF projection is being
+    /// removed. It prevents fields not yet editable by old panels from being lost.
+    /// </summary>
+    [JsonIgnore]
+    public ProjectState? MigrationSnapshot { get; set; }
+
     [JsonIgnore]
     public long VideoRevision { get; private set; }
 

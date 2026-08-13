@@ -27,7 +27,7 @@ public sealed class EditorSession : IEditorSession
     {
         ArgumentNullException.ThrowIfNull(transaction);
         if (transaction.Commands.Count == 0)
-            return new EditResult(false, _state, transaction.Description, _state.Revision);
+            return new EditResult(false, _state, transaction.Description, _state.Revision, ProjectChangeSet.Empty);
 
         var before = _state;
         var candidate = before;
@@ -47,7 +47,7 @@ public sealed class EditorSession : IEditorSession
         }
 
         if (ReferenceEquals(candidate, before) || candidate == before)
-            return new EditResult(false, before, transaction.Description, before.Revision);
+            return new EditResult(false, before, transaction.Description, before.Revision, ProjectChangeSet.Empty);
 
         candidate = candidate with
         {
@@ -55,13 +55,14 @@ public sealed class EditorSession : IEditorSession
             UpdatedAt = DateTimeOffset.UtcNow
         };
         EnsureValid(candidate);
+        var changes = ProjectChangeSet.Between(before, candidate);
 
         _state = candidate;
         _undo.AddLast(new HistoryEntry(before, candidate, transaction.Description));
         while (_undo.Count > MaximumUndoEntries) _undo.RemoveFirst();
         _redo.Clear();
-        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(before, candidate, transaction.Description, false));
-        return new EditResult(true, candidate, transaction.Description, candidate.Revision);
+        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(before, candidate, transaction.Description, false, changes));
+        return new EditResult(true, candidate, transaction.Description, candidate.Revision, changes);
     }
 
     public bool Undo()
@@ -72,7 +73,8 @@ public sealed class EditorSession : IEditorSession
         var previous = _state;
         _state = entry.Before;
         _redo.Push(entry);
-        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(previous, _state, $"Отмена: {entry.Description}", true));
+        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
+            previous, _state, $"Отмена: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
         return true;
     }
 
@@ -83,7 +85,8 @@ public sealed class EditorSession : IEditorSession
         var previous = _state;
         _state = entry.After;
         _undo.AddLast(entry);
-        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(previous, _state, $"Повтор: {entry.Description}", true));
+        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
+            previous, _state, $"Повтор: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
         return true;
     }
 
@@ -97,7 +100,8 @@ public sealed class EditorSession : IEditorSession
             _undo.Clear();
             _redo.Clear();
         }
-        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(previous, state, reason, false));
+        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
+            previous, state, reason, false, ProjectChangeSet.Between(previous, state)));
     }
 
     private void EnsureValid(ProjectState state)

@@ -16,6 +16,30 @@ public enum MediaKind
     Image
 }
 
+public enum MediaOnlineState
+{
+    Online,
+    Offline,
+    Relinking,
+    Incompatible
+}
+
+public enum MediaStreamKind
+{
+    Video,
+    Audio
+}
+
+public enum TransitionKind
+{
+    CrossDissolve,
+    DipToBlack,
+    DipToWhite,
+    Wipe,
+    Slide,
+    ConstantPowerAudio
+}
+
 public enum MarkerKind
 {
     Scene,
@@ -39,6 +63,39 @@ public sealed record TimelineTrack(
     bool IsLocked = false,
     bool IsVisible = true);
 
+public sealed record SequenceSettings
+{
+    public SequenceSettings(
+        int canvasWidth = 1920,
+        int canvasHeight = 1080,
+        FrameRate? frameRate = null,
+        int audioSampleRate = 48_000)
+    {
+        CanvasWidth = canvasWidth;
+        CanvasHeight = canvasHeight;
+        FrameRate = frameRate ?? FrameRate.Fps30;
+        AudioSampleRate = audioSampleRate;
+    }
+
+    public int CanvasWidth { get; init; }
+    public int CanvasHeight { get; init; }
+    public FrameRate FrameRate { get; init; }
+    public int AudioSampleRate { get; init; }
+    public static SequenceSettings Default { get; } = new();
+}
+
+public sealed record MediaStreamDescriptor(
+    int StreamIndex,
+    MediaStreamKind Kind,
+    string Codec,
+    string PixelOrSampleFormat = "",
+    int Width = 0,
+    int Height = 0,
+    int SampleRate = 0,
+    int Channels = 0,
+    FrameRate? FrameRate = null,
+    bool IsVariableFrameRate = false);
+
 public sealed record MediaSource(
     Guid Id,
     string Path,
@@ -53,13 +110,30 @@ public sealed record MediaSource(
     string AudioCodec = "",
     long FileSize = 0,
     long LastWriteUtcTicks = 0,
-    string Fingerprint = "");
+    string Fingerprint = "",
+    string PreviousPath = "",
+    MediaOnlineState OnlineState = MediaOnlineState.Online,
+    string FastFingerprint = "",
+    string VerifiedFingerprint = "",
+    ImmutableArray<MediaStreamDescriptor> Streams = default,
+    bool IsVariableFrameRate = false,
+    string ProxyPath = "");
 
 public sealed record VideoParameters(
     double Brightness = 0,
     double Contrast = 1,
     double Saturation = 1,
-    double Temperature = 0);
+    double Temperature = 0,
+    double PositionX = 0.5,
+    double PositionY = 0.5,
+    double ScaleX = 1,
+    double ScaleY = 1,
+    double Rotation = 0,
+    double CropLeft = 0,
+    double CropTop = 0,
+    double CropRight = 0,
+    double CropBottom = 0,
+    double Opacity = 1);
 
 public sealed record AudioParameters(
     double Volume = 1,
@@ -125,13 +199,29 @@ public sealed record TimelineMarker(
     public TimeRange Range => new(Start, Duration);
 }
 
+public sealed record TimelineTransition(
+    Guid Id,
+    TransitionKind Kind,
+    Guid TrackId,
+    Guid FromClipId,
+    Guid ToClipId,
+    TimelineTime Start,
+    TimelineTime Duration)
+{
+    public TimelineTime End => Start + Duration;
+    public TimeRange Range => new(Start, Duration);
+}
+
 public sealed record ProjectState
 {
+    private SequenceSettings _sequence = SequenceSettings.Default;
+
     public Guid Id { get; init; } = Guid.NewGuid();
     public string Name { get; init; } = "Новый проект";
-    public int CanvasWidth { get; init; } = 1920;
-    public int CanvasHeight { get; init; } = 1080;
-    public FrameRate FrameRate { get; init; } = FrameRate.Fps30;
+    public SequenceSettings Sequence { get => _sequence; init => _sequence = value ?? SequenceSettings.Default; }
+    public int CanvasWidth { get => _sequence.CanvasWidth; init => _sequence = _sequence with { CanvasWidth = value }; }
+    public int CanvasHeight { get => _sequence.CanvasHeight; init => _sequence = _sequence with { CanvasHeight = value }; }
+    public FrameRate FrameRate { get => _sequence.FrameRate; init => _sequence = _sequence with { FrameRate = value }; }
     public long Revision { get; init; }
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; init; } = DateTimeOffset.UtcNow;
@@ -139,6 +229,7 @@ public sealed record ProjectState
     public ImmutableDictionary<Guid, MediaSource> Sources { get; init; } = ImmutableDictionary<Guid, MediaSource>.Empty;
     public ImmutableArray<MediaClip> MediaClips { get; init; } = [];
     public ImmutableArray<TextClip> TextClips { get; init; } = [];
+    public ImmutableArray<TimelineTransition> Transitions { get; init; } = [];
     public ImmutableArray<TimelineMarker> Markers { get; init; } = [];
     public TimelineTime? InPoint { get; init; }
     public TimelineTime? OutPoint { get; init; }

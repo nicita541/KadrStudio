@@ -32,6 +32,7 @@ internal static class ProjectDocumentSerializer
         public required int CanvasHeight { get; init; }
         public required int FrameRateNumerator { get; init; }
         public required int FrameRateDenominator { get; init; }
+        public int AudioSampleRate { get; init; } = 48_000;
         public required long Revision { get; init; }
         public required DateTimeOffset CreatedAt { get; init; }
         public required DateTimeOffset UpdatedAt { get; init; }
@@ -39,6 +40,7 @@ internal static class ProjectDocumentSerializer
         public required MediaSource[] Sources { get; init; }
         public required MediaClip[] MediaClips { get; init; }
         public required TextClip[] TextClips { get; init; }
+        public TimelineTransition[] Transitions { get; init; } = [];
         public required TimelineMarker[] Markers { get; init; }
         public long? InPointTicks { get; init; }
         public long? OutPointTicks { get; init; }
@@ -51,6 +53,7 @@ internal static class ProjectDocumentSerializer
             CanvasHeight = project.CanvasHeight,
             FrameRateNumerator = project.FrameRate.Numerator,
             FrameRateDenominator = project.FrameRate.Denominator,
+            AudioSampleRate = project.Sequence.AudioSampleRate,
             Revision = project.Revision,
             CreatedAt = project.CreatedAt,
             UpdatedAt = project.UpdatedAt,
@@ -58,6 +61,7 @@ internal static class ProjectDocumentSerializer
             Sources = project.Sources.Values.ToArray(),
             MediaClips = project.MediaClips.ToArray(),
             TextClips = project.TextClips.ToArray(),
+            Transitions = project.Transitions.ToArray(),
             Markers = project.Markers.ToArray(),
             InPointTicks = project.InPoint?.Ticks,
             OutPointTicks = project.OutPoint?.Ticks
@@ -67,9 +71,8 @@ internal static class ProjectDocumentSerializer
         {
             Id = Id,
             Name = Name,
-            CanvasWidth = CanvasWidth,
-            CanvasHeight = CanvasHeight,
-            FrameRate = new FrameRate(FrameRateNumerator, FrameRateDenominator),
+            Sequence = new SequenceSettings(
+                CanvasWidth, CanvasHeight, new FrameRate(FrameRateNumerator, FrameRateDenominator), AudioSampleRate),
             Revision = Revision,
             CreatedAt = CreatedAt,
             UpdatedAt = UpdatedAt,
@@ -77,6 +80,7 @@ internal static class ProjectDocumentSerializer
             Sources = Sources.ToImmutableDictionary(item => item.Id),
             MediaClips = MediaClips.ToImmutableArray(),
             TextClips = TextClips.ToImmutableArray(),
+            Transitions = Transitions.ToImmutableArray(),
             Markers = Markers.ToImmutableArray(),
             InPoint = InPointTicks is { } inTicks ? new TimelineTime(inTicks) : null,
             OutPoint = OutPointTicks is { } outTicks ? new TimelineTime(outTicks) : null

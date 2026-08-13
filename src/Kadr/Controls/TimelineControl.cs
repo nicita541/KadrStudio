@@ -12,6 +12,7 @@ namespace KadrStudio.Controls;
 
 public sealed class TimelineControl : FrameworkElement
 {
+    private readonly WaveformRenderer _waveformRenderer = new();
     public const string MediaAssetDataFormat = "KadrStudio.MediaAssetId";
     public const double LeftGutterWidth = 96;
 
@@ -841,7 +842,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawWaveform(DrawingContext context, TimelineClip clip, MediaAsset? asset, Rect rectangle, double dpi)
     {
-        if (asset is { WaveformPeaks.Count: > 0 })
+        if (asset is { Waveform.IsEmpty: false })
         {
             var wholeWaveformArea = new Rect(rectangle.Left + 4, rectangle.Top + 21,
                 Math.Max(0, rectangle.Width - 8), Math.Max(0, rectangle.Height - 26));
@@ -850,51 +851,12 @@ public sealed class TimelineControl : FrameworkElement
             context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(74, 5, 48, 35)), null,
                 waveformArea, 3, 3);
 
-            // Адаптивная плотность: около 100 отдельных столбиков в видимой части клипа.
-            // При увеличении таймлайна каждый столбик охватывает меньший фрагмент исходного звука.
-            var columnCount = Math.Max(1, Math.Min(120, (int)Math.Ceiling(waveformArea.Width / 3.2)));
-            var step = waveformArea.Width / columnCount;
-            var barWidth = Math.Max(1, Math.Min(2.2, step * 0.62));
             var visibleClipStartRatio = rectangle.Width <= 0 ? 0 : Math.Clamp((waveformArea.Left - rectangle.Left) / rectangle.Width, 0, 1);
             var visibleClipEndRatio = rectangle.Width <= 0 ? 1 : Math.Clamp((waveformArea.Right - rectangle.Left) / rectangle.Width, 0, 1);
             var sourceStartRatio = asset.Duration <= 0 ? 0 : Math.Clamp((clip.SourceStart + visibleClipStartRatio * clip.Duration) / asset.Duration, 0, 1);
             var sourceEndRatio = asset.Duration <= 0 ? 1 : Math.Clamp((clip.SourceStart + visibleClipEndRatio * clip.Duration) / asset.Duration, 0, 1);
-            var visiblePeaks = TimelineMediaCacheService.AggregateVisiblePeaks(
-                asset.WaveformPeaks, sourceStartRatio, sourceEndRatio, columnCount);
-            var barBrush = new SolidColorBrush(Color.FromRgb(167, 243, 208));
-            var quietBrush = new SolidColorBrush(Color.FromRgb(74, 222, 128));
-            for (var column = 0; column < columnCount; column++)
-            {
-                var peak = visiblePeaks[column];
-                var height = Math.Max(1.5, peak * (waveformArea.Height - 2));
-                var x = waveformArea.Left + column * step + (step - barWidth) / 2;
-                context.DrawRoundedRectangle(peak < 0.13 ? quietBrush : barBrush, null,
-                    new Rect(x, waveformArea.Bottom - height - 1, barWidth, height), 0.8, 0.8);
-            }
-            return;
-        }
-
-        if (asset?.WaveformPath is { } path && TryLoadImage(path) is { } waveform)
-        {
-            var startRatio = asset.Duration <= 0 ? 0 : Math.Clamp(clip.SourceStart / asset.Duration, 0, 1);
-            var widthRatio = asset.Duration <= 0 ? 1 : Math.Clamp(clip.Duration / asset.Duration, 0.0001, 1 - startRatio);
-            var brush = new ImageBrush(waveform)
-            {
-                Stretch = Stretch.Fill,
-                ViewboxUnits = BrushMappingMode.RelativeToBoundingBox,
-                Viewbox = new Rect(startRatio, 0, widthRatio, 1),
-                AlignmentY = AlignmentY.Bottom,
-                Opacity = 1
-            };
-            var waveformArea = new Rect(rectangle.Left + 3, rectangle.Top + 21,
-                Math.Max(0, rectangle.Width - 6), Math.Max(0, rectangle.Height - 25));
-            context.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(82, 7, 52, 38)), null,
-                waveformArea, 3, 3);
-            context.DrawRoundedRectangle(brush, null,
-                waveformArea, 3, 3);
-            context.DrawLine(CreatePen(Color.FromArgb(215, 183, 247, 213), 1),
-                new Point(waveformArea.Left, waveformArea.Bottom - 1),
-                new Point(waveformArea.Right, waveformArea.Bottom - 1));
+            _waveformRenderer.Draw(context, asset.Waveform, waveformArea,
+                sourceStartRatio, sourceEndRatio, VisualTreeHelper.GetDpi(this).DpiScaleX);
             return;
         }
 
@@ -1251,7 +1213,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void OnMediaPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.WaveformPath) or nameof(MediaAsset.WaveformPeaks))
+        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.Waveform))
         {
             if (Dispatcher.CheckAccess())
             {

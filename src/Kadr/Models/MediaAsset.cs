@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using KadrStudio.ViewModels;
+using KadrStudio.Application.Caching;
 
 namespace KadrStudio.Models;
 
@@ -8,8 +9,7 @@ public sealed class MediaAsset : ObservableObject
     private string _path = string.Empty;
     private string? _thumbnailPath;
     private IReadOnlyList<string> _timelineFramePaths = Array.Empty<string>();
-    private string? _waveformPath;
-    private IReadOnlyList<float> _waveformPeaks = Array.Empty<float>();
+    private WaveformPyramid _waveform = WaveformPyramid.Empty;
     private bool _isMissing;
 
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -45,17 +45,10 @@ public sealed class MediaAsset : ObservableObject
     }
 
     [JsonIgnore]
-    public string? WaveformPath
+    public WaveformPyramid Waveform
     {
-        get => _waveformPath;
-        set => SetProperty(ref _waveformPath, value);
-    }
-
-    [JsonIgnore]
-    public IReadOnlyList<float> WaveformPeaks
-    {
-        get => _waveformPeaks;
-        set => SetProperty(ref _waveformPeaks, value ?? Array.Empty<float>());
+        get => _waveform;
+        set => SetProperty(ref _waveform, value ?? WaveformPyramid.Empty);
     }
 
     [JsonIgnore]

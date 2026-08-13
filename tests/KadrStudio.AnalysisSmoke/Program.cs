@@ -28,31 +28,6 @@ if (args is ["--make-empty-project", var emptyProjectOutput])
     return 0;
 }
 
-if (args is ["--preview-smoke", var previewInput] && File.Exists(previewInput))
-{
-    var probe = new MediaProbeService(ffmpegLocator, processRunner);
-    var previewAsset = await probe.ProbeAsync(Path.GetFullPath(previewInput));
-    var project = EditorProject.CreateNew();
-    project.Media.Add(previewAsset);
-    project.Clips.Add(new TimelineClip
-    {
-        AssetId = previewAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
-        Start = 0, SourceStart = 0, Duration = previewAsset.Duration
-    });
-    var service = new PreviewCompositionService(
-        ffmpegLocator, processRunner, renderCoordinator,
-        Path.Combine(Path.GetTempPath(), "KadrStudio", "preview-smoke"));
-    var started = System.Diagnostics.Stopwatch.StartNew();
-    var segment = await service.EnsureVideoSegmentAsync(project, Math.Min(39, previewAsset.Duration / 2), halfQuality: true);
-    var segmentAsset = await probe.ProbeAsync(segment.Path);
-    if (!File.Exists(segment.Path) || segmentAsset.Kind != MediaKind.Video || segmentAsset.Duration > 20 || segmentAsset.HasAudio)
-    {
-        throw new InvalidOperationException("Быстрый фрагмент предпросмотра создан неверно.");
-    }
-    Console.WriteLine($"PREVIEW_SEGMENT_SMOKE_OK {segmentAsset.Duration:0.0}s in {started.Elapsed.TotalSeconds:0.0}s");
-    return 0;
-}
-
 if (args is ["--timeline-cache-smoke", var cacheInput] && File.Exists(cacheInput))
 {
     var probe = new MediaProbeService(ffmpegLocator, processRunner);
@@ -67,31 +42,6 @@ if (args is ["--timeline-cache-smoke", var cacheInput] && File.Exists(cacheInput
         throw new InvalidOperationException("Кадры или реальная форма волны таймлайна не созданы.");
     }
     Console.WriteLine($"TIMELINE_CACHE_SMOKE_OK frames={cacheAsset.TimelineFramePaths.Count} waveformPeaks={cacheAsset.Waveform.Levels[0].Count} in {started.Elapsed.TotalSeconds:0.0}s");
-    return 0;
-}
-
-if (args is ["--still-frame-smoke", var stillInput] && File.Exists(stillInput))
-{
-    var probe = new MediaProbeService(ffmpegLocator, processRunner);
-    var stillAsset = await probe.ProbeAsync(Path.GetFullPath(stillInput));
-    var project = EditorProject.CreateNew();
-    project.Media.Add(stillAsset);
-    project.Clips.Add(new TimelineClip
-    {
-        AssetId = stillAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
-        Start = 0, SourceStart = 0, Duration = stillAsset.Duration
-    });
-    var service = new PreviewCompositionService(
-        ffmpegLocator, processRunner, renderCoordinator,
-        Path.Combine(Path.GetTempPath(), "KadrStudio", "still-smoke"));
-    var positions = new[] { 9.2, Math.Min(stillAsset.Duration - 0.1, 47.3) };
-    foreach (var position in positions)
-    {
-        var still = await service.EnsureStillFrameAsync(project, position, halfQuality: true);
-        if (!File.Exists(still.Path) || new FileInfo(still.Path).Length < 1024)
-            throw new InvalidOperationException($"Точный кадр {position:0.0} не создан.");
-    }
-    Console.WriteLine("STILL_FRAME_SMOKE_OK " + string.Join(", ", positions.Select(value => value.ToString("0.0"))));
     return 0;
 }
 

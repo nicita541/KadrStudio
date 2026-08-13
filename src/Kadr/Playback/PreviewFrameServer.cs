@@ -71,10 +71,58 @@ public sealed class PreviewFrameServer(
         {
             ThrowIfDisposed();
             if (_plan is null) throw new InvalidOperationException("Preview is not prepared.");
+            if (State == PreviewState.Playing) return;
             SetState(PreviewState.Buffering);
             await StopProcessesAsync().ConfigureAwait(false);
             await StartProcessesAsync(_position, play: true, cancellationToken).ConfigureAwait(false);
             SetState(PreviewState.Playing);
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task UpdatePlanAsync(
+        RenderPlan plan,
+        PreviewRequest request,
+        bool restartVideo,
+        bool restartAudio,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        if (!restartVideo && !restartAudio) return;
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            var wasPlaying = State == PreviewState.Playing;
+            var current = Position.Clamp(plan.Range.Start, plan.Range.End);
+            _plan = plan;
+            _request = request;
+            _position = current;
+            if (wasPlaying) SetState(PreviewState.Buffering);
+
+            if (restartVideo) await StopVideoAsync().ConfigureAwait(false);
+            if (restartAudio)
+            {
+                await StopAudioAsync().ConfigureAwait(false);
+                _playbackStart = current;
+                _fallbackClock.Restart();
+            }
+
+            var remaining = plan.Range.End - current;
+            if (remaining > TimelineTime.Zero)
+            {
+                var sliced = SlicePlan(plan, new TimeRange(current, remaining));
+                if (restartVideo)
+                    await StartVideoAsync(sliced, current, wasPlaying, cancellationToken).ConfigureAwait(false);
+                if (restartAudio && wasPlaying)
+                    await StartAudioAsync(sliced, cancellationToken).ConfigureAwait(false);
+            }
+            SetState(wasPlaying ? PreviewState.Playing : PreviewState.Paused);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            SetFailed(exception);
+            throw;
         }
         finally { _gate.Release(); }
     }
@@ -107,6 +155,7 @@ public sealed class PreviewFrameServer(
         try
         {
             ThrowIfDisposed();
+            _position = Position;
             await StopProcessesAsync().ConfigureAwait(false);
             SetState(PreviewState.Paused);
         }
@@ -142,52 +191,57 @@ public sealed class PreviewFrameServer(
         var plan = SlicePlan(_plan, range);
         _playbackStart = position;
         _fallbackClock.Restart();
-
-        if (plan.VisualLayers.Any(layer => layer.TimelineRange.Intersects(range)))
-        {
-            _videoCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var videoToken = _videoCancellation.Token;
-            var command = coordinator.CreateCommand(plan, new RenderOutputOptions(
-                RenderPurpose.FrameServer, "pipe:1", _request.Width, _request.Height,
-                IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false));
-            _videoProcess = Start(command, redirectOutput: true);
-            if (play)
-            {
-                _videoFrames = Channel.CreateBounded<VideoFrame>(new BoundedChannelOptions(8)
-                {
-                    SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait
-                });
-                _videoTask = PumpVideoAsync(_videoProcess, position, continuous: true, _videoFrames.Writer, videoToken);
-                _presentationTask = PresentFramesAsync(_videoFrames.Reader, videoToken);
-            }
-            else
-            {
-                _videoTask = PumpVideoAsync(_videoProcess, position, continuous: false, null, videoToken);
-            }
-        }
-
-        if (play && plan.AudioLayers.Length > 0)
-        {
-            _audioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var audioToken = _audioCancellation.Token;
-            var command = coordinator.CreateCommand(plan, new RenderOutputOptions(
-                RenderPurpose.AudioServer, "pipe:1", 16, 16,
-                IncludeVideo: false, IncludeAudio: true, IncludeOverlays: false));
-            _audioProcess = Start(command, redirectOutput: true);
-            _audioBuffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2))
-            {
-                BufferDuration = TimeSpan.FromSeconds(3),
-                DiscardOnBufferOverflow = false,
-                ReadFully = true
-            };
-            _audioOutput = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, true, 80);
-            _audioOutput.Init(_audioBuffer);
-            _audioTask = PumpAudioAsync(_audioProcess, audioToken);
-            await WaitForAudioPrerollAsync(_audioBuffer, audioToken).ConfigureAwait(false);
-            _fallbackClock.Restart();
-            _audioOutput.Play();
-        }
+        await StartVideoAsync(plan, position, play, cancellationToken).ConfigureAwait(false);
+        if (play) await StartAudioAsync(plan, cancellationToken).ConfigureAwait(false);
         await Task.Yield();
+    }
+
+    private Task StartVideoAsync(RenderPlan plan, TimelineTime position, bool play, CancellationToken cancellationToken)
+    {
+        if (plan.VisualLayers.Length == 0) return Task.CompletedTask;
+        _videoCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var token = _videoCancellation.Token;
+        var command = coordinator.CreateCommand(plan, new RenderOutputOptions(
+            RenderPurpose.FrameServer, "pipe:1", _request.Width, _request.Height,
+            IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false));
+        _videoProcess = Start(command, redirectOutput: true);
+        if (play)
+        {
+            _videoFrames = Channel.CreateBounded<VideoFrame>(new BoundedChannelOptions(8)
+            {
+                SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.Wait
+            });
+            _videoTask = PumpVideoAsync(_videoProcess, position, continuous: true, _videoFrames.Writer, token);
+            _presentationTask = PresentFramesAsync(_videoFrames.Reader, token);
+        }
+        else
+        {
+            _videoTask = PumpVideoAsync(_videoProcess, position, continuous: false, null, token);
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task StartAudioAsync(RenderPlan plan, CancellationToken cancellationToken)
+    {
+        if (plan.AudioLayers.Length == 0) return;
+        _audioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var token = _audioCancellation.Token;
+        var command = coordinator.CreateCommand(plan, new RenderOutputOptions(
+            RenderPurpose.AudioServer, "pipe:1", 16, 16,
+            IncludeVideo: false, IncludeAudio: true, IncludeOverlays: false));
+        _audioProcess = Start(command, redirectOutput: true);
+        _audioBuffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2))
+        {
+            BufferDuration = TimeSpan.FromSeconds(3),
+            DiscardOnBufferOverflow = false,
+            ReadFully = true
+        };
+        _audioOutput = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, true, 80);
+        _audioOutput.Init(_audioBuffer);
+        _audioTask = PumpAudioAsync(_audioProcess, token);
+        await WaitForAudioPrerollAsync(_audioBuffer, token).ConfigureAwait(false);
+        _fallbackClock.Restart();
+        _audioOutput.Play();
     }
 
     private async Task PumpVideoAsync(
@@ -281,17 +335,31 @@ public sealed class PreviewFrameServer(
 
     private async Task StopProcessesAsync()
     {
-        _videoCancellation?.Cancel();
-        _audioCancellation?.Cancel();
         _fallbackClock.Stop();
-        _audioOutput?.Stop();
-        TryKill(_videoProcess); TryKill(_audioProcess);
-        var tasks = new[] { _videoTask, _presentationTask, _audioTask }.Where(task => task is not null).Cast<Task>().ToArray();
+        await StopVideoAsync().ConfigureAwait(false);
+        await StopAudioAsync().ConfigureAwait(false);
+    }
+
+    private async Task StopVideoAsync()
+    {
+        _videoCancellation?.Cancel();
+        TryKill(_videoProcess);
+        var tasks = new[] { _videoTask, _presentationTask }.Where(task => task is not null).Cast<Task>().ToArray();
         if (tasks.Length > 0) try { await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
-        _videoProcess?.Dispose(); _audioProcess?.Dispose(); _audioOutput?.Dispose();
-        _videoProcess = null; _audioProcess = null; _audioOutput = null; _audioBuffer = null;
-        _videoTask = null; _presentationTask = null; _audioTask = null; _videoFrames = null;
+        _videoProcess?.Dispose();
+        _videoProcess = null; _videoTask = null; _presentationTask = null; _videoFrames = null;
         _videoCancellation?.Dispose(); _videoCancellation = null;
+    }
+
+    private async Task StopAudioAsync()
+    {
+        _audioCancellation?.Cancel();
+        _audioOutput?.Stop();
+        TryKill(_audioProcess);
+        if (_audioTask is not null)
+            try { await _audioTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
+        _audioProcess?.Dispose(); _audioOutput?.Dispose();
+        _audioProcess = null; _audioOutput = null; _audioBuffer = null; _audioTask = null;
         _audioCancellation?.Dispose(); _audioCancellation = null;
     }
 

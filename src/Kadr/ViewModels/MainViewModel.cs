@@ -49,7 +49,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
         ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
         _renderCoordinator = new TimelineRenderCoordinator(_ffmpegLocator);
-        PreviewCompositionService = new PreviewCompositionService(_ffmpegLocator, _processRunner, _renderCoordinator);
         TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
         ExportService = new ExportService(_ffmpegLocator, _processRunner, _renderCoordinator);
         ProjectHistoryService = new ProjectHistoryService();
@@ -65,7 +64,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public MediaProbeService MediaProbeService { get; }
     public ThumbnailService ThumbnailService { get; }
-    public PreviewCompositionService PreviewCompositionService { get; }
     public TimelineRenderCoordinator RenderCoordinator => _renderCoordinator;
     public TimelineMediaCacheService TimelineMediaCacheService { get; }
     public ExportService ExportService { get; }

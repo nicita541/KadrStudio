@@ -24,6 +24,9 @@ public sealed class PreviewPresenter : IAsyncDisposable
     private long _overlayGeneration;
     private bool _halfQuality = true;
     private bool _prepared;
+    private string? _videoSignature;
+    private string? _audioSignature;
+    private string? _overlaySignature;
 
     public PreviewPresenter(Image image, FrameworkElement emptyState, FfmpegLocator locator,
         TimelineRenderCoordinator coordinator)
@@ -46,6 +49,9 @@ public sealed class PreviewPresenter : IAsyncDisposable
         _project = project;
         _halfQuality = halfQuality;
         _prepared = false;
+        _videoSignature = null;
+        _audioSignature = null;
+        _overlaySignature = null;
         _videoGeneration++;
         _audioGeneration++;
         _overlayGeneration++;
@@ -78,17 +84,39 @@ public sealed class PreviewPresenter : IAsyncDisposable
                 plan = _proxies.UseAvailable(plan);
             }
             var position = TimelineTime.FromSeconds(Math.Clamp(timelineSeconds, 0, Math.Max(0, _project.Duration)));
+            var size = PreviewSizing.Resolve(_project, _halfQuality);
             if (!_prepared)
             {
-                var size = PreviewSizing.Resolve(_project, _halfQuality);
                 var request = new PreviewRequest(position, new FrameRate(_project.FrameRate), size.Width, size.Height,
                     _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
                 await _engine.PrepareAsync(plan, request, cancellationToken).ConfigureAwait(false);
+                RememberSignatures(plan);
                 _prepared = true;
             }
-            else if (forceSeek)
+            else
             {
-                await _engine.SeekAsync(position, cancellationToken).ConfigureAwait(false);
+                var videoChanged = !string.Equals(_videoSignature, plan.VideoContentSignature, StringComparison.Ordinal);
+                var audioChanged = !string.Equals(_audioSignature, plan.AudioContentSignature, StringComparison.Ordinal);
+                var overlayChanged = !string.Equals(_overlaySignature, plan.OverlaySignature, StringComparison.Ordinal);
+                if (videoChanged) _videoGeneration++;
+                if (audioChanged) _audioGeneration++;
+                if (overlayChanged) _overlayGeneration++;
+                var request = new PreviewRequest(position, new FrameRate(_project.FrameRate), size.Width, size.Height,
+                    _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
+                if (videoChanged || audioChanged)
+                {
+                    await _engine.UpdatePlanAsync(plan, request, videoChanged, audioChanged, cancellationToken)
+                        .ConfigureAwait(false);
+                    RememberSignatures(plan);
+                }
+                else if (overlayChanged)
+                {
+                    _overlaySignature = plan.OverlaySignature;
+                }
+
+                var frameDuration = 1d / Math.Max(1, _project.FrameRate);
+                if (forceSeek && Math.Abs(position.TotalSeconds - _engine.Position.TotalSeconds) > frameDuration / 2)
+                    await _engine.SeekAsync(position, cancellationToken).ConfigureAwait(false);
             }
             if (playing) await _engine.StartAsync(cancellationToken).ConfigureAwait(false);
             else await _engine.PauseAsync(cancellationToken).ConfigureAwait(false);
@@ -102,6 +130,9 @@ public sealed class PreviewPresenter : IAsyncDisposable
         if (audio) _audioGeneration++;
         if (overlay) _overlayGeneration++;
         _prepared = false;
+        _videoSignature = null;
+        _audioSignature = null;
+        _overlaySignature = null;
         await _engine.StopAsync().ConfigureAwait(false);
     }
 
@@ -129,6 +160,13 @@ public sealed class PreviewPresenter : IAsyncDisposable
     }
 
     private void Engine_Failed(object? sender, Exception exception) => Failed?.Invoke(this, exception);
+
+    private void RememberSignatures(KadrStudio.Application.Rendering.RenderPlan plan)
+    {
+        _videoSignature = plan.VideoContentSignature;
+        _audioSignature = plan.AudioContentSignature;
+        _overlaySignature = plan.OverlaySignature;
+    }
 
     private static void Dispatch(Action action)
     {

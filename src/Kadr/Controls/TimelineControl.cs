@@ -140,6 +140,9 @@ public sealed class TimelineControl : FrameworkElement
 
     public double HorizontalViewportOffset { get; set; }
     public double HorizontalViewportWidth { get; set; }
+    private TimelineViewport Viewport => new(PixelsPerSecond, HorizontalViewportOffset, HorizontalViewportWidth, LeftGutterWidth);
+    private TrackLayout Layout => new(GetTrackCount(TrackKind.Visual), GetTrackCount(TrackKind.Audio), HasTextTrack,
+        TrackAreaTop, TrackHeight, TrackGap, TrackBottomPadding);
 
     protected override Size MeasureOverride(Size availableSize)
     {
@@ -190,7 +193,7 @@ public sealed class TimelineControl : FrameworkElement
         base.OnMouseLeftButtonDown(e);
         Focus();
         var point = e.GetPosition(this);
-        var playheadX = LeftGutterWidth + PlayheadSeconds * PixelsPerSecond;
+        var playheadX = Viewport.TimeToContentX(PlayheadSeconds);
         if (point.Y <= RulerHeight && HitTestMarker(point) is { } marker)
         {
             PlayheadSeconds = marker.Start;
@@ -414,7 +417,7 @@ public sealed class TimelineControl : FrameworkElement
                 break;
             case DragOperation.Move:
                 _dragTextOverlay.Start = SnapTime(Math.Max(0,
-                    (point.X - LeftGutterWidth) / PixelsPerSecond - _dragPointerOffsetSeconds));
+                    Viewport.ContentXToTime(point.X) - _dragPointerOffsetSeconds));
                 break;
         }
         _dragChanged |= !TextOverlayEquals(_dragTextOverlay, _dragTextOriginal);
@@ -450,7 +453,7 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
         var point = e.GetPosition(this);
-        var time = Math.Max(0, (point.X - LeftGutterWidth) / PixelsPerSecond);
+        var time = Viewport.ContentXToTime(point.X);
         var target = GetTrackAt(point.Y) ?? new TrackAddress(TrackKind.Visual, 0);
         AssetDropped?.Invoke(this, new AssetDroppedEventArgs(assetId, time, target.Kind, target.Index));
         e.Handled = true;
@@ -519,7 +522,7 @@ public sealed class TimelineControl : FrameworkElement
         {
             _dragClip.TrackIndex = target.Index;
         }
-        var desiredStart = SnapTime(Math.Max(0, (point.X - LeftGutterWidth) / PixelsPerSecond - _dragPointerOffsetSeconds));
+        var desiredStart = SnapTime(Math.Max(0, Viewport.ContentXToTime(point.X) - _dragPointerOffsetSeconds));
         _dragClip.Start = FindNonOverlappingStart(_dragClip, desiredStart);
     }
 
@@ -572,10 +575,10 @@ public sealed class TimelineControl : FrameworkElement
         context.DrawLine(_gridPen, new Point(0, RulerHeight), new Point(RenderSize.Width, RulerHeight));
         var majorStep = NiceTimeStep(92 / PixelsPerSecond);
         var minorStep = majorStep / 5;
-        var maximumTime = Math.Max(1, (RenderSize.Width - LeftGutterWidth) / PixelsPerSecond);
+        var maximumTime = Math.Max(1, Viewport.ContentXToTime(RenderSize.Width));
         for (var time = 0.0; time <= maximumTime + majorStep; time += minorStep)
         {
-            var x = LeftGutterWidth + time * PixelsPerSecond;
+            var x = Viewport.TimeToContentX(time);
             var isMajor = Math.Abs(time / majorStep - Math.Round(time / majorStep)) < 0.001;
             context.DrawLine(isMajor ? _gridPen : _minorGridPen, new Point(x, isMajor ? 14 : 23), new Point(x, RulerHeight));
             if (isMajor)
@@ -621,7 +624,7 @@ public sealed class TimelineControl : FrameworkElement
         context.DrawRectangle(new SolidColorBrush(Color.FromRgb(20, 21, 26)), null,
             new Rect(left, 0, LeftGutterWidth, RulerHeight));
         context.DrawLine(_gridPen, new Point(left + LeftGutterWidth, 0), new Point(left + LeftGutterWidth, RenderSize.Height));
-        var visibleTime = Math.Max(0, HorizontalViewportOffset / PixelsPerSecond);
+        var visibleTime = Viewport.VisibleTimelineStart;
         context.DrawText(CreateText(FormatRulerTime(visibleTime), 9.5, Color.FromRgb(167, 168, 176), dpi), new Point(left + 8, 1));
         if (HasTextTrack) DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254), dpi);
         for (var index = 0; index < GetTrackCount(TrackKind.Visual); index++)
@@ -646,10 +649,8 @@ public sealed class TimelineControl : FrameworkElement
         foreach (var clip in Project.Clips.OrderBy(item => item.Track).ThenBy(item => item.TrackIndex).ThenBy(item => item.Start))
         {
             var rectangle = GetClipRectangle(clip);
-            var visibleLeft = HorizontalViewportOffset + LeftGutterWidth;
-            var visibleRight = HorizontalViewportWidth > 0
-                ? HorizontalViewportOffset + HorizontalViewportWidth
-                : RenderSize.Width;
+            var visibleLeft = Viewport.VisibleContentLeft;
+            var visibleRight = Viewport.VisibleContentRight;
             if (rectangle.Right < visibleLeft || rectangle.Left > visibleRight)
             {
                 continue;
@@ -779,7 +780,7 @@ public sealed class TimelineControl : FrameworkElement
         }
         foreach (var marker in Project.Markers.Where(marker => MarkerPriority(marker.Kind) == 2).OrderBy(marker => marker.Start))
         {
-            var x = LeftGutterWidth + marker.Start * PixelsPerSecond;
+            var x = Viewport.TimeToContentX(marker.Start);
             if (x < LeftGutterWidth || x > RenderSize.Width)
             {
                 continue;
@@ -871,13 +872,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private Rect GetVisibleContentRectangle(Rect source, double inset)
     {
-        var visibleLeft = HorizontalViewportOffset + LeftGutterWidth + inset;
-        var visibleRight = HorizontalViewportWidth > 0
-            ? HorizontalViewportOffset + HorizontalViewportWidth - inset
-            : RenderSize.Width - inset;
-        var left = Math.Max(source.Left, visibleLeft);
-        var right = Math.Min(source.Right, visibleRight);
-        return right > left ? new Rect(left, source.Top, right - left, source.Height) : Rect.Empty;
+        return Viewport.ClipToVisible(source, inset);
     }
 
     private ImageSource? TryLoadImage(string path)
@@ -909,7 +904,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawPlayhead(DrawingContext context)
     {
-        var x = LeftGutterWidth + PlayheadSeconds * PixelsPerSecond;
+        var x = Viewport.TimeToContentX(PlayheadSeconds);
         context.DrawLine(_playheadPen, new Point(x, 18), new Point(x, RenderSize.Height));
         var marker = new StreamGeometry();
         using (var geometry = marker.Open())
@@ -931,8 +926,8 @@ public sealed class TimelineControl : FrameworkElement
 
         var inPoint = Math.Clamp(Project.InPoint ?? 0, 0, Project.TimelineDisplayDuration);
         var outPoint = Math.Clamp(Project.OutPoint ?? Project.TimelineDisplayDuration, inPoint, Project.TimelineDisplayDuration);
-        var inX = LeftGutterWidth + inPoint * PixelsPerSecond;
-        var outX = LeftGutterWidth + outPoint * PixelsPerSecond;
+        var inX = Viewport.TimeToContentX(inPoint);
+        var outX = Viewport.TimeToContentX(outPoint);
         var selectionTop = RulerHeight;
         var selectionHeight = Math.Max(0, RenderSize.Height - selectionTop);
         if (inX > LeftGutterWidth)
@@ -986,8 +981,8 @@ public sealed class TimelineControl : FrameworkElement
         {
             return null;
         }
-        var time = (point.X - LeftGutterWidth) / PixelsPerSecond;
-        var tolerance = 10 / PixelsPerSecond;
+        var time = Viewport.ContentXToTime(point.X);
+        var tolerance = Viewport.PixelsToDuration(10);
         return Project.Markers
             .Where(marker => MarkerPriority(marker.Kind) == 2)
             .OrderBy(marker => Math.Abs(marker.Start - time))
@@ -996,54 +991,29 @@ public sealed class TimelineControl : FrameworkElement
 
     private Rect GetClipRectangle(TimelineClip clip)
     {
-        var top = GetTrackTop(clip.Track, clip.TrackIndex);
-        var left = LeftGutterWidth + clip.Start * PixelsPerSecond;
-        var width = Math.Max(10, clip.Duration * PixelsPerSecond);
+        var top = Layout.GetTrackTop(clip.Track, clip.TrackIndex);
+        var left = Viewport.TimeToContentX(clip.Start);
+        var width = Math.Max(10, Viewport.DurationToPixels(clip.Duration));
         return new Rect(left, top + 3, width, TrackHeight - 6);
     }
 
     private Rect GetTextOverlayRectangle(TextOverlay overlay)
     {
-        var left = LeftGutterWidth + overlay.Start * PixelsPerSecond;
-        return new Rect(left, GetTextTrackTop() + 3, Math.Max(10, overlay.Duration * PixelsPerSecond), TrackHeight - 6);
+        var left = Viewport.TimeToContentX(overlay.Start);
+        return new Rect(left, Layout.TextTrackTop + 3, Math.Max(10, Viewport.DurationToPixels(overlay.Duration)), TrackHeight - 6);
     }
 
     private TrackAddress? GetTrackAt(double y)
     {
-        if (y < TrackAreaTop)
-        {
-            return null;
-        }
-        var slot = (int)((y - TrackAreaTop) / (TrackHeight + TrackGap));
-        var visualCount = GetTrackCount(TrackKind.Visual);
-        var textCount = HasTextTrack ? 1 : 0;
-        if (slot < 0)
-        {
-            return null;
-        }
-        if (slot < textCount)
-        {
-            return new TrackAddress(TrackKind.Visual, 0);
-        }
-        var visualSlot = slot - textCount;
-        if (visualSlot < visualCount)
-        {
-            return new TrackAddress(TrackKind.Visual, visualCount - 1 - visualSlot);
-        }
-        var audioIndex = visualSlot - visualCount;
-        return audioIndex < GetTrackCount(TrackKind.Audio) ? new TrackAddress(TrackKind.Audio, audioIndex) : null;
+        return Layout.GetTrackAt(y);
     }
 
     private double GetTrackTop(TrackKind kind, int index)
     {
-        var textCount = HasTextTrack ? 1 : 0;
-        var slot = kind == TrackKind.Visual
-            ? textCount + GetTrackCount(TrackKind.Visual) - 1 - index
-            : textCount + GetTrackCount(TrackKind.Visual) + index;
-        return TrackAreaTop + slot * (TrackHeight + TrackGap);
+        return Layout.GetTrackTop(kind, index);
     }
 
-    private double GetTextTrackTop() => TrackAreaTop;
+    private double GetTextTrackTop() => Layout.TextTrackTop;
 
     private bool HasTextTrack => Project?.TextOverlays.Count > 0;
 
@@ -1051,8 +1021,7 @@ public sealed class TimelineControl : FrameworkElement
         => kind == TrackKind.Visual ? Project?.VisualTrackCount ?? 2 : Project?.AudioTrackCount ?? 2;
 
     private double GetRequiredHeight()
-        => TrackAreaTop + (GetTrackCount(TrackKind.Visual) + GetTrackCount(TrackKind.Audio) + (HasTextTrack ? 1 : 0)) *
-            (TrackHeight + TrackGap) - TrackGap + TrackBottomPadding;
+        => Layout.RequiredHeight;
 
     private TimelineClip? GetPreviousClip(TimelineClip clip)
         => Project?.GetTrackClips(clip.Track, clip.TrackIndex)
@@ -1080,7 +1049,7 @@ public sealed class TimelineControl : FrameworkElement
         {
             return;
         }
-        PlayheadSeconds = Math.Max(0, (point.X - LeftGutterWidth) / PixelsPerSecond);
+        PlayheadSeconds = Viewport.ContentXToTime(point.X);
         PlayheadChanged?.Invoke(this, new PlayheadChangedEventArgs(PlayheadSeconds));
     }
 
@@ -1305,8 +1274,6 @@ public sealed class TimelineControl : FrameworkElement
     private static bool TextOverlayEquals(TextOverlay left, TextOverlay right)
         => Math.Abs(left.Start - right.Start) < 0.0001 &&
            Math.Abs(left.Duration - right.Duration) < 0.0001;
-
-    private readonly record struct TrackAddress(TrackKind Kind, int Index);
 
     private enum DragOperation
     {

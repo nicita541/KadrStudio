@@ -1,50 +1,45 @@
 using System.Windows;
-using System.Windows.Controls;
+using System.Windows.Threading;
 using KadrStudio.Services;
+using LibVLCSharp.Shared;
+using LibVLCSharp.WPF;
 
 namespace KadrStudio.Playback;
 
 /// <summary>
-/// Owns the WPF decoder layer for an editor preview. Video and audio each use
-/// their own double buffer. A prepared source replaces the visible source only
-/// after MediaOpened, so decoder latency cannot produce a black transition.
+/// Dedicated LibVLC playback adapter. Video and audio use independent decoders;
+/// changing one stream cannot replace, mute or reset the other stream.
+/// Timeline composition is still prepared by the render pipeline, while this
+/// class only owns decoding, seeking and presentation.
 /// </summary>
 public sealed class PreviewPlaybackController : IDisposable
 {
-    private MediaElement _activeVideo;
-    private MediaElement _standbyVideo;
-    private MediaElement _activeAudio;
-    private MediaElement _standbyAudio;
-    private TimelinePreviewSegment? _activeVideoSegment;
-    private TimelinePreviewSegment? _standbyVideoSegment;
-    private TimelinePreviewSegment? _activeAudioSegment;
-    private TimelinePreviewSegment? _standbyAudioSegment;
-    private double _standbyVideoPosition;
-    private double _standbyAudioPosition;
-    private bool _standbyVideoReady;
-    private bool _standbyAudioReady;
-    private bool _videoOpened;
-    private bool _audioOpened;
+    private readonly VideoView _videoView;
+    private readonly LibVLC _libVlc;
+    private readonly MediaPlayer _videoPlayer;
+    private readonly MediaPlayer _audioPlayer;
+    private TimelinePreviewSegment? _videoSegment;
+    private TimelinePreviewSegment? _audioSegment;
+    private Media? _videoMedia;
+    private Media? _audioMedia;
+    private double _pendingVideoPosition;
+    private double _pendingAudioPosition;
     private bool _disposed;
 
-    public PreviewPlaybackController(
-        MediaElement videoA,
-        MediaElement videoB,
-        MediaElement audioA,
-        MediaElement audioB)
+    public PreviewPlaybackController(VideoView videoView)
     {
-        _activeVideo = videoA;
-        _standbyVideo = videoB;
-        _activeAudio = audioA;
-        _standbyAudio = audioB;
-        SubscribeVideo(videoA);
-        SubscribeVideo(videoB);
-        SubscribeAudio(audioA);
-        SubscribeAudio(audioB);
-        ConfigureVideo(videoA);
-        ConfigureVideo(videoB);
-        ConfigureAudio(audioA);
-        ConfigureAudio(audioB);
+        ArgumentNullException.ThrowIfNull(videoView);
+        LibVLCSharp.Shared.Core.Initialize();
+        _videoView = videoView;
+        _libVlc = new LibVLC("--no-video-title-show", "--quiet", "--no-snapshot-preview");
+        _videoPlayer = new MediaPlayer(_libVlc) { Mute = true, Volume = 0 };
+        _audioPlayer = new MediaPlayer(_libVlc) { Mute = false, Volume = 100 };
+        _videoView.MediaPlayer = _videoPlayer;
+        _videoPlayer.Playing += VideoPlayer_Playing;
+        _videoPlayer.EndReached += VideoPlayer_EndReached;
+        _videoPlayer.EncounteredError += VideoPlayer_EncounteredError;
+        _audioPlayer.Playing += AudioPlayer_Playing;
+        _audioPlayer.EncounteredError += AudioPlayer_EncounteredError;
     }
 
     public bool IsPlaying { get; private set; }
@@ -57,58 +52,33 @@ public sealed class PreviewPlaybackController : IDisposable
     public void UpdateVideo(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
     {
         ThrowIfDisposed();
-        TimelinePosition = timelinePosition;
-        var position = SegmentPosition(segment, timelinePosition);
-        if (SamePath(_activeVideoSegment, segment))
+        TimelinePosition = Math.Max(0, timelinePosition);
+        _pendingVideoPosition = SegmentPosition(segment, TimelinePosition);
+        if (!SamePath(_videoSegment, segment))
         {
-            if (_videoOpened && (forceSeek || Drift(_activeVideo, position) > 0.35))
-                _activeVideo.Position = TimeSpan.FromSeconds(position);
-            if (IsPlaying)
-            {
-                _activeVideo.Visibility = Visibility.Visible;
-                _activeVideo.Play();
-                VideoPresented?.Invoke(this, EventArgs.Empty);
-            }
+            _videoSegment = segment;
+            ReplaceVideoMedia(segment.Path);
             return;
         }
-        if (SamePath(_standbyVideoSegment, segment))
-        {
-            if (_standbyVideoReady && segment.Contains(timelinePosition)) PresentStandbyVideo(segment);
-            return;
-        }
-
-        _standbyVideoSegment = segment;
-        _standbyVideoReady = false;
-        _standbyVideoPosition = position;
-        ResetMedia(_standbyVideo);
-        ConfigureVideo(_standbyVideo);
-        _standbyVideo.Source = new Uri(segment.Path, UriKind.Absolute);
+        if (forceSeek || Drift(_videoPlayer, _pendingVideoPosition) > 0.25)
+            Seek(_videoPlayer, _pendingVideoPosition);
+        if (IsPlaying && !_videoPlayer.IsPlaying) _videoPlayer.Play();
     }
 
     public void UpdateAudio(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
     {
         ThrowIfDisposed();
-        TimelinePosition = timelinePosition;
-        var position = SegmentPosition(segment, timelinePosition);
-        if (SamePath(_activeAudioSegment, segment))
+        TimelinePosition = Math.Max(0, timelinePosition);
+        _pendingAudioPosition = SegmentPosition(segment, TimelinePosition);
+        if (!SamePath(_audioSegment, segment))
         {
-            if (_audioOpened && (forceSeek || Drift(_activeAudio, position) > 0.35))
-                _activeAudio.Position = TimeSpan.FromSeconds(position);
-            if (IsPlaying) _activeAudio.Play(); else _activeAudio.Pause();
+            _audioSegment = segment;
+            ReplaceAudioMedia(segment.Path);
             return;
         }
-        if (SamePath(_standbyAudioSegment, segment))
-        {
-            if (_standbyAudioReady && segment.Contains(timelinePosition)) PresentStandbyAudio(segment);
-            return;
-        }
-
-        _standbyAudioSegment = segment;
-        _standbyAudioReady = false;
-        _standbyAudioPosition = position;
-        ResetMedia(_standbyAudio);
-        ConfigureAudio(_standbyAudio);
-        _standbyAudio.Source = new Uri(segment.Path, UriKind.Absolute);
+        if (forceSeek || Drift(_audioPlayer, _pendingAudioPosition) > 0.25)
+            Seek(_audioPlayer, _pendingAudioPosition);
+        if (IsPlaying && !_audioPlayer.IsPlaying) _audioPlayer.Play();
     }
 
     public void SetPlaying(bool isPlaying)
@@ -117,53 +87,49 @@ public sealed class PreviewPlaybackController : IDisposable
         IsPlaying = isPlaying;
         if (isPlaying)
         {
-            if (_videoOpened && _activeVideoSegment is not null)
+            if (_videoMedia is not null)
             {
-                _activeVideo.Visibility = Visibility.Visible;
-                _activeVideo.Play();
-                VideoPresented?.Invoke(this, EventArgs.Empty);
+                _videoView.Visibility = Visibility.Visible;
+                if (!_videoPlayer.IsPlaying) _videoPlayer.Play();
             }
-            if (_audioOpened && _activeAudioSegment is not null) _activeAudio.Play();
+            if (_audioMedia is not null && !_audioPlayer.IsPlaying) _audioPlayer.Play();
         }
         else
         {
-            _activeVideo.Pause();
-            _standbyVideo.Pause();
-            _activeAudio.Pause();
-            _standbyAudio.Pause();
+            if (_videoPlayer.CanPause) _videoPlayer.Pause();
+            if (_audioPlayer.CanPause) _audioPlayer.Pause();
         }
     }
 
-    public void SetTimelinePosition(double timelinePosition) => TimelinePosition = Math.Max(0, timelinePosition);
+    public void SetTimelinePosition(double timelinePosition)
+        => TimelinePosition = Math.Max(0, timelinePosition);
 
     public void HideVideo()
     {
-        _activeVideo.Pause();
-        _standbyVideo.Pause();
-        _activeVideo.Visibility = Visibility.Collapsed;
-        _standbyVideo.Visibility = Visibility.Collapsed;
+        ThrowIfDisposed();
+        if (_videoPlayer.CanPause) _videoPlayer.Pause();
+        _videoView.Visibility = Visibility.Collapsed;
     }
 
     public void ClearVideo()
     {
-        ResetMedia(_activeVideo);
-        ResetMedia(_standbyVideo);
-        _activeVideo.Visibility = Visibility.Collapsed;
-        _standbyVideo.Visibility = Visibility.Collapsed;
-        _activeVideoSegment = null;
-        _standbyVideoSegment = null;
-        _standbyVideoReady = false;
-        _videoOpened = false;
+        if (_disposed) return;
+        _videoPlayer.Stop();
+        _videoPlayer.Media = null;
+        _videoMedia?.Dispose();
+        _videoMedia = null;
+        _videoSegment = null;
+        _videoView.Visibility = Visibility.Collapsed;
     }
 
     public void ClearAudio()
     {
-        ResetMedia(_activeAudio);
-        ResetMedia(_standbyAudio);
-        _activeAudioSegment = null;
-        _standbyAudioSegment = null;
-        _standbyAudioReady = false;
-        _audioOpened = false;
+        if (_disposed) return;
+        _audioPlayer.Stop();
+        _audioPlayer.Media = null;
+        _audioMedia?.Dispose();
+        _audioMedia = null;
+        _audioSegment = null;
     }
 
     public void Dispose()
@@ -171,188 +137,103 @@ public sealed class PreviewPlaybackController : IDisposable
         if (_disposed) return;
         ClearVideo();
         ClearAudio();
-        UnsubscribeVideo(_activeVideo);
-        UnsubscribeVideo(_standbyVideo);
-        UnsubscribeAudio(_activeAudio);
-        UnsubscribeAudio(_standbyAudio);
+        _videoPlayer.Playing -= VideoPlayer_Playing;
+        _videoPlayer.EndReached -= VideoPlayer_EndReached;
+        _videoPlayer.EncounteredError -= VideoPlayer_EncounteredError;
+        _audioPlayer.Playing -= AudioPlayer_Playing;
+        _audioPlayer.EncounteredError -= AudioPlayer_EncounteredError;
+        _videoView.MediaPlayer = null;
+        _videoPlayer.Dispose();
+        _audioPlayer.Dispose();
+        _libVlc.Dispose();
         _disposed = true;
     }
 
-    private async void Video_MediaOpened(object sender, RoutedEventArgs e)
+    private void ReplaceVideoMedia(string path)
     {
-        if (sender is not MediaElement player || player != _standbyVideo || _standbyVideoSegment is null) return;
-        var segment = _standbyVideoSegment;
-        if (!SourceMatches(player, segment)) return;
-        player.Position = TimeSpan.FromSeconds(Math.Max(0, _standbyVideoPosition));
-        player.Play();
-        await Task.Delay(60);
-        if (player != _standbyVideo || !SamePath(_standbyVideoSegment, segment) || !SourceMatches(player, segment)) return;
-        _standbyVideoReady = true;
-        if (!segment.Contains(TimelinePosition))
-        {
-            player.Pause();
-            return;
-        }
-        PresentStandbyVideo(segment);
-    }
-
-    private void Audio_MediaOpened(object sender, RoutedEventArgs e)
-    {
-        if (sender is not MediaElement player || player != _standbyAudio || _standbyAudioSegment is null) return;
-        var segment = _standbyAudioSegment;
-        if (!SourceMatches(player, segment)) return;
-        player.Position = TimeSpan.FromSeconds(Math.Max(0, _standbyAudioPosition));
-        _standbyAudioReady = true;
-        if (!segment.Contains(TimelinePosition))
-        {
-            player.Pause();
-            return;
-        }
-        PresentStandbyAudio(segment);
-    }
-
-    private void PresentStandbyVideo(TimelinePreviewSegment segment)
-    {
-        if (!SamePath(_standbyVideoSegment, segment)) return;
-        var position = SegmentPosition(segment, TimelinePosition);
-        if (Drift(_standbyVideo, position) > 0.2) _standbyVideo.Position = TimeSpan.FromSeconds(position);
-        var old = _activeVideo;
-        old.Pause();
-        old.Visibility = Visibility.Collapsed;
-        _activeVideo = _standbyVideo;
-        _activeVideoSegment = segment;
-        _standbyVideo = old;
-        _standbyVideoSegment = null;
-        _standbyVideoReady = false;
-        _videoOpened = true;
-        _activeVideo.Visibility = IsPlaying ? Visibility.Visible : Visibility.Collapsed;
+        var next = CreateMedia(path);
+        _videoPlayer.Stop();
+        _videoPlayer.Media = next;
+        _videoMedia?.Dispose();
+        _videoMedia = next;
         if (IsPlaying)
         {
-            _activeVideo.Play();
+            _videoView.Visibility = Visibility.Visible;
+            _videoPlayer.Play();
+        }
+        else
+        {
+            _videoPlayer.Play();
+            _videoPlayer.SetPause(true);
+        }
+    }
+
+    private void ReplaceAudioMedia(string path)
+    {
+        var next = CreateMedia(path);
+        _audioPlayer.Stop();
+        _audioPlayer.Media = next;
+        _audioMedia?.Dispose();
+        _audioMedia = next;
+        if (IsPlaying) _audioPlayer.Play();
+        else
+        {
+            _audioPlayer.Play();
+            _audioPlayer.SetPause(true);
+        }
+    }
+
+    private Media CreateMedia(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!File.Exists(fullPath)) throw new FileNotFoundException("Preview segment was not found.", fullPath);
+        return new Media(_libVlc, fullPath, FromType.FromPath);
+    }
+
+    private void VideoPlayer_Playing(object? sender, EventArgs e)
+    {
+        Seek(_videoPlayer, _pendingVideoPosition);
+        if (!IsPlaying) _videoPlayer.SetPause(true);
+        Dispatch(() =>
+        {
+            if (IsPlaying) _videoView.Visibility = Visibility.Visible;
             VideoPresented?.Invoke(this, EventArgs.Empty);
-        }
-        ResetMedia(_standbyVideo);
-        ConfigureVideo(_standbyVideo);
+        });
     }
 
-    private void PresentStandbyAudio(TimelinePreviewSegment segment)
+    private void AudioPlayer_Playing(object? sender, EventArgs e)
     {
-        if (!SamePath(_standbyAudioSegment, segment)) return;
-        _standbyAudio.Position = TimeSpan.FromSeconds(SegmentPosition(segment, TimelinePosition));
-        var old = _activeAudio;
-        old.Pause();
-        _activeAudio = _standbyAudio;
-        _activeAudioSegment = segment;
-        _standbyAudio = old;
-        _standbyAudioSegment = null;
-        _standbyAudioReady = false;
-        _audioOpened = true;
-        if (IsPlaying) _activeAudio.Play(); else _activeAudio.Pause();
-        ResetMedia(_standbyAudio);
-        ConfigureAudio(_standbyAudio);
+        Seek(_audioPlayer, _pendingAudioPosition);
+        if (!IsPlaying) _audioPlayer.SetPause(true);
     }
 
-    private void Video_MediaEnded(object sender, RoutedEventArgs e)
-    {
-        if (sender == _activeVideo && IsPlaying) VideoEnded?.Invoke(this, EventArgs.Empty);
-    }
+    private void VideoPlayer_EndReached(object? sender, EventArgs e)
+        => Dispatch(() => { if (IsPlaying) VideoEnded?.Invoke(this, EventArgs.Empty); });
 
-    private void Video_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
-    {
-        if (sender is not MediaElement player) return;
-        var segment = player == _standbyVideo ? _standbyVideoSegment : _activeVideoSegment;
-        if (player == _standbyVideo)
-        {
-            _standbyVideoSegment = null;
-            _standbyVideoReady = false;
-        }
-        else if (player == _activeVideo)
-        {
-            _activeVideoSegment = null;
-            _videoOpened = false;
-            player.Visibility = Visibility.Collapsed;
-        }
-        ResetMedia(player);
-        ConfigureVideo(player);
-        VideoFailed?.Invoke(this, new PreviewPlaybackFailedEventArgs(segment, e.ErrorException));
-    }
+    private void VideoPlayer_EncounteredError(object? sender, EventArgs e)
+        => Dispatch(() => VideoFailed?.Invoke(this, new PreviewPlaybackFailedEventArgs(_videoSegment, null)));
 
-    private void Audio_MediaFailed(object? sender, ExceptionRoutedEventArgs e)
-    {
-        if (sender is not MediaElement player) return;
-        var segment = player == _standbyAudio ? _standbyAudioSegment : _activeAudioSegment;
-        if (player == _standbyAudio)
-        {
-            _standbyAudioSegment = null;
-            _standbyAudioReady = false;
-        }
-        else if (player == _activeAudio)
-        {
-            _activeAudioSegment = null;
-            _audioOpened = false;
-        }
-        ResetMedia(player);
-        ConfigureAudio(player);
-        AudioFailed?.Invoke(this, new PreviewPlaybackFailedEventArgs(segment, e.ErrorException));
-    }
+    private void AudioPlayer_EncounteredError(object? sender, EventArgs e)
+        => Dispatch(() => AudioFailed?.Invoke(this, new PreviewPlaybackFailedEventArgs(_audioSegment, null)));
 
-    private void SubscribeVideo(MediaElement player)
-    {
-        player.MediaOpened += Video_MediaOpened;
-        player.MediaEnded += Video_MediaEnded;
-        player.MediaFailed += Video_MediaFailed;
-    }
+    private static void Seek(MediaPlayer player, double seconds)
+        => player.Time = Math.Max(0, (long)Math.Round(seconds * 1000));
 
-    private void UnsubscribeVideo(MediaElement player)
-    {
-        player.MediaOpened -= Video_MediaOpened;
-        player.MediaEnded -= Video_MediaEnded;
-        player.MediaFailed -= Video_MediaFailed;
-    }
-
-    private void SubscribeAudio(MediaElement player)
-    {
-        player.MediaOpened += Audio_MediaOpened;
-        player.MediaFailed += Audio_MediaFailed;
-    }
-
-    private void UnsubscribeAudio(MediaElement player)
-    {
-        player.MediaOpened -= Audio_MediaOpened;
-        player.MediaFailed -= Audio_MediaFailed;
-    }
-
-    private static void ConfigureVideo(MediaElement player)
-    {
-        player.IsMuted = true;
-        player.Volume = 0;
-    }
-
-    private static void ConfigureAudio(MediaElement player)
-    {
-        player.IsMuted = false;
-        player.Volume = 1;
-        player.Balance = 0;
-    }
-
-    private static void ResetMedia(MediaElement player)
-    {
-        player.Stop();
-        player.Source = null;
-    }
+    private static double Drift(MediaPlayer player, double seconds)
+        => Math.Abs(player.Time / 1000.0 - seconds);
 
     private static bool SamePath(TimelinePreviewSegment? left, TimelinePreviewSegment right)
-        => left is not null && left.Path.Equals(right.Path, StringComparison.OrdinalIgnoreCase);
-
-    private static bool SourceMatches(MediaElement player, TimelinePreviewSegment segment)
-        => player.Source is not null && Path.GetFullPath(player.Source.LocalPath)
-            .Equals(Path.GetFullPath(segment.Path), StringComparison.OrdinalIgnoreCase);
+        => left is not null && Path.GetFullPath(left.Path).Equals(Path.GetFullPath(right.Path), StringComparison.OrdinalIgnoreCase);
 
     private static double SegmentPosition(TimelinePreviewSegment segment, double timelinePosition)
         => Math.Clamp(timelinePosition - segment.TimelineStart, 0, Math.Max(0, segment.Duration - 0.01));
 
-    private static double Drift(MediaElement player, double position)
-        => Math.Abs(player.Position.TotalSeconds - position);
+    private static void Dispatch(Action action)
+    {
+        var dispatcher = System.Windows.Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess()) action();
+        else dispatcher.BeginInvoke(action, DispatcherPriority.Render);
+    }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 }

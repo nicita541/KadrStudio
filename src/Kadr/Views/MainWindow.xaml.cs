@@ -67,8 +67,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _viewModel = new MainViewModel();
         _previewSession = new TimelinePreviewSession(_viewModel.PreviewCompositionService);
-        _previewPlayback = new PreviewPlaybackController(
-            PreviewMedia, PreviewMediaNext, PreviewAudio, PreviewAudioNext);
+        _previewPlayback = new PreviewPlaybackController(PreviewVideoView);
         _previewPlayback.VideoPresented += PreviewPlayback_VideoPresented;
         _previewPlayback.VideoEnded += PreviewPlayback_VideoEnded;
         _previewPlayback.VideoFailed += PreviewPlayback_VideoFailed;

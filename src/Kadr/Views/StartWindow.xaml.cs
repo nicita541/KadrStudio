@@ -83,7 +83,7 @@ public partial class StartWindow : Window
     private void OpenEditor(string? projectPath)
     {
         var editor = new MainWindow(projectPath);
-        Application.Current.MainWindow = editor;
+        System.Windows.Application.Current.MainWindow = editor;
         editor.Show();
         Close();
     }

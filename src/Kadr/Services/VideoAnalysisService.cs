@@ -513,7 +513,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
     {
         if (result.ExitCode != 0)
         {
-            throw new InvalidOperationException($"{message}.\n{PreviewProxyService.LastMeaningfulLine(result.StandardError)}");
+            throw new InvalidOperationException($"{message}.\n{FfmpegOutput.LastMeaningfulLine(result.StandardError)}");
         }
     }
 

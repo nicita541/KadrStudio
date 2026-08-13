@@ -63,6 +63,12 @@ public sealed class EditorProject : ObservableObject
     public string? FilePath { get; set; }
 
     [JsonIgnore]
+    public long VideoRevision { get; private set; }
+
+    [JsonIgnore]
+    public long AudioRevision { get; private set; }
+
+    [JsonIgnore]
     public double Duration => Math.Max(
         Clips.Count == 0 ? 0 : Clips.Max(clip => clip.End),
         TextOverlays.Count == 0 ? 0 : TextOverlays.Max(overlay => overlay.End));
@@ -111,6 +117,24 @@ public sealed class EditorProject : ObservableObject
         }
 
         OnPropertyChanged(nameof(Duration));
+    }
+
+    public void InvalidatePreview(TrackKind track)
+    {
+        if (track == TrackKind.Visual)
+        {
+            VideoRevision++;
+        }
+        else
+        {
+            AudioRevision++;
+        }
+    }
+
+    public void InvalidateAllPreview()
+    {
+        InvalidatePreview(TrackKind.Visual);
+        InvalidatePreview(TrackKind.Audio);
     }
 
     private int RequiredTrackCount(TrackKind kind)

@@ -11,6 +11,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using KadrStudio.Controls;
 using KadrStudio.Models;
+using KadrStudio.Playback;
 using KadrStudio.Services;
 using KadrStudio.ViewModels;
 using Microsoft.Win32;
@@ -27,17 +28,11 @@ public partial class MainWindow : Window
     private bool _isPlaying;
     private bool _allowClose;
     private bool _isCloseConfirmationPending;
-    private bool _isPreparingPreview;
     private double _playbackStartSeconds;
-    private double _pendingVideoPosition;
-    private double _pendingAudioPosition;
-    private bool _videoOpened;
-    private bool _audioOpened;
-    private Guid? _activeVisualClipId;
-    private Guid? _activeAudioClipId;
-    private string? _activeVisualSourcePath;
-    private string? _activeAudioSourcePath;
-    private readonly Dictionary<Guid, PreviewSegment> _previewSegments = [];
+    private PreviewPlaybackController? _previewPlayback;
+    private TimelinePreviewSession? _previewSession;
+    private readonly HashSet<string> _pendingPreviewRequests = [];
+    private int _previewSessionGeneration;
     private readonly string? _initialProjectPath;
     private CancellationTokenSource? _analysisCancellation;
     private readonly ObservableCollection<OllamaModelInfo> _localAiModels = [];
@@ -50,7 +45,6 @@ public partial class MainWindow : Window
     private bool _isDraggingPreviewText;
     private Point _previewTextDragOffset;
     private TextOverlay? _previewDraggedOverlay;
-    private int _previewPrimeVersion;
     private bool _isEditingPreviewText;
     private bool _isResizingPreviewText;
     private string _previewTextResizeHandle = "BottomRight";
@@ -60,6 +54,8 @@ public partial class MainWindow : Window
     private TextOverlay? _previewEditedOverlay;
     private CancellationTokenSource? _stillPreviewCancellation;
     private int _stillPreviewVersion;
+    private bool _stillPreviewPending;
+    private double _stillPreviewPendingPosition = -1;
 
     public MainWindow() : this(null)
     {
@@ -70,6 +66,13 @@ public partial class MainWindow : Window
         _initialProjectPath = initialProjectPath;
         InitializeComponent();
         _viewModel = new MainViewModel();
+        _previewSession = new TimelinePreviewSession(_viewModel.PreviewCompositionService);
+        _previewPlayback = new PreviewPlaybackController(
+            PreviewMedia, PreviewMediaNext, PreviewAudio, PreviewAudioNext);
+        _previewPlayback.VideoPresented += PreviewPlayback_VideoPresented;
+        _previewPlayback.VideoEnded += PreviewPlayback_VideoEnded;
+        _previewPlayback.VideoFailed += PreviewPlayback_VideoFailed;
+        _previewPlayback.AudioFailed += PreviewPlayback_AudioFailed;
         DataContext = _viewModel;
         LocalAiModelComboBox.ItemsSource = _localAiModels;
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
@@ -1316,7 +1319,7 @@ public partial class MainWindow : Window
         }
 
         _viewModel.CommitEdit("Звук клипа изменён");
-        UpdatePreviewAt(_viewModel.Playhead, forceSeek: false);
+        UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
     }
 
     private void TimelineScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
@@ -1368,15 +1371,9 @@ public partial class MainWindow : Window
         _isPlaying = true;
         _playbackStartSeconds = _viewModel.Playhead;
         _playbackClock.Restart();
+        _previewPlayback?.SetTimelinePosition(_viewModel.Playhead);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-        if (_videoOpened && PreviewMedia.Visibility == Visibility.Visible)
-        {
-            PreviewMedia.Play();
-        }
-        if (_audioOpened)
-        {
-            PreviewAudio.Play();
-        }
+        _previewPlayback?.SetPlaying(true);
         _playbackTimer.Start();
         PlayPauseButton.Content = "Ⅱ";
     }
@@ -1391,17 +1388,16 @@ public partial class MainWindow : Window
         _isPlaying = false;
         _playbackTimer.Stop();
         _playbackClock.Stop();
-        PreviewMedia.Pause();
-        PreviewAudio.Pause();
+        _previewPlayback?.SetPlaying(false);
         UpdateAudioMeters(null);
         PlayPauseButton.Content = "▶";
+        UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
     }
 
     private void StopPlayback()
     {
         PausePlayback();
-        PreviewMedia.Pause();
-        PreviewAudio.Pause();
+        _previewPlayback?.SetPlaying(false);
     }
 
     private void PlaybackTimer_Tick(object? sender, EventArgs e)
@@ -1431,36 +1427,216 @@ public partial class MainWindow : Window
         {
             _playbackStartSeconds = bounded;
             _playbackClock.Restart();
-            PreviewMedia.Play();
-            PreviewAudio.Play();
+            _previewPlayback?.SetTimelinePosition(bounded);
+            _previewPlayback?.SetPlaying(true);
         }
         KeepPlayheadVisible(bounded);
     }
 
     private void UpdatePreviewAt(double timelineSeconds, bool forceSeek)
     {
-        var visualClip = FindActiveClip(TrackKind.Visual, timelineSeconds);
-        UpdateVisualPreview(visualClip, timelineSeconds, forceSeek);
-
-        var audioClip = FindActiveClip(TrackKind.Audio, timelineSeconds);
-        UpdateAudioPreview(audioClip, timelineSeconds, forceSeek);
+        _previewPlayback?.SetTimelinePosition(timelineSeconds);
+        UpdateCompositedVideoPreview(timelineSeconds, forceSeek);
+        UpdateMixedAudioPreview(timelineSeconds, forceSeek);
         UpdateTextOverlayPreview(timelineSeconds);
     }
 
-    private async Task UpdatePausedStillFrameAsync(MediaAsset asset, double sourcePosition)
+    private async Task EnsureVideoPreviewAsync(double timelinePosition)
     {
+        if (_previewSession is null) return;
+        var generation = _previewSessionGeneration;
+        var bucket = Math.Floor(Math.Max(0, timelinePosition) / PreviewCompositionService.SegmentStep);
+        var requestKey = $"v:{bucket:0}";
+        if (!_pendingPreviewRequests.Add(requestKey)) return;
+        try
+        {
+            var segment = await _previewSession.EnsureVideoAsync(
+                _viewModel.Project, timelinePosition, _useHalfQualityPreview);
+            if (generation != _previewSessionGeneration) return;
+            if (_isPlaying && segment.Contains(_viewModel.Playhead))
+                ActivateVideoSegment(segment, _viewModel.Playhead, forceSeek: true);
+            else if (segment.TimelineStart > _viewModel.Playhead &&
+                     segment.TimelineStart - _viewModel.Playhead <= PreviewCompositionService.SegmentOverlap + 1)
+                ActivateVideoSegment(segment, _viewModel.Playhead, forceSeek: true);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            _viewModel.StatusText = $"Видеопредпросмотр недоступен: {exception.Message}";
+        }
+        finally
+        {
+            _pendingPreviewRequests.Remove(requestKey);
+        }
+    }
+
+    private async Task EnsureAudioPreviewAsync(double timelinePosition)
+    {
+        if (_previewSession is null) return;
+        var generation = _previewSessionGeneration;
+        var bucket = Math.Floor(Math.Max(0, timelinePosition) / PreviewCompositionService.SegmentStep);
+        var requestKey = $"a:{bucket:0}";
+        if (!_pendingPreviewRequests.Add(requestKey)) return;
+        try
+        {
+            var segment = await _previewSession.EnsureAudioAsync(_viewModel.Project, timelinePosition);
+            if (generation != _previewSessionGeneration) return;
+            if (segment.Contains(_viewModel.Playhead))
+                ActivateAudioSegment(segment, _viewModel.Playhead, forceSeek: true);
+            else if (segment.TimelineStart > _viewModel.Playhead &&
+                     segment.TimelineStart - _viewModel.Playhead <= PreviewCompositionService.SegmentOverlap + 1)
+                ActivateAudioSegment(segment, _viewModel.Playhead, forceSeek: true);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception)
+        {
+            _viewModel.StatusText = $"Аудиопредпросмотр недоступен: {exception.Message}";
+        }
+        finally
+        {
+            _pendingPreviewRequests.Remove(requestKey);
+        }
+    }
+
+    private void ActivateVideoSegment(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
+    {
+        _previewPlayback?.UpdateVideo(segment, timelinePosition, forceSeek);
+    }
+
+    private void ActivateAudioSegment(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
+    {
+        _previewPlayback?.UpdateAudio(segment, timelinePosition, forceSeek);
+    }
+
+    private void PreviewPlayback_VideoPresented(object? sender, EventArgs e)
+    {
+        PreviewImage.Visibility = Visibility.Collapsed;
+        EmptyPreview.Visibility = Visibility.Collapsed;
+    }
+
+    private void PreviewPlayback_VideoEnded(object? sender, EventArgs e)
+        => _ = EnsureVideoPreviewAsync(_viewModel.Playhead);
+
+    private async void PreviewPlayback_VideoFailed(object? sender, PreviewPlaybackFailedEventArgs e)
+    {
+        _previewSession?.InvalidateVideo(e.Segment?.Path);
+        await UpdatePausedStillFrameAsync(_viewModel.Playhead, allowDuringPlayback: true);
+        _viewModel.StatusText = DecoderRecoveryStatus(
+            "Видеодекодер перезапущен без остановки звука", e.Error);
+        await EnsureVideoPreviewAsync(_viewModel.Playhead);
+    }
+
+    private async void PreviewPlayback_AudioFailed(object? sender, PreviewPlaybackFailedEventArgs e)
+    {
+        _previewSession?.InvalidateAudio(e.Segment?.Path);
+        _viewModel.StatusText = DecoderRecoveryStatus(
+            "Аудиодекодер перезапущен независимо от видео", e.Error);
+        await EnsureAudioPreviewAsync(_viewModel.Playhead);
+    }
+
+    private static string DecoderRecoveryStatus(string message, Exception? error)
+    {
+        var detail = error?.Message?.Trim();
+        if (string.IsNullOrWhiteSpace(detail)) return message;
+        return $"{message}: {detail}";
+    }
+
+    private void ClearVideoPlayers() => _previewPlayback?.ClearVideo();
+
+    private void ClearAudioPlayers() => _previewPlayback?.ClearAudio();
+
+    private void UpdateCompositedVideoPreview(double timelineSeconds, bool forceSeek)
+    {
+        if (!_viewModel.PreviewCompositionService.HasRenderableVideo(_viewModel.Project))
+        {
+            ClearVideoPlayers();
+            PreviewImage.Source = null;
+            PreviewImage.Visibility = Visibility.Collapsed;
+            EmptyPreview.Visibility = Visibility.Visible;
+            return;
+        }
+
+        EmptyPreview.Visibility = Visibility.Collapsed;
+        if (!_isPlaying)
+        {
+            _previewPlayback?.SetPlaying(false);
+            if (forceSeek || PreviewImage.Source is null)
+                _ = UpdatePausedStillFrameAsync(timelineSeconds);
+            if (_previewSession?.TryGetVideo(_viewModel.Project, timelineSeconds, _useHalfQualityPreview) is null)
+                _ = EnsureVideoPreviewAsync(timelineSeconds);
+            return;
+        }
+
+        var segment = _previewSession?.TryGetVideo(_viewModel.Project, timelineSeconds, _useHalfQualityPreview);
+        if (segment is null)
+        {
+            if (PreviewImage.Source is null)
+                _ = UpdatePausedStillFrameAsync(timelineSeconds, allowDuringPlayback: true);
+            _ = EnsureVideoPreviewAsync(timelineSeconds);
+            return;
+        }
+
+        ActivateVideoSegment(segment, timelineSeconds, forceSeek);
+        if (segment.TimelineEnd - timelineSeconds < PreviewCompositionService.SegmentOverlap + 1 &&
+            segment.TimelineStart + PreviewCompositionService.SegmentStep < _viewModel.Project.Duration)
+        {
+            _ = EnsureVideoPreviewAsync(segment.TimelineStart + PreviewCompositionService.SegmentStep + 0.001);
+        }
+    }
+
+    private void UpdateMixedAudioPreview(double timelineSeconds, bool forceSeek)
+    {
+        if (!_viewModel.PreviewCompositionService.HasRenderableAudio(_viewModel.Project))
+        {
+            ClearAudioPlayers();
+            return;
+        }
+
+        var segment = _previewSession?.TryGetAudio(_viewModel.Project, timelineSeconds);
+        if (segment is null)
+        {
+            _ = EnsureAudioPreviewAsync(timelineSeconds);
+            return;
+        }
+
+        ActivateAudioSegment(segment, timelineSeconds, forceSeek);
+        if (segment.TimelineEnd - timelineSeconds < PreviewCompositionService.SegmentOverlap + 1 &&
+            segment.TimelineStart + PreviewCompositionService.SegmentStep < _viewModel.Project.Duration)
+        {
+            _ = EnsureAudioPreviewAsync(segment.TimelineStart + PreviewCompositionService.SegmentStep + 0.001);
+        }
+    }
+
+    private async Task UpdatePausedStillFrameAsync(double timelinePosition, bool allowDuringPlayback = false)
+    {
+        if (_stillPreviewPending && allowDuringPlayback &&
+            Math.Abs(timelinePosition - _stillPreviewPendingPosition) < 0.75)
+        {
+            return;
+        }
         var version = ++_stillPreviewVersion;
+        _stillPreviewPending = true;
+        _stillPreviewPendingPosition = timelinePosition;
         _stillPreviewCancellation?.Cancel();
         _stillPreviewCancellation?.Dispose();
         _stillPreviewCancellation = new CancellationTokenSource();
         try
         {
-            var path = await _viewModel.PreviewProxyService.EnsureStillFrameAsync(
-                asset, sourcePosition, _stillPreviewCancellation.Token);
-            if (version != _stillPreviewVersion || _isPlaying) return;
-            PreviewImage.Source = LoadBitmap(path);
+            if (_previewSession is null) return;
+            var still = await _previewSession.EnsureStillAsync(
+                _viewModel.Project, timelinePosition, _useHalfQualityPreview, _stillPreviewCancellation.Token);
+            if (version != _stillPreviewVersion || (_isPlaying && !allowDuringPlayback) ||
+                !_previewSession.IsCurrentVideo(_viewModel.Project, _useHalfQualityPreview, still.Signature)) return;
+            PreviewImage.Source = LoadBitmap(still.Path);
             PreviewImage.Visibility = Visibility.Visible;
-            PreviewMedia.Visibility = Visibility.Collapsed;
+            if (!_isPlaying)
+            {
+                _previewPlayback?.HideVideo();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1468,6 +1644,10 @@ public partial class MainWindow : Window
         catch (Exception exception)
         {
             if (version == _stillPreviewVersion) _viewModel.StatusText = $"Кадр предпросмотра недоступен: {exception.Message}";
+        }
+        finally
+        {
+            if (version == _stillPreviewVersion) _stillPreviewPending = false;
         }
     }
 
@@ -1778,310 +1958,16 @@ public partial class MainWindow : Window
         return active;
     }
 
-    private void UpdateVisualPreview(TimelineClip? clip, double timelineSeconds, bool forceSeek)
+
+    private void PreviewQuality_Changed(object sender, SelectionChangedEventArgs e)
     {
-        if (clip is null)
-        {
-            _activeVisualClipId = null;
-            _activeVisualSourcePath = null;
-            PreviewMedia.Stop();
-            PreviewMedia.Source = null;
-            PreviewMedia.Visibility = Visibility.Collapsed;
-            PreviewImage.Source = null;
-            PreviewImage.Visibility = Visibility.Collapsed;
-            EmptyPreview.Visibility = _viewModel.Project.GetVisualClips().Count == 0
-                ? Visibility.Visible
-                : Visibility.Collapsed;
-            return;
-        }
-
-        var asset = _viewModel.Project.FindAsset(clip.AssetId);
-        if (asset is null || asset.IsMissing)
-        {
-            EmptyPreview.Visibility = Visibility.Visible;
-            return;
-        }
-
-        var localTime = Math.Clamp(timelineSeconds - clip.Start, 0, Math.Max(0, clip.Duration - 0.001));
-        var sourcePosition = clip.SourceStart + localTime;
-        EmptyPreview.Visibility = Visibility.Collapsed;
-
-        if (asset.Kind == MediaKind.Image)
-        {
-            PreviewMedia.Stop();
-            PreviewMedia.Visibility = Visibility.Collapsed;
-            if (_activeVisualClipId != clip.Id || PreviewImage.Source is null)
-            {
-                PreviewImage.Source = LoadBitmap(asset.Path);
-            }
-            PreviewImage.Visibility = Visibility.Visible;
-            _activeVisualClipId = clip.Id;
-            return;
-        }
-
-        if (!_isPlaying)
-        {
-            if (forceSeek || PreviewImage.Source is null || _activeVisualClipId != clip.Id)
-            {
-                _activeVisualClipId = clip.Id;
-                _ = UpdatePausedStillFrameAsync(asset, sourcePosition);
-            }
-            if (PreviewImage.Source is not null)
-            {
-                PreviewImage.Visibility = Visibility.Visible;
-                PreviewMedia.Visibility = Visibility.Collapsed;
-            }
-            return;
-        }
-
-        if (!TryResolvePreviewSource(asset, sourcePosition, out var sourcePath, out var mediaPosition))
-        {
-            PreviewMedia.Stop();
-            PreviewMedia.Source = null;
-            PreviewMedia.Visibility = Visibility.Collapsed;
-            if (!string.IsNullOrWhiteSpace(asset.ThumbnailPath) && File.Exists(asset.ThumbnailPath))
-            {
-                PreviewImage.Source = LoadBitmap(asset.ThumbnailPath);
-                PreviewImage.Visibility = Visibility.Visible;
-            }
-            return;
-        }
-
-        PreviewImage.Visibility = Visibility.Collapsed;
-        PreviewMedia.Visibility = Visibility.Visible;
-        var hasLinkedAudio = clip.LinkGroupId is Guid linkGroupId &&
-                             _viewModel.Project.Clips.Any(item => item.Track == TrackKind.Audio && item.LinkGroupId == linkGroupId);
-        PreviewMedia.IsMuted = clip.IsMuted || hasLinkedAudio;
-        PreviewMedia.Volume = Math.Clamp(clip.Volume, 0, 1);
-        if (_activeVisualClipId != clip.Id || !string.Equals(_activeVisualSourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
-        {
-            _activeVisualClipId = clip.Id;
-            _activeVisualSourcePath = sourcePath;
-            _videoOpened = false;
-            _pendingVideoPosition = mediaPosition;
-            PreviewMedia.Stop();
-            PreviewMedia.Source = new Uri(sourcePath, UriKind.Absolute);
-            return;
-        }
-
-        if (_videoOpened && (forceSeek || Math.Abs(PreviewMedia.Position.TotalSeconds - mediaPosition) > 0.38))
-        {
-            PreviewMedia.Position = TimeSpan.FromSeconds(mediaPosition);
-            if (!_isPlaying)
-            {
-                PrimePausedPreviewFrame();
-            }
-        }
-    }
-
-    private void UpdateAudioPreview(TimelineClip? clip, double timelineSeconds, bool forceSeek)
-    {
-        if (clip is null)
-        {
-            _activeAudioClipId = null;
-            _activeAudioSourcePath = null;
-            _audioOpened = false;
-            PreviewAudio.Stop();
-            PreviewAudio.Source = null;
-            return;
-        }
-
-        var asset = _viewModel.Project.FindAsset(clip.AssetId);
-        if (asset is null || asset.IsMissing)
-        {
-            return;
-        }
-
-        var localTime = Math.Clamp(timelineSeconds - clip.Start, 0, Math.Max(0, clip.Duration - 0.001));
-        var sourcePosition = clip.SourceStart + localTime;
-        PreviewAudio.IsMuted = clip.IsMuted;
-        PreviewAudio.Volume = Math.Clamp(clip.Volume, 0, 1);
-        PreviewAudio.Balance = Math.Clamp(clip.Pan, -1, 1);
-
-        if (!TryResolvePreviewSource(asset, sourcePosition, out var sourcePath, out var mediaPosition))
-        {
-            PreviewAudio.Stop();
-            PreviewAudio.Source = null;
-            return;
-        }
-
-        if (_activeAudioClipId != clip.Id || !string.Equals(_activeAudioSourcePath, sourcePath, StringComparison.OrdinalIgnoreCase))
-        {
-            _activeAudioClipId = clip.Id;
-            _activeAudioSourcePath = sourcePath;
-            _audioOpened = false;
-            _pendingAudioPosition = mediaPosition;
-            PreviewAudio.Stop();
-            PreviewAudio.Source = new Uri(sourcePath, UriKind.Absolute);
-            return;
-        }
-
-        if (_audioOpened && (forceSeek || Math.Abs(PreviewAudio.Position.TotalSeconds - mediaPosition) > 0.38))
-        {
-            PreviewAudio.Position = TimeSpan.FromSeconds(mediaPosition);
-        }
-    }
-
-    private bool TryResolvePreviewSource(MediaAsset asset, double sourcePosition, out string sourcePath, out double mediaPosition)
-    {
-        if (!_useHalfQualityPreview)
-        {
-            sourcePath = asset.Path;
-            mediaPosition = sourcePosition;
-            return true;
-        }
-        if (_previewSegments.TryGetValue(asset.Id, out var previewSegment) &&
-            previewSegment.Contains(asset.Id, sourcePosition) && File.Exists(previewSegment.Path))
-        {
-            sourcePath = previewSegment.Path;
-            mediaPosition = Math.Max(0, sourcePosition - previewSegment.SourceStart);
-            if (previewSegment.SourceEnd - sourcePosition < 4 && sourcePosition + 5 < asset.Duration)
-            {
-                _ = EnsureHalfQualityPreviewAsync(asset, sourcePosition + 5);
-            }
-            return true;
-        }
-
-        sourcePath = string.Empty;
-        mediaPosition = 0;
-        _ = EnsureHalfQualityPreviewAsync(asset, sourcePosition);
-        return false;
-    }
-
-    private void PreviewMedia_MediaOpened(object sender, RoutedEventArgs e)
-    {
-        _videoOpened = true;
-        PreviewMedia.Position = TimeSpan.FromSeconds(Math.Max(0, _pendingVideoPosition));
-        if (_isPlaying)
-        {
-            PreviewMedia.Play();
-        }
-        else
-        {
-            PrimePausedPreviewFrame();
-        }
-    }
-
-    private async void PrimePausedPreviewFrame()
-    {
-        var version = ++_previewPrimeVersion;
-        PreviewMedia.Play();
-        await Task.Delay(120);
-        if (version == _previewPrimeVersion && !_isPlaying)
-        {
-            PreviewMedia.Pause();
-        }
-    }
-
-    private void PreviewAudio_MediaOpened(object sender, RoutedEventArgs e)
-    {
-        _audioOpened = true;
-        PreviewAudio.Position = TimeSpan.FromSeconds(Math.Max(0, _pendingAudioPosition));
-        if (_isPlaying)
-        {
-            PreviewAudio.Play();
-        }
-        else
-        {
-            PreviewAudio.Pause();
-        }
-    }
-
-    private void PreviewMedia_MediaEnded(object sender, RoutedEventArgs e)
-    {
-        // Переход к следующему клипу выполняет общий таймер таймлайна.
-    }
-
-    private async void PreviewMedia_MediaFailed(object sender, ExceptionRoutedEventArgs e)
-    {
-        var asset = _activeVisualClipId is { } clipId
-            ? _viewModel.Project.FindAsset(_viewModel.Project.FindClip(clipId)?.AssetId ?? Guid.Empty)
-            : null;
-        await TryPrepareFallbackPreviewAsync(asset, e.ErrorException);
-    }
-
-    private async void PreviewAudio_MediaFailed(object sender, ExceptionRoutedEventArgs e)
-    {
-        var asset = _activeAudioClipId is { } clipId
-            ? _viewModel.Project.FindAsset(_viewModel.Project.FindClip(clipId)?.AssetId ?? Guid.Empty)
-            : null;
-        await TryPrepareFallbackPreviewAsync(asset, e.ErrorException);
-    }
-
-    private async Task TryPrepareFallbackPreviewAsync(MediaAsset? asset, Exception? playbackError)
-    {
-        if (asset is null || _isPreparingPreview)
-        {
-            return;
-        }
-
-        PausePlayback();
-        try
-        {
-            _useHalfQualityPreview = true;
-            PreviewQualityComboBox.SelectedIndex = 0;
-            var active = FindActiveClip(TrackKind.Visual, _viewModel.Playhead) ?? FindActiveClip(TrackKind.Audio, _viewModel.Playhead);
-            var sourcePosition = active is null
-                ? 0
-                : active.SourceStart + Math.Max(0, _viewModel.Playhead - active.Start);
-            await EnsureHalfQualityPreviewAsync(asset, sourcePosition);
-        }
-        catch (Exception exception)
-        {
-            ShowError("Не удалось подготовить предпросмотр", exception);
-        }
-    }
-
-    private async Task EnsureHalfQualityPreviewAsync(MediaAsset asset, double sourcePosition = 0)
-    {
-        if (asset.Kind == MediaKind.Image ||
-            (_previewSegments.TryGetValue(asset.Id, out var existing) && existing.Contains(asset.Id, sourcePosition)) ||
-            _isPreparingPreview)
-        {
-            return;
-        }
-        _isPreparingPreview = true;
-        _viewModel.StatusText = $"Быстрый предпросмотр {FormatEditorTime(sourcePosition)}…";
-        try
-        {
-            _previewSegments[asset.Id] = await _viewModel.PreviewProxyService.EnsureSegmentAsync(asset, sourcePosition);
-            _activeVisualClipId = null;
-            _activeAudioClipId = null;
-            _activeVisualSourcePath = null;
-            _activeAudioSourcePath = null;
-            UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-            _viewModel.StatusText = "Предпросмотр готов";
-        }
-        catch (Exception exception)
-        {
-            _viewModel.StatusText = $"Предпросмотр 1/2 недоступен: {exception.Message}";
-        }
-        finally
-        {
-            _isPreparingPreview = false;
-        }
-    }
-
-    private async void PreviewQuality_Changed(object sender, SelectionChangedEventArgs e)
-    {
-        if (!IsLoaded)
-        {
-            return;
-        }
+        if (!IsLoaded) return;
         _useHalfQualityPreview = (PreviewQualityComboBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() != "Original";
-        _activeVisualClipId = null;
-        _activeAudioClipId = null;
-        _activeVisualSourcePath = null;
-        _activeAudioSourcePath = null;
-        var active = FindActiveClip(TrackKind.Visual, _viewModel.Playhead) ?? FindActiveClip(TrackKind.Audio, _viewModel.Playhead);
-        var asset = active is null ? null : _viewModel.Project.FindAsset(active.AssetId);
-        if (_useHalfQualityPreview && asset is not null)
-        {
-            var sourcePosition = active!.SourceStart + Math.Max(0, _viewModel.Playhead - active.Start);
-            await EnsureHalfQualityPreviewAsync(asset, sourcePosition);
-        }
+        ResetCompositionPreviewSources(clearImage: false);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-        _viewModel.StatusText = _useHalfQualityPreview ? "Предпросмотр: 1/2 качества" : "Предпросмотр: оригинал";
+        _viewModel.StatusText = _useHalfQualityPreview
+            ? "Предпросмотр: 1/2 качества"
+            : "Предпросмотр: оригинальное качество";
     }
 
     private void PreviewZoomIn_Click(object sender, RoutedEventArgs e) => SetPreviewScale(_previewScale + 0.25);
@@ -2129,17 +2015,23 @@ public partial class MainWindow : Window
     private void ResetPreviewState()
     {
         _stillPreviewCancellation?.Cancel();
-        PreviewImage.Source = null;
-        _activeVisualClipId = null;
-        _activeAudioClipId = null;
-        _activeVisualSourcePath = null;
-        _activeAudioSourcePath = null;
-        _videoOpened = false;
-        _audioOpened = false;
+        _stillPreviewPending = false;
+        _stillPreviewPendingPosition = -1;
+        ResetCompositionPreviewSources(clearImage: true);
         TimelineEditor.Project = _viewModel.Project;
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
         TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+    }
+
+    private void ResetCompositionPreviewSources(bool clearImage)
+    {
+        _previewSession?.Reset();
+        _previewSessionGeneration++;
+        _pendingPreviewRequests.Clear();
+        ClearVideoPlayers();
+        ClearAudioPlayers();
+        if (clearImage) PreviewImage.Source = null;
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -2234,6 +2126,17 @@ public partial class MainWindow : Window
         if (_allowClose || !_viewModel.IsDirty)
         {
             StopPlayback();
+            if (_previewPlayback is not null)
+            {
+                _previewPlayback.VideoPresented -= PreviewPlayback_VideoPresented;
+                _previewPlayback.VideoEnded -= PreviewPlayback_VideoEnded;
+                _previewPlayback.VideoFailed -= PreviewPlayback_VideoFailed;
+                _previewPlayback.AudioFailed -= PreviewPlayback_AudioFailed;
+                _previewPlayback.Dispose();
+                _previewPlayback = null;
+            }
+            _previewSession?.Dispose();
+            _previewSession = null;
             _viewModel.Dispose();
             return;
         }

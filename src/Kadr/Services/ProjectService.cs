@@ -43,10 +43,6 @@ public sealed class ProjectService
         foreach (var asset in project.Media)
         {
             asset.IsMissing = !File.Exists(asset.Path);
-            if (string.IsNullOrWhiteSpace(asset.PreviewSourcePath) || !File.Exists(asset.PreviewSourcePath))
-            {
-                asset.PreviewSourcePath = asset.Path;
-            }
         }
 
         return project;
@@ -68,10 +64,6 @@ public sealed class ProjectService
         foreach (var asset in project.Media)
         {
             asset.IsMissing = !File.Exists(asset.Path);
-            if (string.IsNullOrWhiteSpace(asset.PreviewSourcePath) || !File.Exists(asset.PreviewSourcePath))
-            {
-                asset.PreviewSourcePath = asset.Path;
-            }
         }
         return project;
     }

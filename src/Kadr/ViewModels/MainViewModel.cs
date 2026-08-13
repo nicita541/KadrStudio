@@ -39,7 +39,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _project = EditorProject.CreateNew();
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
         ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
-        PreviewProxyService = new PreviewProxyService(_ffmpegLocator, _processRunner);
+        PreviewCompositionService = new PreviewCompositionService(_ffmpegLocator, _processRunner);
         TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
         ExportService = new ExportService(_ffmpegLocator, _processRunner);
         ProjectHistoryService = new ProjectHistoryService();
@@ -52,7 +52,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public MediaProbeService MediaProbeService { get; }
     public ThumbnailService ThumbnailService { get; }
-    public PreviewProxyService PreviewProxyService { get; }
+    public PreviewCompositionService PreviewCompositionService { get; }
     public TimelineMediaCacheService TimelineMediaCacheService { get; }
     public ExportService ExportService { get; }
     public ProjectHistoryService ProjectHistoryService { get; }
@@ -932,23 +932,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _projectService.DeleteAutosave();
     }
 
-    public async Task<string> EnsurePreviewAsync(MediaAsset asset, IProgress<double>? progress = null)
-    {
-        IsBusy = true;
-        try
-        {
-            StatusText = $"Подготовка предпросмотра: {asset.Name}";
-            var path = await PreviewProxyService.EnsureProxyAsync(asset, progress);
-            MarkChanged();
-            StatusText = "Предпросмотр готов";
-            return path;
-        }
-        finally
-        {
-            IsBusy = false;
-        }
-    }
-
     public void MarkChanged()
     {
         if (_suppressDirtyTracking)
@@ -1082,10 +1065,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void OnClipsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
+        var visualChanged = false;
+        var audioChanged = false;
         if (e.OldItems is not null)
         {
             foreach (TimelineClip clip in e.OldItems)
             {
+                visualChanged |= clip.Track == TrackKind.Visual;
+                audioChanged |= clip.Track == TrackKind.Audio;
                 clip.PropertyChanged -= OnClipPropertyChanged;
                 _subscribedClips.Remove(clip);
             }
@@ -1095,9 +1082,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             foreach (TimelineClip clip in e.NewItems)
             {
+                visualChanged |= clip.Track == TrackKind.Visual;
+                audioChanged |= clip.Track == TrackKind.Audio;
                 SubscribeClip(clip);
             }
         }
+
+        if (visualChanged) Project.InvalidatePreview(TrackKind.Visual);
+        if (audioChanged) Project.InvalidatePreview(TrackKind.Audio);
 
         OnPropertyChanged(nameof(TimelineDurationLabel));
         OnPropertyChanged(nameof(CanExport));
@@ -1105,6 +1097,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void OnClipPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (sender is TimelineClip clip) Project.InvalidatePreview(clip.Track);
         OnPropertyChanged(nameof(TimelineDurationLabel));
         if (ReferenceEquals(sender, SelectedClip))
         {
@@ -1154,6 +1147,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
+        if (e.PropertyName is nameof(EditorProject.CanvasWidth) or nameof(EditorProject.CanvasHeight) or nameof(EditorProject.FrameRate))
+            Project.InvalidatePreview(TrackKind.Visual);
         if (e.PropertyName == nameof(EditorProject.Name))
         {
             OnPropertyChanged(nameof(ProjectTitle));

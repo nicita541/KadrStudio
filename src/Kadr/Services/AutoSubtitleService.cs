@@ -201,7 +201,7 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
                 cancellationToken: cancellationToken);
             if (recognition.ExitCode != 0)
             {
-                var reason = PreviewProxyService.LastMeaningfulLine(recognition.StandardError);
+                var reason = FfmpegOutput.LastMeaningfulLine(recognition.StandardError);
                 throw new InvalidOperationException(
                     $"Автосубтитры Windows недоступны: {reason}. Установите русский пакет речи в параметрах Windows.");
             }

@@ -410,7 +410,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         if (result.ExitCode != 0 || !File.Exists(outputPath))
         {
             throw new InvalidOperationException(
-                $"Не удалось подготовить кадры для локального ИИ.\n{PreviewProxyService.LastMeaningfulLine(result.StandardError)}");
+                $"Не удалось подготовить кадры для локального ИИ.\n{FfmpegOutput.LastMeaningfulLine(result.StandardError)}");
         }
 
         return outputPath;

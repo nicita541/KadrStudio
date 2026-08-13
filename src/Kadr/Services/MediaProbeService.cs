@@ -47,7 +47,6 @@ public sealed class MediaProbeService(FfmpegLocator locator, ProcessRunner proce
         {
             Name = Path.GetFileName(filePath),
             Path = Path.GetFullPath(filePath),
-            PreviewSourcePath = Path.GetFullPath(filePath),
             Kind = isImage ? MediaKind.Image : hasVideo ? MediaKind.Video : MediaKind.Audio,
             Duration = isImage ? 5 : Math.Max(0.1, duration),
             HasAudio = hasAudio,

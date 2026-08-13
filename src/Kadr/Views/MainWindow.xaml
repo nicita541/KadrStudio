@@ -638,13 +638,19 @@
                     <Border Width="960" Height="540" Background="Black" BorderBrush="#383942" BorderThickness="1" CornerRadius="3" ClipToBounds="True">
                         <Grid>
                             <MediaElement x:Name="PreviewMedia"
+                                          Visibility="Collapsed"
                                           LoadedBehavior="Manual"
                                           UnloadedBehavior="Manual"
                                           Stretch="Uniform"
                                           ScrubbingEnabled="True"
-                                          MediaOpened="PreviewMedia_MediaOpened"
-                                          MediaEnded="PreviewMedia_MediaEnded"
-                                          MediaFailed="PreviewMedia_MediaFailed" />
+                                          />
+                            <MediaElement x:Name="PreviewMediaNext"
+                                          Visibility="Collapsed"
+                                          LoadedBehavior="Manual"
+                                          UnloadedBehavior="Manual"
+                                          Stretch="Uniform"
+                                          ScrubbingEnabled="True"
+                                          />
                             <Image x:Name="PreviewImage" Stretch="Uniform" Visibility="Collapsed" />
                             <Canvas x:Name="PreviewTextCanvas" Width="960" Height="540">
                                 <Border x:Name="PreviewTextBorder"
@@ -763,9 +769,16 @@
                           IsHitTestVisible="False"
                           LoadedBehavior="Manual"
                           UnloadedBehavior="Manual"
-                          ScrubbingEnabled="True"
-                          MediaOpened="PreviewAudio_MediaOpened"
-                          MediaFailed="PreviewAudio_MediaFailed" />
+                          ScrubbingEnabled="True" />
+            <MediaElement x:Name="PreviewAudioNext"
+                          Grid.Row="0"
+                          Width="1"
+                          Height="1"
+                          Opacity="0"
+                          IsHitTestVisible="False"
+                          LoadedBehavior="Manual"
+                          UnloadedBehavior="Manual"
+                          ScrubbingEnabled="True" />
         </Grid>
 
         <GridSplitter Grid.Row="1"

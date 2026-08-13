@@ -40,7 +40,7 @@ public sealed class ExportService(FfmpegLocator locator, ProcessRunner processRu
                 arguments,
                 line =>
                 {
-                    if (PreviewProxyService.TryParseTime(line, out var seconds))
+                    if (FfmpegOutput.TryParseTime(line, out var seconds))
                     {
                         var ratio = Math.Clamp(seconds / Math.Max(0.1, project.Duration), 0, 1);
                         progress?.Report(new ExportProgress(5 + ratio * 93, "Экспорт дорожек", FormatProgressTime(seconds, project.Duration)));
@@ -159,11 +159,9 @@ public sealed class ExportService(FfmpegLocator locator, ProcessRunner processRu
         var audioLabels = new List<string> { "[asilence]" };
         var audioIndex = 0;
         foreach (var input in inputs.Where(input =>
+                     input.Clip.Track == TrackKind.Audio &&
                      input.Asset.HasAudio &&
-                     input.Asset.Kind is MediaKind.Video or MediaKind.Audio &&
-                     (input.Clip.Track == TrackKind.Audio ||
-                      input.Clip.LinkGroupId is null ||
-                      !project.Clips.Any(clip => clip.Track == TrackKind.Audio && clip.LinkGroupId == input.Clip.LinkGroupId))))
+                     input.Asset.Kind is MediaKind.Video or MediaKind.Audio))
         {
             var label = $"audio{audioIndex++}";
             var delay = Math.Max(0, (long)Math.Round(input.Clip.Start * 1000));
@@ -218,7 +216,7 @@ public sealed class ExportService(FfmpegLocator locator, ProcessRunner processRu
     {
         if (result.ExitCode != 0)
         {
-            throw new InvalidOperationException($"{message}.\n{PreviewProxyService.LastMeaningfulLine(result.StandardError)}");
+            throw new InvalidOperationException($"{message}.\n{FfmpegOutput.LastMeaningfulLine(result.StandardError)}");
         }
     }
 

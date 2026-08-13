@@ -22,11 +22,19 @@ if (args is ["--preview-smoke", var previewInput] && File.Exists(previewInput))
 {
     var probe = new MediaProbeService(ffmpegLocator, processRunner);
     var previewAsset = await probe.ProbeAsync(Path.GetFullPath(previewInput));
-    var service = new PreviewProxyService(ffmpegLocator, processRunner);
+    var project = EditorProject.CreateNew();
+    project.Media.Add(previewAsset);
+    project.Clips.Add(new TimelineClip
+    {
+        AssetId = previewAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
+        Start = 0, SourceStart = 0, Duration = previewAsset.Duration
+    });
+    var service = new PreviewCompositionService(
+        ffmpegLocator, processRunner, Path.Combine(Path.GetTempPath(), "KadrStudio", "preview-smoke"));
     var started = System.Diagnostics.Stopwatch.StartNew();
-    var segment = await service.EnsureSegmentAsync(previewAsset, Math.Min(39, previewAsset.Duration / 2));
+    var segment = await service.EnsureVideoSegmentAsync(project, Math.Min(39, previewAsset.Duration / 2), halfQuality: true);
     var segmentAsset = await probe.ProbeAsync(segment.Path);
-    if (!File.Exists(segment.Path) || segmentAsset.Kind != MediaKind.Video || segmentAsset.Duration > 21 || !segmentAsset.HasAudio)
+    if (!File.Exists(segment.Path) || segmentAsset.Kind != MediaKind.Video || segmentAsset.Duration > 20 || segmentAsset.HasAudio)
     {
         throw new InvalidOperationException("Быстрый фрагмент предпросмотра создан неверно.");
     }
@@ -54,12 +62,20 @@ if (args is ["--still-frame-smoke", var stillInput] && File.Exists(stillInput))
 {
     var probe = new MediaProbeService(ffmpegLocator, processRunner);
     var stillAsset = await probe.ProbeAsync(Path.GetFullPath(stillInput));
-    var service = new PreviewProxyService(ffmpegLocator, processRunner);
+    var project = EditorProject.CreateNew();
+    project.Media.Add(stillAsset);
+    project.Clips.Add(new TimelineClip
+    {
+        AssetId = stillAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
+        Start = 0, SourceStart = 0, Duration = stillAsset.Duration
+    });
+    var service = new PreviewCompositionService(
+        ffmpegLocator, processRunner, Path.Combine(Path.GetTempPath(), "KadrStudio", "still-smoke"));
     var positions = new[] { 9.2, Math.Min(stillAsset.Duration - 0.1, 47.3) };
     foreach (var position in positions)
     {
-        var path = await service.EnsureStillFrameAsync(stillAsset, position);
-        if (!File.Exists(path) || new FileInfo(path).Length < 1024)
+        var still = await service.EnsureStillFrameAsync(project, position, halfQuality: true);
+        if (!File.Exists(still.Path) || new FileInfo(still.Path).Length < 1024)
             throw new InvalidOperationException($"Точный кадр {position:0.0} не создан.");
     }
     Console.WriteLine("STILL_FRAME_SMOKE_OK " + string.Join(", ", positions.Select(value => value.ToString("0.0"))));
@@ -215,6 +231,171 @@ if (args is ["--history-smoke"])
         {
             Directory.Delete(testRoot, recursive: true);
         }
+    }
+}
+
+if (args is ["--preview-composition-smoke"])
+{
+    var testRoot = Path.Combine(Path.GetTempPath(), "KadrStudio", "preview-composition-smoke", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(testRoot);
+    try
+    {
+        var basePath = Path.Combine(testRoot, "base.mp4");
+        var topPath = Path.Combine(testRoot, "top.mp4");
+        var baseResult = await processRunner.RunAsync(ffmpegLocator.FfmpegPath,
+            ["-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "color=0x25334f:s=320x180:r=15:d=36",
+             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=36",
+             "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", basePath]);
+        var topResult = await processRunner.RunAsync(ffmpegLocator.FfmpegPath,
+            ["-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "color=0x9955dd:s=160x90:r=15:d=8",
+             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", topPath]);
+        if (baseResult.ExitCode != 0 || topResult.ExitCode != 0)
+            throw new InvalidOperationException("Не удалось создать исходники проверки предпросмотра.");
+
+        var probe = new MediaProbeService(ffmpegLocator, processRunner);
+        var baseAsset = await probe.ProbeAsync(basePath);
+        var topAsset = await probe.ProbeAsync(topPath);
+        var project = EditorProject.CreateNew();
+        project.Media.Add(baseAsset);
+        project.Media.Add(topAsset);
+        project.Clips.Add(new TimelineClip
+        {
+            AssetId = baseAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
+            Start = 0, SourceStart = 0, Duration = 36
+        });
+        project.Clips.Add(new TimelineClip
+        {
+            AssetId = topAsset.Id, Track = TrackKind.Visual, TrackIndex = 1,
+            Start = 4, SourceStart = 0, Duration = 8
+        });
+        var audioClip = new TimelineClip
+        {
+            AssetId = baseAsset.Id, Track = TrackKind.Audio, TrackIndex = 0,
+            Start = 0, SourceStart = 0, Duration = 36, Volume = 0.8, Pan = -0.15
+        };
+        project.Clips.Add(audioClip);
+
+        var composition = new PreviewCompositionService(
+            ffmpegLocator, processRunner, Path.Combine(testRoot, "preview-cache"));
+        using var previewSession = new TimelinePreviewSession(composition);
+        var initialVideoSignature = composition.GetVideoSignature(project, halfQuality: true);
+        var initialAudioSignature = composition.GetAudioSignature(project);
+        audioClip.Volume = 0.45;
+        if (composition.GetVideoSignature(project, halfQuality: true) != initialVideoSignature ||
+            composition.GetAudioSignature(project) == initialAudioSignature)
+            throw new InvalidOperationException("Громкость аудио ошибочно инвалидирует видеокэш.");
+        var changedAudioSignature = composition.GetAudioSignature(project);
+        project.GetVisualClips()[0].Brightness = 0.08;
+        if (composition.GetVideoSignature(project, halfQuality: true) == initialVideoSignature ||
+            composition.GetAudioSignature(project) != changedAudioSignature)
+            throw new InvalidOperationException("Цветокоррекция видео ошибочно инвалидирует аудиокэш.");
+        var audioBeforeCanvasChange = composition.GetAudioSignature(project);
+        project.CanvasWidth = 1280;
+        project.CanvasHeight = 720;
+        if (composition.GetAudioSignature(project) != audioBeforeCanvasChange)
+            throw new InvalidOperationException("Размер видеокадра ошибочно инвалидирует аудиокэш.");
+
+        var firstTasks = new[]
+        {
+            composition.EnsureVideoSegmentAsync(project, 14.8, halfQuality: true),
+            composition.EnsureVideoSegmentAsync(project, 15.2, halfQuality: true)
+        };
+        var audioTasks = new[]
+        {
+            composition.EnsureAudioSegmentAsync(project, 14.8),
+            composition.EnsureAudioSegmentAsync(project, 15.2)
+        };
+        await Task.WhenAll(firstTasks.Concat<Task>(audioTasks));
+        var videoSegments = await Task.WhenAll(firstTasks);
+        var audioSegments = await Task.WhenAll(audioTasks);
+        if (videoSegments.Select(segment => segment.Path).Distinct().Count() != 2 ||
+            audioSegments.Select(segment => segment.Path).Distinct().Count() != 2 ||
+            !videoSegments[0].Contains(14.8) || !videoSegments[1].Contains(15.2) ||
+            !audioSegments[0].Contains(14.8) || !audioSegments[1].Contains(15.2))
+            throw new InvalidOperationException("Сегменты на границе 15 секунд сформированы неверно.");
+
+        foreach (var segment in videoSegments)
+        {
+            var media = await probe.ProbeAsync(segment.Path);
+            if (media.Kind != MediaKind.Video || media.HasAudio || media.Width != 640 || media.Height != 360)
+                throw new InvalidOperationException("V-дорожки должны давать только видео 640x360 без аудио.");
+        }
+        foreach (var segment in audioSegments)
+        {
+            var media = await probe.ProbeAsync(segment.Path);
+            if (media.Kind != MediaKind.Audio || !media.HasAudio)
+                throw new InvalidOperationException("A-дорожки должны давать только аудио без видеопотока.");
+        }
+
+        var still = await composition.EnsureStillFrameAsync(project, 6.5, halfQuality: true);
+        if (!File.Exists(still.Path) || new FileInfo(still.Path).Length < 512)
+            throw new InvalidOperationException("Композитный точный кадр не создан.");
+        var sessionVideo = await previewSession.EnsureVideoAsync(project, 14.8, halfQuality: true);
+        var cachedSessionVideo = previewSession.TryGetVideo(project, 14.8, halfQuality: true);
+        if (cachedSessionVideo?.Path != sessionVideo.Path)
+            throw new InvalidOperationException("Сессия не вернула готовый видеосегмент из своего поколения.");
+        project.InvalidatePreview(TrackKind.Audio);
+        if (previewSession.TryGetVideo(project, 14.8, halfQuality: true)?.Path != sessionVideo.Path)
+            throw new InvalidOperationException("Инвалидация аудио ошибочно сбросила поколение видео.");
+
+        var staleVideoJob = previewSession.EnsureVideoAsync(project, 30.2, halfQuality: true);
+        var independentAudioJob = previewSession.EnsureAudioAsync(project, 30.2);
+        project.GetVisualClips()[0].Contrast = 1.15;
+        project.InvalidatePreview(TrackKind.Visual);
+        var currentVideoJob = previewSession.EnsureVideoAsync(project, 30.2, halfQuality: true);
+        try
+        {
+            await staleVideoJob;
+            throw new InvalidOperationException("Устаревшее поколение видео смогло попасть в текущую сессию.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        await Task.WhenAll(currentVideoJob, independentAudioJob);
+        if (!previewSession.IsCurrentVideo(project, halfQuality: true, currentVideoJob.Result.Signature))
+            throw new InvalidOperationException("Сессия не приняла актуальное поколение видеокэша.");
+
+        using (var revisionViewModel = new KadrStudio.ViewModels.MainViewModel())
+        {
+            var revisionAsset = new MediaAsset
+            {
+                Path = basePath, Name = "revision.mp4", Kind = MediaKind.Video,
+                Duration = 36, HasAudio = true, FileSizeBytes = new FileInfo(basePath).Length
+            };
+            revisionViewModel.Project.Media.Add(revisionAsset);
+            var revisionVideo = new TimelineClip
+            {
+                AssetId = revisionAsset.Id, Track = TrackKind.Visual, TrackIndex = 0,
+                Start = 0, SourceStart = 0, Duration = 10
+            };
+            var revisionAudio = new TimelineClip
+            {
+                AssetId = revisionAsset.Id, Track = TrackKind.Audio, TrackIndex = 0,
+                Start = 0, SourceStart = 0, Duration = 10
+            };
+            revisionViewModel.Project.Clips.Add(revisionVideo);
+            revisionViewModel.Project.Clips.Add(revisionAudio);
+            var videoRevision = revisionViewModel.Project.VideoRevision;
+            var audioRevision = revisionViewModel.Project.AudioRevision;
+            revisionAudio.Volume = 0.3;
+            if (revisionViewModel.Project.VideoRevision != videoRevision ||
+                revisionViewModel.Project.AudioRevision <= audioRevision)
+                throw new InvalidOperationException("Изменение A-дорожки затронуло ревизию V-дорожек.");
+            videoRevision = revisionViewModel.Project.VideoRevision;
+            audioRevision = revisionViewModel.Project.AudioRevision;
+            revisionVideo.Saturation = 0.7;
+            if (revisionViewModel.Project.VideoRevision <= videoRevision ||
+                revisionViewModel.Project.AudioRevision != audioRevision)
+                throw new InvalidOperationException("Изменение V-дорожки затронуло ревизию A-дорожек.");
+        }
+        Console.WriteLine($"PREVIEW_COMPOSITION_SMOKE_OK video={videoSegments.Length} audio={audioSegments.Length} independent-signatures=true");
+        return 0;
+    }
+    finally
+    {
+        try { Directory.Delete(testRoot, recursive: true); } catch { }
     }
 }
 

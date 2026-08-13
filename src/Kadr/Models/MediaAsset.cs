@@ -7,7 +7,6 @@ public sealed class MediaAsset : ObservableObject
 {
     private string _path = string.Empty;
     private string? _thumbnailPath;
-    private string? _previewSourcePath;
     private IReadOnlyList<string> _timelineFramePaths = Array.Empty<string>();
     private string? _waveformPath;
     private IReadOnlyList<float> _waveformPeaks = Array.Empty<float>();
@@ -36,12 +35,6 @@ public sealed class MediaAsset : ObservableObject
     {
         get => _thumbnailPath;
         set => SetProperty(ref _thumbnailPath, value);
-    }
-
-    public string? PreviewSourcePath
-    {
-        get => _previewSourcePath;
-        set => SetProperty(ref _previewSourcePath, value);
     }
 
     [JsonIgnore]

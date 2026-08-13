@@ -736,11 +736,14 @@ public partial class MainWindow : Window
         _viewModel.StatusText = "Поиск встроенных субтитров или локального распознавания…";
         try
         {
-            var transcription = await _viewModel.AutoSubtitleService.TranscribeLocalAsync(
+            var automationSnapshot = _viewModel.CaptureAutomationSnapshot();
+            var transcription = await _viewModel.AutomationOrchestrator.TranscribeAsync(
                 asset,
                 audioClip.SourceStart,
                 audioClip.Duration);
             var cues = transcription.Cues;
+            if (!_viewModel.IsAutomationSnapshotCurrent(automationSnapshot))
+                throw new InvalidOperationException("Project changed while subtitles were generated. Run the operation again.");
             if (cues.Count == 0)
             {
                 throw new InvalidOperationException(
@@ -859,13 +862,22 @@ public partial class MainWindow : Window
 
         try
         {
+            var automationSnapshot = _viewModel.CaptureAutomationSnapshot();
             var query = AnalysisPromptTextBox.Text?.Trim() ?? string.Empty;
-            var result = await _viewModel.VideoAnalysisService.AnalyzeAsync(
+            var pipeline = await _viewModel.AutomationOrchestrator.AnalyzeAsync(
                 new VideoAnalysisRequest(asset, sourceStart, sourceEnd, query),
+                UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo selectedModel
+                    ? selectedModel.Name
+                    : null,
                 progress,
                 _analysisCancellation.Token);
-            string? localAiWarning = null;
-            if (UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo model)
+            var result = pipeline.Result;
+            string? localAiWarning = pipeline.Warning;
+            if (!_viewModel.IsAutomationSnapshotCurrent(automationSnapshot))
+                throw new InvalidOperationException("Project changed while video analysis was running. Run the analysis again.");
+#if false
+            string? legacyLocalAiWarning = null;
+            if (false && UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo model)
             {
                 try
                 {
@@ -888,12 +900,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            result = await _viewModel.VideoAnalysisService.RefineSemanticBoundariesAsync(
-                asset,
-                result,
-                progress,
-                _analysisCancellation.Token);
-
+#endif
             var mappedMarkers = MapAnalysisMarkers(asset, timelineClips, result, query);
             if (mappedMarkers.Count == 0)
             {

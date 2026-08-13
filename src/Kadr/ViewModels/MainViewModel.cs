@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Windows.Data;
 using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
+using KadrStudio.Application.Automation;
 using KadrStudio.Models;
 using KadrStudio.Services;
 
@@ -14,8 +15,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly FfmpegLocator _ffmpegLocator = new();
     private readonly ProcessRunner _processRunner = new();
     private readonly TimelineRenderCoordinator _renderCoordinator;
+    private readonly KadrStudio.Infrastructure.Jobs.BackgroundJobScheduler _automationScheduler;
     private readonly ProjectService _projectService = new();
     private readonly EditorProjectMapper _projectMapper = new();
+    private readonly AutomationProposalApplier _automationProposalApplier = new();
+    private readonly AutomationProposalValidator _automationProposalValidator = new();
     private EditorSession _editorSession;
     private readonly List<TimelineClip> _subscribedClips = new();
     private readonly List<TextOverlay> _subscribedTextOverlays = new();
@@ -51,6 +55,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         AutoSubtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
         VideoAnalysisService = new VideoAnalysisService(_ffmpegLocator, _processRunner);
         OllamaVideoAnalysisService = new OllamaVideoAnalysisService(_ffmpegLocator, _processRunner);
+        _automationScheduler = new KadrStudio.Infrastructure.Jobs.BackgroundJobScheduler();
+        AutomationOrchestrator = new AutomationOrchestrator(
+            _automationScheduler, VideoAnalysisService, OllamaVideoAnalysisService, AutoSubtitleService);
         AttachProject(_project);
         BuildMediaView();
     }
@@ -64,6 +71,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public AutoSubtitleService AutoSubtitleService { get; }
     public VideoAnalysisService VideoAnalysisService { get; }
     public OllamaVideoAnalysisService OllamaVideoAnalysisService { get; }
+    public AutomationOrchestrator AutomationOrchestrator { get; }
 
     public EditorProject Project
     {
@@ -183,6 +191,75 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool CanRedo => _editorSession.CanRedo;
     public bool HasAutosave => _projectService.AutosaveExists;
     public bool HasPendingEditReview => _editReviewSnapshot is not null;
+
+    public ProjectAutomationSnapshot CaptureAutomationSnapshot()
+        => ProposalFactory.Capture(_editorSession.State);
+
+    public bool IsAutomationSnapshotCurrent(ProjectAutomationSnapshot snapshot)
+        => snapshot.ProjectId == _editorSession.State.Id && snapshot.BaseRevision == _editorSession.State.Revision;
+
+    public AutomationApplyResult ApplyAutomationProposal(AutomationProposal proposal)
+    {
+        var validation = _automationProposalValidator.Validate(_editorSession.State, proposal);
+        if (!validation.IsValid)
+        {
+            return new AutomationApplyResult(
+                false,
+                validation.Errors.Any(item => item.Code == "automation.stale"),
+                _editorSession.State,
+                string.Join("; ", validation.Errors.Select(item => item.Message)));
+        }
+        if (proposal.CreateCheckpoint)
+            ProjectHistoryService.CreateCheckpoint(Project, $"Before: {proposal.Title}");
+        var result = _automationProposalApplier.Apply(_editorSession, proposal);
+        if (!result.Applied) return result;
+        _suppressDirtyTracking = true;
+        try
+        {
+            SelectedClip = null;
+            Project = _projectMapper.ToUi(result.State, Project.FilePath);
+            Playhead = Math.Min(Playhead, Project.Duration);
+            IsDirty = true;
+        }
+        finally
+        {
+            _suppressDirtyTracking = false;
+        }
+        ScheduleAutosave();
+        StatusText = result.Message;
+        NotifyHistoryChanged();
+        return result;
+    }
+
+    public AutomationProposal CreateSubtitleProposal(
+        ProjectAutomationSnapshot snapshot,
+        IEnumerable<TextOverlay> overlays,
+        string producer)
+        => ProposalFactory.ForSubtitles(
+            snapshot,
+            overlays.Select(item => _projectMapper.ToCoreText(item, snapshot.State)).ToArray(),
+            "Auto subtitles",
+            $"Created subtitles: {overlays.Count()}",
+            producer);
+
+    public AutomationProposal CreateAnalysisProposal(
+        ProjectAutomationSnapshot snapshot,
+        Guid sourceId,
+        double start,
+        double end,
+        IEnumerable<Models.TimelineMarker> markers,
+        string producer)
+    {
+        var rangeStart = KadrStudio.Core.Domain.TimelineTime.FromSeconds(start);
+        var rangeEnd = KadrStudio.Core.Domain.TimelineTime.FromSeconds(end);
+        var replacement = snapshot.State.Markers
+            .Where(item => item.SourceId != sourceId || item.End <= rangeStart || item.Start >= rangeEnd)
+            .Concat(markers.Select(_projectMapper.ToCoreMarker))
+            .OrderBy(item => item.Start)
+            .ToArray();
+        return ProposalFactory.ForMarkers(
+            snapshot, replacement, "Video analysis", $"Created analysis markers: {replacement.Length}", producer);
+    }
 
     public async Task<IReadOnlyList<string>> ImportFilesAsync(
         IEnumerable<string> filePaths,
@@ -953,6 +1030,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _autosaveCancellation?.Dispose();
         OllamaVideoAnalysisService.Dispose();
         _renderCoordinator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _automationScheduler.DisposeAsync().AsTask().GetAwaiter().GetResult();
         DetachProject(Project);
     }
 

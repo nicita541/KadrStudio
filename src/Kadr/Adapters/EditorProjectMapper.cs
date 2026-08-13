@@ -180,6 +180,33 @@ public sealed class EditorProjectMapper
         return result;
     }
 
+    public KadrStudio.Core.Domain.TimelineMarker ToCoreMarker(Models.TimelineMarker marker)
+        => new(
+            marker.Id,
+            (CoreMarkerKind)(int)marker.Kind,
+            Time(marker.Start),
+            Time(marker.Duration),
+            marker.Title,
+            marker.Description,
+            marker.AssetId == Guid.Empty ? null : marker.AssetId,
+            Time(marker.SourceStart),
+            marker.Confidence,
+            marker.Query);
+
+    public TextClip ToCoreText(TextOverlay overlay, ProjectState project)
+    {
+        var textTrack = project.Tracks
+            .Where(item => item.Kind == CoreTrackKind.Text)
+            .OrderBy(item => item.Index)
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException("The project does not contain a text track.");
+        return new TextClip(
+            overlay.Id, textTrack.Id, Time(overlay.Start), Time(overlay.Duration), overlay.Text,
+            new TextStyle(
+                overlay.FontFamily, overlay.FontSize, overlay.Color, overlay.X, overlay.Y,
+                overlay.Rotation, overlay.BoxWidth, overlay.BoxHeight, overlay.IsSubtitle));
+    }
+
     private static void AddTrack(
         ICollection<TimelineTrack> tracks,
         IDictionary<(CoreTrackKind Kind, int Index), Guid> ids,

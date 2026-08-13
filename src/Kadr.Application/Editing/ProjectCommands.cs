@@ -410,6 +410,21 @@ public sealed record DeleteTextClipsCommand(IReadOnlySet<Guid> ClipIds) : IEditC
         => project with { TextClips = project.TextClips.Where(item => !ClipIds.Contains(item.Id)).ToImmutableArray() };
 }
 
+public sealed record AddTextClipsCommand(IReadOnlyList<TextClip> Clips) : IEditCommand
+{
+    public string Description => "Add text clips";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var duplicate = Clips.Select(item => item.Id)
+            .Intersect(project.TextClips.Select(item => item.Id))
+            .FirstOrDefault();
+        if (duplicate != Guid.Empty)
+            throw new EditRejectedException($"Text clip {duplicate} already exists.");
+        return project with { TextClips = project.TextClips.AddRange(Clips) };
+    }
+}
+
 public sealed record ReplaceMarkersCommand(IReadOnlyList<TimelineMarker> Markers) : IEditCommand
 {
     public string Description => "Заменить метки";

@@ -214,6 +214,12 @@ public sealed class ProjectValidator : IProjectValidator
                 errors.Add(new("transition.duration", "Transition duration exceeds available clip material.", transition.Id));
             if (transition.Start < from.Start || transition.End > to.End || !transition.Range.Contains(from.End))
                 errors.Add(new("transition.range", "Transition must straddle the edit point.", transition.Id));
+            if (project.Sources.TryGetValue(from.SourceId, out var fromSource) &&
+                fromSource.Kind != MediaKind.Image &&
+                from.SourceIn + from.Duration + (transition.End - from.End) > fromSource.Duration)
+                errors.Add(new("transition.from-handle", "The outgoing source has insufficient media after the edit.", transition.Id));
+            if (transition.Start < to.Start && to.SourceIn < to.Start - transition.Start)
+                errors.Add(new("transition.to-handle", "The incoming source has insufficient media before the edit.", transition.Id));
             if (track.Kind == TrackKind.Audio && transition.Kind != TransitionKind.ConstantPowerAudio)
                 errors.Add(new("transition.audio-kind", "Audio tracks support Constant Power transitions only.", transition.Id));
             if (track.Kind == TrackKind.Visual && transition.Kind == TransitionKind.ConstantPowerAudio)

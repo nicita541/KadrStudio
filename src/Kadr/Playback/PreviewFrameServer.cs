@@ -33,6 +33,7 @@ public sealed class PreviewFrameServer(
     private readonly Stopwatch _fallbackClock = new();
     private TimelineTime _position;
     private TimelineTime _playbackStart;
+    private int _audioSampleRate = 48_000;
     private bool _disposed;
 
     public PreviewState State { get; private set; } = PreviewState.Idle;
@@ -235,7 +236,8 @@ public sealed class PreviewFrameServer(
             RenderPurpose.AudioServer, "pipe:1", 16, 16,
             IncludeVideo: false, IncludeAudio: true, IncludeOverlays: false));
         _audioProcess = Start(command, redirectOutput: true);
-        _audioBuffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2))
+        _audioSampleRate = plan.AudioSampleRate;
+        _audioBuffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(_audioSampleRate, 2))
         {
             BufferDuration = TimeSpan.FromSeconds(3),
             DiscardOnBufferOverflow = false,
@@ -410,7 +412,8 @@ public sealed class PreviewFrameServer(
         var output = _audioOutput;
         if (output is not null && output.PlaybackState == PlaybackState.Playing)
         {
-            var seconds = output.GetPosition() / (double)WaveFormat.CreateIeeeFloatWaveFormat(48_000, 2).AverageBytesPerSecond;
+            var seconds = output.GetPosition() /
+                          (double)WaveFormat.CreateIeeeFloatWaveFormat(_audioSampleRate, 2).AverageBytesPerSecond;
             return _playbackStart + TimelineTime.FromSeconds(seconds);
         }
         return _playbackStart + TimelineTime.FromSeconds(_fallbackClock.Elapsed.TotalSeconds);
@@ -433,10 +436,30 @@ public sealed class PreviewFrameServer(
 
     private static RenderPlan SlicePlan(RenderPlan plan, TimeRange range)
     {
-        var visual = plan.VisualLayers.Where(layer => layer.TimelineRange.Intersects(range)).ToImmutableArray();
-        var audio = plan.AudioLayers.Where(layer => layer.TimelineRange.Intersects(range)).ToImmutableArray();
+        var videoTransitions = plan.VideoTransitions
+            .Where(item => item.TimelineRange.Intersects(range)).ToImmutableArray();
+        var audioTransitions = plan.AudioTransitions
+            .Where(item => item.TimelineRange.Intersects(range)).ToImmutableArray();
+        var videoTransitionClips = videoTransitions
+            .SelectMany(item => new[] { item.From.ClipId, item.To.ClipId }).ToHashSet();
+        var audioTransitionClips = audioTransitions
+            .SelectMany(item => new[] { item.From.ClipId, item.To.ClipId }).ToHashSet();
+        var visual = plan.VisualLayers
+            .Where(layer => layer.TimelineRange.Intersects(range) || videoTransitionClips.Contains(layer.ClipId))
+            .ToImmutableArray();
+        var audio = plan.AudioLayers
+            .Where(layer => layer.TimelineRange.Intersects(range) || audioTransitionClips.Contains(layer.ClipId))
+            .ToImmutableArray();
         var text = plan.TextLayers.Where(layer => layer.TimelineRange.Intersects(range)).ToImmutableArray();
-        return plan with { Range = range, VisualLayers = visual, AudioLayers = audio, TextLayers = text };
+        return plan with
+        {
+            Range = range,
+            VisualLayers = visual,
+            AudioLayers = audio,
+            TextLayers = text,
+            VideoTransitions = videoTransitions,
+            AudioTransitions = audioTransitions
+        };
     }
 
     private void SetState(PreviewState state)

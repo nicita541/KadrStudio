@@ -34,12 +34,13 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             plan.GetPipelineSignature(options.IncludeVideo, options.IncludeAudio, options.IncludeOverlays));
     }
 
-    private static Dictionary<Guid, int> AddInputs(
+    private static RenderInputs AddInputs(
         ICollection<string> arguments,
         RenderPlan plan,
         RenderOutputOptions options)
     {
-        var inputs = new Dictionary<Guid, int>();
+        var indexes = new Dictionary<Guid, int>();
+        var windows = new Dictionary<Guid, DecodeWindow>();
         var layers = (options.IncludeVideo ? plan.VisualLayers.Cast<object>() : [])
             .Concat(options.IncludeAudio ? plan.AudioLayers : [])
             .ToArray();
@@ -51,14 +52,11 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
                 RenderAudioLayer audio => audio.ClipId,
                 _ => throw new UnreachableException()
             };
-            if (inputs.ContainsKey(clipId)) continue;
+            if (indexes.ContainsKey(clipId)) continue;
             var timelineRange = layer is RenderVisualLayer v ? v.TimelineRange : ((RenderAudioLayer)layer).TimelineRange;
             var sourceIn = layer is RenderVisualLayer vv ? vv.SourceIn : ((RenderAudioLayer)layer).SourceIn;
             var sourcePath = layer is RenderVisualLayer vvv ? vvv.SourcePath : ((RenderAudioLayer)layer).SourcePath;
-            var intersectionStart = timelineRange.Start >= plan.Range.Start ? timelineRange.Start : plan.Range.Start;
-            var intersectionEnd = timelineRange.End <= plan.Range.End ? timelineRange.End : plan.Range.End;
-            var sourceOffset = sourceIn + (intersectionStart - timelineRange.Start);
-            var duration = intersectionEnd - intersectionStart;
+            var window = ResolveDecodeWindow(plan, clipId, timelineRange, sourceIn);
             var isImage = layer is RenderVisualLayer { SourceKind: MediaKind.Image };
             if (isImage)
             {
@@ -67,20 +65,21 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             }
             else
             {
-                arguments.Add("-ss"); arguments.Add(Format(sourceOffset.TotalSeconds));
+                arguments.Add("-ss"); arguments.Add(Format(window.SourceOffset.TotalSeconds));
             }
-            arguments.Add("-t"); arguments.Add(Format(duration.TotalSeconds));
+            arguments.Add("-t"); arguments.Add(Format(window.Duration.TotalSeconds));
             arguments.Add("-i"); arguments.Add(sourcePath);
-            inputs.Add(clipId, inputs.Count);
+            indexes.Add(clipId, indexes.Count);
+            windows.Add(clipId, window);
         }
-        return inputs;
+        return new RenderInputs(indexes, windows);
     }
 
     private static string BuildVideoGraph(
         ICollection<string> filters,
         RenderPlan plan,
         RenderOutputOptions options,
-        IReadOnlyDictionary<Guid, int> inputs)
+        RenderInputs inputs)
     {
         var duration = Format(plan.Duration.TotalSeconds);
         var frameRate = FrameRateValue(plan.FrameRate);
@@ -89,18 +88,29 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         for (var index = 0; index < plan.VisualLayers.Length; index++)
         {
             var layer = plan.VisualLayers[index];
-            var start = RelativeStart(layer.TimelineRange, plan.Range);
-            var end = RelativeEnd(layer.TimelineRange, plan.Range);
             var prepared = $"vprepared{index}";
+            var window = inputs.Windows[layer.ClipId];
+            var surface = $"vsurface{index}";
+            var canvas = $"vcanvas{index}";
+            var layout = $"vlayout{index}";
             filters.Add(
-                $"[{inputs[layer.ClipId]}:v:0]scale={options.Width}:{options.Height}:force_original_aspect_ratio=decrease," +
-                $"pad={options.Width}:{options.Height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={frameRate},format=rgba," +
-                BuildColorFilters(layer.Parameters) +
-                $"setpts=PTS-STARTPTS+{Format(start)}/TB[{prepared}]");
+                $"[{inputs.Indexes[layer.ClipId]}:v:0]" + BuildVideoSurfaceFilters(layer.Parameters, options) +
+                $"fps={frameRate},format=rgba,setpts=PTS-STARTPTS[{surface}]");
+            filters.Add($"color=c=black@0:s={options.Width}x{options.Height}:r={frameRate}:" +
+                        $"d={Format(window.Duration.TotalSeconds)},format=rgba[{canvas}]");
+            filters.Add(
+                $"[{canvas}][{surface}]overlay=" +
+                $"x='{Format(options.Width * layer.Parameters.PositionX)}-overlay_w/2':" +
+                $"y='{Format(options.Height * layer.Parameters.PositionY)}-overlay_h/2':" +
+                $"eof_action=pass:shortest=1[{layout}]");
+            filters.Add($"[{layout}]" + BuildVideoTransitionFilters(plan, layer, window) +
+                        $"setpts=PTS-STARTPTS+{Format(RelativeStart(window.Range, plan.Range))}/TB[{prepared}]");
             var composed = $"vcomposed{index}";
+            var overlayX = BuildTransitionOverlayX(plan, layer, options.Width);
             filters.Add(
-                $"[{previous}][{prepared}]overlay=0:0:eof_action=pass:shortest=0:" +
-                $"enable='between(t,{Format(start)},{Format(end)})'[{composed}]");
+                $"[{previous}][{prepared}]overlay=x='{overlayX}':y=0:eof_action=pass:shortest=0:" +
+                $"enable='between(t,{Format(RelativeStart(window.Range, plan.Range))}," +
+                $"{Format(RelativeEnd(window.Range, plan.Range))})'[{composed}]");
             previous = composed;
         }
         for (var index = 0; options.IncludeOverlays && index < plan.TextLayers.Length; index++)
@@ -127,20 +137,25 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
     private static string BuildAudioGraph(
         ICollection<string> filters,
         RenderPlan plan,
-        IReadOnlyDictionary<Guid, int> inputs)
+        RenderInputs inputs)
     {
-        filters.Add($"anullsrc=channel_layout=stereo:sample_rate=48000:d={Format(plan.Duration.TotalSeconds)}[asilence]");
+        filters.Add($"anullsrc=channel_layout=stereo:sample_rate={plan.AudioSampleRate}:d={Format(plan.Duration.TotalSeconds)}[asilence]");
         var labels = new List<string> { "[asilence]" };
         for (var index = 0; index < plan.AudioLayers.Length; index++)
         {
             var layer = plan.AudioLayers[index];
-            var duration = IntersectionDuration(layer.TimelineRange, plan.Range);
-            var delay = Math.Max(0, (long)Math.Round(RelativeStart(layer.TimelineRange, plan.Range) * 1000));
+            var window = inputs.Windows[layer.ClipId];
+            var duration = window.Duration.TotalSeconds;
+            var delaySamples = Math.Max(0, (long)Math.Round(
+                RelativeStart(window.Range, plan.Range) * plan.AudioSampleRate,
+                MidpointRounding.AwayFromZero));
             var label = $"aprepared{index}";
             filters.Add(
-                $"[{inputs[layer.ClipId]}:a:0]aresample=48000,atrim=0:{Format(duration)},asetpts=PTS-STARTPTS," +
+                $"[{inputs.Indexes[layer.ClipId]}:a:0]aresample={plan.AudioSampleRate}," +
+                $"atrim=0:{Format(duration)},asetpts=PTS-STARTPTS," +
                 $"volume={Format(layer.Parameters.Volume)}," + BuildAudioFilters(layer.Parameters, duration) +
-                $"adelay={delay}|{delay}[{label}]");
+                BuildAudioTransitionFilters(plan, layer, window) +
+                $"adelay={delaySamples}S|{delaySamples}S[{label}]");
             labels.Add($"[{label}]");
         }
         filters.Add(
@@ -193,7 +208,7 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             {
                 arguments.Add("-b:a"); arguments.Add(options.Purpose == RenderPurpose.Preview ? "128k" : "192k");
             }
-            arguments.Add("-ar"); arguments.Add("48000");
+            arguments.Add("-ar"); arguments.Add(plan.AudioSampleRate.ToString(CultureInfo.InvariantCulture));
             arguments.Add("-ac"); arguments.Add("2");
             if (options.Purpose == RenderPurpose.AudioServer)
             {
@@ -212,18 +227,129 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
     private static double RelativeEnd(TimeRange clip, TimeRange plan)
         => Math.Min(plan.Duration.TotalSeconds, (clip.End - plan.Start).TotalSeconds);
 
-    private static double IntersectionDuration(TimeRange clip, TimeRange plan)
-        => Math.Max(0, RelativeEnd(clip, plan) - RelativeStart(clip, plan));
-
-    private static string BuildColorFilters(VideoParameters parameters)
+    private static string BuildVideoSurfaceFilters(VideoParameters parameters, RenderOutputOptions options)
     {
         var filters = new List<string>();
+        if (parameters.CropLeft > 0 || parameters.CropTop > 0 ||
+            parameters.CropRight > 0 || parameters.CropBottom > 0)
+        {
+            filters.Add($"crop=iw*{Format(1 - parameters.CropLeft - parameters.CropRight)}:" +
+                        $"ih*{Format(1 - parameters.CropTop - parameters.CropBottom)}:" +
+                        $"iw*{Format(parameters.CropLeft)}:ih*{Format(parameters.CropTop)}");
+        }
+        filters.Add($"scale={options.Width}:{options.Height}:force_original_aspect_ratio=decrease");
+        if (Math.Abs(parameters.ScaleX - 1) > 0.0001 || Math.Abs(parameters.ScaleY - 1) > 0.0001)
+            filters.Add($"scale='max(2,trunc(iw*{Format(parameters.ScaleX)}/2)*2)':" +
+                        $"'max(2,trunc(ih*{Format(parameters.ScaleY)}/2)*2)'");
+        if (Math.Abs(parameters.Rotation) > 0.0001)
+            filters.Add($"rotate={Format(parameters.Rotation * Math.PI / 180)}:" +
+                        "ow=rotw(iw):oh=roth(ih):c=black@0");
+        filters.Add("setsar=1");
         if (Math.Abs(parameters.Brightness) > 0.0001 || Math.Abs(parameters.Contrast - 1) > 0.0001 ||
             Math.Abs(parameters.Saturation - 1) > 0.0001)
             filters.Add($"eq=brightness={Format(parameters.Brightness)}:contrast={Format(parameters.Contrast)}:saturation={Format(parameters.Saturation)}");
         if (Math.Abs(parameters.Temperature) > 0.0001)
             filters.Add($"colorchannelmixer=rr={Format(Math.Clamp(1 + parameters.Temperature * 0.22, 0.5, 1.5))}:gg=1:" +
                         $"bb={Format(Math.Clamp(1 - parameters.Temperature * 0.22, 0.5, 1.5))}");
+        filters.Add("format=rgba");
+        if (Math.Abs(parameters.Opacity - 1) > 0.0001)
+            filters.Add($"colorchannelmixer=aa={Format(parameters.Opacity)}");
+        return string.Join(',', filters) + ',';
+    }
+
+    private static DecodeWindow ResolveDecodeWindow(
+        RenderPlan plan,
+        Guid clipId,
+        TimeRange clipRange,
+        TimelineTime sourceIn)
+    {
+        var start = clipRange.Start >= plan.Range.Start ? clipRange.Start : plan.Range.Start;
+        var end = clipRange.End <= plan.Range.End ? clipRange.End : plan.Range.End;
+        foreach (var transition in plan.VideoTransitions
+                     .Where(item => item.From.ClipId == clipId || item.To.ClipId == clipId)
+                     .Select(item => item.TimelineRange)
+                     .Concat(plan.AudioTransitions
+                         .Where(item => item.From.ClipId == clipId || item.To.ClipId == clipId)
+                         .Select(item => item.TimelineRange)))
+        {
+            if (transition.Start < start && transition.End > plan.Range.Start)
+                start = transition.Start >= plan.Range.Start ? transition.Start : plan.Range.Start;
+            if (transition.End > end && transition.Start < plan.Range.End)
+                end = transition.End <= plan.Range.End ? transition.End : plan.Range.End;
+        }
+        var offset = sourceIn + (start - clipRange.Start);
+        return new DecodeWindow(new TimeRange(start, end - start), offset);
+    }
+
+    private static string BuildVideoTransitionFilters(
+        RenderPlan plan,
+        RenderVisualLayer layer,
+        DecodeWindow window)
+    {
+        var filters = new List<string>();
+        foreach (var transition in plan.VideoTransitions.Where(item => item.From.ClipId == layer.ClipId))
+        {
+            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
+            var duration = transition.TimelineRange.Duration.TotalSeconds;
+            if (transition.Kind is TransitionKind.DipToBlack or TransitionKind.DipToWhite)
+            {
+                var color = transition.Kind == TransitionKind.DipToWhite ? "white" : "black";
+                filters.Add($"fade=t=out:st={Format(localStart)}:d={Format(duration / 2)}:" +
+                            $"alpha=0:color={color}");
+            }
+        }
+        foreach (var transition in plan.VideoTransitions.Where(item => item.To.ClipId == layer.ClipId))
+        {
+            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
+            var duration = transition.TimelineRange.Duration.TotalSeconds;
+            switch (transition.Kind)
+            {
+                case TransitionKind.CrossDissolve:
+                    filters.Add($"fade=t=in:st={Format(localStart)}:d={Format(duration)}:alpha=1");
+                    break;
+                case TransitionKind.DipToBlack:
+                case TransitionKind.DipToWhite:
+                    filters.Add($"fade=t=in:st={Format(localStart + duration / 2)}:" +
+                                $"d={Format(duration / 2)}:alpha=1");
+                    break;
+                case TransitionKind.Wipe:
+                    var progress = $"clip((T-{Format(localStart)})/{Format(duration)},0,1)";
+                    filters.Add("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':" +
+                                $"a='alpha(X,Y)*lte(X/W,{progress})'");
+                    break;
+            }
+        }
+        return filters.Count == 0 ? string.Empty : string.Join(',', filters) + ',';
+    }
+
+    private static string BuildTransitionOverlayX(RenderPlan plan, RenderVisualLayer layer, int width)
+    {
+        var slide = plan.VideoTransitions.FirstOrDefault(item =>
+            item.Kind == TransitionKind.Slide && item.To.ClipId == layer.ClipId);
+        if (slide is null) return "0";
+        var start = RelativeStart(slide.TimelineRange, plan.Range);
+        var duration = slide.TimelineRange.Duration.TotalSeconds;
+        return $"{width}*(1-clip((t-{Format(start)})/{Format(duration)},0,1))";
+    }
+
+    private static string BuildAudioTransitionFilters(
+        RenderPlan plan,
+        RenderAudioLayer layer,
+        DecodeWindow window)
+    {
+        var filters = new List<string>();
+        foreach (var transition in plan.AudioTransitions.Where(item => item.From.ClipId == layer.ClipId))
+        {
+            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
+            filters.Add($"afade=t=out:st={Format(localStart)}:" +
+                        $"d={Format(transition.TimelineRange.Duration.TotalSeconds)}:curve=iqsin");
+        }
+        foreach (var transition in plan.AudioTransitions.Where(item => item.To.ClipId == layer.ClipId))
+        {
+            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
+            filters.Add($"afade=t=in:st={Format(localStart)}:" +
+                        $"d={Format(transition.TimelineRange.Duration.TotalSeconds)}:curve=hsin");
+        }
         return filters.Count == 0 ? string.Empty : string.Join(',', filters) + ',';
     }
 
@@ -281,4 +407,13 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             : $"{frameRate.Numerator}/{frameRate.Denominator}";
 
     private static string Format(double value) => value.ToString("0.######", CultureInfo.InvariantCulture);
+
+    private sealed record DecodeWindow(TimeRange Range, TimelineTime SourceOffset)
+    {
+        public TimelineTime Duration => Range.Duration;
+    }
+
+    private sealed record RenderInputs(
+        IReadOnlyDictionary<Guid, int> Indexes,
+        IReadOnlyDictionary<Guid, DecodeWindow> Windows);
 }

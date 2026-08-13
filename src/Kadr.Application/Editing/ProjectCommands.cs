@@ -543,13 +543,51 @@ public sealed record UpsertTransitionCommand(TimelineTransition Transition) : IE
 
     public ProjectState Apply(ProjectState project)
     {
+        var normalized = NormalizeTransition(project, Transition);
         var exists = project.Transitions.Any(item => item.Id == Transition.Id);
         return project with
         {
             Transitions = exists
-                ? project.Transitions.Select(item => item.Id == Transition.Id ? Transition : item).ToImmutableArray()
-                : project.Transitions.Add(Transition)
+                ? project.Transitions.Select(item => item.Id == Transition.Id ? normalized : item).ToImmutableArray()
+                : project.Transitions.Add(normalized)
         };
+    }
+
+    private static TimelineTransition NormalizeTransition(ProjectState project, TimelineTransition transition)
+    {
+        var from = project.FindMediaClip(transition.FromClipId)
+            ?? throw new EditRejectedException("Transition outgoing clip was not found.");
+        var to = project.FindMediaClip(transition.ToClipId)
+            ?? throw new EditRejectedException("Transition incoming clip was not found.");
+        var track = project.FindTrack(transition.TrackId)
+            ?? throw new EditRejectedException("Transition track was not found.");
+        if (from.TrackId != track.Id || to.TrackId != track.Id || from.End != to.Start)
+            throw new EditRejectedException("Transition clips must be adjacent on the same track.");
+        if (track.Kind == TrackKind.Audio && transition.Kind != TransitionKind.ConstantPowerAudio ||
+            track.Kind == TrackKind.Visual && transition.Kind == TransitionKind.ConstantPowerAudio)
+            throw new EditRejectedException("Transition kind does not match the track kind.");
+
+        var cut = from.End;
+        var requestedStart = transition.Start < cut ? transition.Start : cut;
+        var requestedEnd = transition.End > cut ? transition.End : cut;
+        var earliest = from.Start;
+        var latest = to.End;
+        if (project.Sources.TryGetValue(to.SourceId, out var toSource) && toSource.Kind != MediaKind.Image)
+        {
+            var byIncomingHandle = cut - to.SourceIn;
+            if (byIncomingHandle > earliest) earliest = byIncomingHandle;
+        }
+        if (project.Sources.TryGetValue(from.SourceId, out var fromSource) && fromSource.Kind != MediaKind.Image)
+        {
+            var outgoingHandle = fromSource.Duration - from.SourceIn - from.Duration;
+            var byOutgoingHandle = cut + outgoingHandle;
+            if (byOutgoingHandle < latest) latest = byOutgoingHandle;
+        }
+        var start = requestedStart >= earliest ? requestedStart : earliest;
+        var end = requestedEnd <= latest ? requestedEnd : latest;
+        if (start >= cut || end <= cut || end <= start)
+            throw new EditRejectedException("The source clips do not have enough media handles for this transition.");
+        return transition with { Start = start, Duration = end - start };
     }
 }
 

@@ -4,6 +4,9 @@ using KadrStudio.Playback;
 using KadrStudio.Services;
 using KadrStudio.Application.Media;
 using KadrStudio.Core.Domain;
+using KadrStudio.Infrastructure.Jobs;
+using KadrStudio.Infrastructure.Rendering;
+using System.Collections.Immutable;
 using UiMediaKind = KadrStudio.Models.MediaKind;
 using UiTrackKind = KadrStudio.Models.TrackKind;
 using Xunit;
@@ -12,6 +15,42 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class MediaPipelineIntegrationTests
 {
+    [Theory(Timeout = 120_000)]
+    [InlineData(TransitionKind.CrossDissolve)]
+    [InlineData(TransitionKind.DipToBlack)]
+    [InlineData(TransitionKind.DipToWhite)]
+    [InlineData(TransitionKind.Wipe)]
+    [InlineData(TransitionKind.Slide)]
+    public async Task Every_typed_transition_renders_real_video_and_constant_power_audio(TransitionKind kind)
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var red = Path.Combine(root, "red.mp4");
+            var blue = Path.Combine(root, "blue.mp4");
+            await CreateColorSourceAsync(locator, red, "red", 440);
+            await CreateColorSourceAsync(locator, blue, "blue", 880);
+            var output = Path.Combine(root, $"transition-{kind}.mp4");
+            var plan = new RenderPlanBuilder().Build(CreateTransitionProject(red, blue, kind));
+
+            await using var scheduler = new BackgroundJobScheduler();
+            var engine = new FfmpegRenderEngine(locator.FfmpegPath, new FfmpegRenderCommandBuilder(), scheduler);
+            await engine.RenderAsync(plan, new RenderOutputOptions(
+                RenderPurpose.Export, output, 320, 240, VideoQuality: 30));
+
+            var probe = await new ProcessRunner().RunAsync(locator.FfprobePath,
+                ["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "default=nw=1", output]);
+            Assert.Equal(0, probe.ExitCode);
+            Assert.Contains("codec_type=video", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("codec_type=audio", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("duration=4.", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.True(new FileInfo(output).Length > 5_000);
+        }
+        finally { DeleteRoot(root); }
+    }
+
     [Fact(Timeout = 60_000)]
     public async Task Export_composes_real_video_and_audio_into_one_valid_file()
     {
@@ -174,6 +213,60 @@ public sealed class MediaPipelineIntegrationTests
         project.Clips.Add(new TimelineClip { AssetId = id, Track = UiTrackKind.Visual, Duration = 2, LinkGroupId = link });
         project.Clips.Add(new TimelineClip { AssetId = id, Track = UiTrackKind.Audio, Duration = 2, LinkGroupId = link });
         return project;
+    }
+
+    private static async Task CreateColorSourceAsync(
+        FfmpegLocator locator,
+        string output,
+        string color,
+        int frequency)
+    {
+        var result = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+        [
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", $"color=c={color}:s=320x240:r=24:d=3",
+            "-f", "lavfi", "-i", $"sine=frequency={frequency}:sample_rate=48000:duration=3",
+            "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", output
+        ]);
+        Assert.Equal(0, result.ExitCode);
+    }
+
+    private static ProjectState CreateTransitionProject(string firstPath, string secondPath, TransitionKind kind)
+    {
+        var project = ProjectState.CreateNew($"Transition {kind}", new FrameRate(24)) with
+        {
+            Sequence = new SequenceSettings(320, 240, new FrameRate(24), 48_000)
+        };
+        var firstSource = new MediaSource(Guid.NewGuid(), firstPath, "red.mp4", KadrStudio.Core.Domain.MediaKind.Video,
+            TimelineTime.FromSeconds(3), true, 320, 240, new FrameRate(24), "h264", "aac",
+            new FileInfo(firstPath).Length, Fingerprint: "red-source");
+        var secondSource = new MediaSource(Guid.NewGuid(), secondPath, "blue.mp4", KadrStudio.Core.Domain.MediaKind.Video,
+            TimelineTime.FromSeconds(3), true, 320, 240, new FrameRate(24), "h264", "aac",
+            new FileInfo(secondPath).Length, Fingerprint: "blue-source");
+        var visual = project.Tracks.Single(item => item.Kind == KadrStudio.Core.Domain.TrackKind.Visual && item.Index == 0);
+        var audio = project.Tracks.Single(item => item.Kind == KadrStudio.Core.Domain.TrackKind.Audio && item.Index == 0);
+        var v1 = new MediaClip(Guid.NewGuid(), firstSource.Id, visual.Id, TimelineTime.Zero,
+            TimelineTime.FromSeconds(0.5), TimelineTime.FromSeconds(2), Video: new VideoParameters());
+        var v2 = new MediaClip(Guid.NewGuid(), secondSource.Id, visual.Id, TimelineTime.FromSeconds(2),
+            TimelineTime.FromSeconds(0.5), TimelineTime.FromSeconds(2), Video: new VideoParameters());
+        var a1 = new MediaClip(Guid.NewGuid(), firstSource.Id, audio.Id, TimelineTime.Zero,
+            TimelineTime.FromSeconds(0.5), TimelineTime.FromSeconds(2), Audio: new AudioParameters());
+        var a2 = new MediaClip(Guid.NewGuid(), secondSource.Id, audio.Id, TimelineTime.FromSeconds(2),
+            TimelineTime.FromSeconds(0.5), TimelineTime.FromSeconds(2), Audio: new AudioParameters());
+        return project with
+        {
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty
+                .Add(firstSource.Id, firstSource).Add(secondSource.Id, secondSource),
+            MediaClips = [v1, v2, a1, a2],
+            Transitions =
+            [
+                new TimelineTransition(Guid.NewGuid(), kind, visual.Id, v1.Id, v2.Id,
+                    TimelineTime.FromSeconds(1.5), TimelineTime.FromSeconds(1)),
+                new TimelineTransition(Guid.NewGuid(), TransitionKind.ConstantPowerAudio, audio.Id, a1.Id, a2.Id,
+                    TimelineTime.FromSeconds(1.5), TimelineTime.FromSeconds(1))
+            ]
+        };
     }
 
     private static string CreateRoot()

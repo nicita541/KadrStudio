@@ -141,6 +141,73 @@ public sealed class RenderPlanTests
         Assert.Single(duringText.TextLayers);
     }
 
+    [Fact]
+    public void All_video_parameters_are_part_of_video_signature_only()
+    {
+        var project = CreateProject();
+        var builder = new RenderPlanBuilder();
+        var initial = builder.Build(project);
+        var clip = project.MediaClips.Single(item => item.Video is not null);
+        var changed = builder.Build(project with
+        {
+            MediaClips = project.MediaClips.Replace(clip, clip with
+            {
+                Video = clip.Video! with
+                {
+                    PositionX = 0.31, PositionY = 0.68, ScaleX = 1.2, ScaleY = 0.8,
+                    Rotation = 17, CropLeft = 0.1, CropBottom = 0.12, Opacity = 0.73
+                }
+            })
+        });
+
+        Assert.NotEqual(initial.VideoGraphSignature, changed.VideoGraphSignature);
+        Assert.Equal(initial.AudioGraphSignature, changed.AudioGraphSignature);
+        Assert.Equal(initial.OverlaySignature, changed.OverlaySignature);
+    }
+
+    [Fact]
+    public void Typed_transitions_invalidate_only_their_pipeline_and_extend_decode_windows()
+    {
+        var project = CreateTransitionProject();
+        var builder = new RenderPlanBuilder();
+        var without = builder.Build(project with { Transitions = [] });
+        var withVideo = builder.Build(project);
+        var audioTransition = project.Transitions.Single(item => item.Kind == TransitionKind.ConstantPowerAudio);
+        var withAudio = builder.Build(project with { Transitions = [audioTransition] });
+
+        Assert.Single(withVideo.VideoTransitions);
+        Assert.Single(withVideo.AudioTransitions);
+        Assert.NotEqual(without.VideoGraphSignature, withVideo.VideoGraphSignature);
+        Assert.Equal(without.OverlaySignature, withVideo.OverlaySignature);
+        Assert.Equal(without.VideoGraphSignature, withAudio.VideoGraphSignature);
+        Assert.NotEqual(without.AudioGraphSignature, withAudio.AudioGraphSignature);
+
+        var command = new FfmpegRenderCommandBuilder().Build(withVideo, new RenderOutputOptions(
+            RenderPurpose.Export, "F:\\output.mp4", 320, 180));
+        var graph = command.Arguments[command.Arguments.IndexOf("-filter_complex") + 1];
+        Assert.Contains("fade=t=in", graph);
+        Assert.Contains("curve=iqsin", graph);
+        Assert.Contains("curve=hsin", graph);
+    }
+
+    [Fact]
+    public void Transition_command_clamps_requested_duration_to_source_handles()
+    {
+        var project = CreateTransitionProject() with { Transitions = [] };
+        var visual = project.MediaClips.Where(item => item.Video is not null).OrderBy(item => item.Start).ToArray();
+        var requested = new TimelineTransition(
+            Guid.NewGuid(), TransitionKind.CrossDissolve, visual[0].TrackId,
+            visual[0].Id, visual[1].Id, TimelineTime.FromSeconds(3), TimelineTime.FromSeconds(4));
+        var session = new KadrStudio.Application.Editing.EditorSession(project);
+
+        var result = session.Execute(new KadrStudio.Application.Editing.EditTransaction(
+            "transition", new KadrStudio.Application.Editing.UpsertTransitionCommand(requested)));
+
+        var transition = Assert.Single(result.State.Transitions);
+        Assert.Equal(TimelineTime.FromSeconds(4), transition.Start);
+        Assert.Equal(TimelineTime.FromSeconds(2), transition.Duration);
+    }
+
     private static ProjectState CreateProject()
     {
         var project = ProjectState.CreateNew("Render plan", FrameRate.Fps23976);
@@ -169,6 +236,35 @@ public sealed class RenderPlanTests
             ],
             InPoint = TimelineTime.FromSeconds(2),
             OutPoint = TimelineTime.FromSeconds(12)
+        };
+    }
+
+    private static ProjectState CreateTransitionProject()
+    {
+        var project = ProjectState.CreateNew("Transitions", new FrameRate(24));
+        var source = new MediaSource(Guid.NewGuid(), "F:\\media\\handles.mp4", "handles.mp4", MediaKind.Video,
+            TimelineTime.FromSeconds(7), true, 320, 180, new FrameRate(24), Fingerprint: "handles");
+        var visual = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var audio = project.Tracks.Single(item => item.Kind == TrackKind.Audio && item.Index == 0);
+        var v1 = new MediaClip(Guid.NewGuid(), source.Id, visual.Id, TimelineTime.Zero,
+            TimelineTime.FromSeconds(1), TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        var v2 = new MediaClip(Guid.NewGuid(), source.Id, visual.Id, TimelineTime.FromSeconds(5),
+            TimelineTime.FromSeconds(1), TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        var a1 = new MediaClip(Guid.NewGuid(), source.Id, audio.Id, TimelineTime.Zero,
+            TimelineTime.FromSeconds(1), TimelineTime.FromSeconds(5), Audio: new AudioParameters());
+        var a2 = new MediaClip(Guid.NewGuid(), source.Id, audio.Id, TimelineTime.FromSeconds(5),
+            TimelineTime.FromSeconds(1), TimelineTime.FromSeconds(5), Audio: new AudioParameters());
+        return project with
+        {
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty.Add(source.Id, source),
+            MediaClips = [v1, v2, a1, a2],
+            Transitions =
+            [
+                new TimelineTransition(Guid.NewGuid(), TransitionKind.CrossDissolve, visual.Id, v1.Id, v2.Id,
+                    TimelineTime.FromSeconds(4), TimelineTime.FromSeconds(2)),
+                new TimelineTransition(Guid.NewGuid(), TransitionKind.ConstantPowerAudio, audio.Id, a1.Id, a2.Id,
+                    TimelineTime.FromSeconds(4), TimelineTime.FromSeconds(2))
+            ]
         };
     }
 }

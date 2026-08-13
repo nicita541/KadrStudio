@@ -2,6 +2,8 @@ using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows.Data;
+using KadrStudio.Adapters;
+using KadrStudio.Application.Editing;
 using KadrStudio.Models;
 using KadrStudio.Services;
 
@@ -11,9 +13,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly FfmpegLocator _ffmpegLocator = new();
     private readonly ProcessRunner _processRunner = new();
+    private readonly TimelineRenderCoordinator _renderCoordinator;
     private readonly ProjectService _projectService = new();
-    private readonly Stack<string> _undoStack = new();
-    private readonly Stack<string> _redoStack = new();
+    private readonly EditorProjectMapper _projectMapper = new();
+    private EditorSession _editorSession;
     private readonly List<TimelineClip> _subscribedClips = new();
     private readonly List<TextOverlay> _subscribedTextOverlays = new();
     private CancellationTokenSource? _autosaveCancellation;
@@ -26,7 +29,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isBusy;
     private bool _isDirty;
     private double _playhead;
-    private string? _pendingEditSnapshot;
+    private bool _editTransactionActive;
     private string? _editReviewSnapshot;
     private string? _editReviewReason;
     private Guid? _editReviewSelectedClipId;
@@ -37,11 +40,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public MainViewModel()
     {
         _project = EditorProject.CreateNew();
+        _editorSession = new EditorSession(_projectMapper.ToCore(_project));
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
         ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
-        PreviewCompositionService = new PreviewCompositionService(_ffmpegLocator, _processRunner);
+        _renderCoordinator = new TimelineRenderCoordinator(_ffmpegLocator);
+        PreviewCompositionService = new PreviewCompositionService(_ffmpegLocator, _processRunner, _renderCoordinator);
         TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
-        ExportService = new ExportService(_ffmpegLocator, _processRunner);
+        ExportService = new ExportService(_ffmpegLocator, _processRunner, _renderCoordinator);
         ProjectHistoryService = new ProjectHistoryService();
         AutoSubtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
         VideoAnalysisService = new VideoAnalysisService(_ffmpegLocator, _processRunner);
@@ -174,8 +179,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public string PlayheadLabel => FormatTime(Playhead);
     public string TimelineDurationLabel => FormatTime(Project.Duration);
-    public bool CanUndo => _undoStack.Count > 0;
-    public bool CanRedo => _redoStack.Count > 0;
+    public bool CanUndo => _editorSession.CanUndo;
+    public bool CanRedo => _editorSession.CanRedo;
     public bool HasAutosave => _projectService.AutosaveExists;
     public bool HasPendingEditReview => _editReviewSnapshot is not null;
 
@@ -516,7 +521,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
-        _pendingEditSnapshot = null;
+        _editTransactionActive = false;
         CancelAutosave();
         _suppressDirtyTracking = true;
         try
@@ -564,16 +569,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         var currentSnapshot = _projectService.CreateSnapshot(Project);
         ProjectHistoryService.CreateCheckpoint(Project, $"Авто: перед откатом к «{entry.Message}»", currentSnapshot);
-        _undoStack.Push(currentSnapshot);
-        TrimHistory(_undoStack);
-        _redoStack.Clear();
 
         var filePath = Project.FilePath;
+        var restored = ProjectHistoryService.RestoreCheckpoint(entry, filePath);
+        var restoredCore = _projectMapper.ToCore(restored, _editorSession.State.Revision);
+        _editorSession.Execute(new EditTransaction(
+            $"Restore checkpoint: {entry.Message}",
+            new ReplaceProjectStateCommand(restoredCore, $"Restore checkpoint: {entry.Message}")));
         _suppressDirtyTracking = true;
         try
         {
             SelectedClip = null;
-            Project = ProjectHistoryService.RestoreCheckpoint(entry, filePath);
+            Project = _projectMapper.ToUi(_editorSession.State, filePath);
             Playhead = Math.Min(Playhead, Project.Duration);
             IsDirty = true;
         }
@@ -794,52 +801,48 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return maximum;
     }
 
-    public void BeginEdit() => _pendingEditSnapshot ??= _projectService.CreateSnapshot(Project);
+    public void BeginEdit() => _editTransactionActive = true;
 
     public void CommitEdit(string status = "Изменения сохранены в проекте")
     {
-        if (_pendingEditSnapshot is null)
+        if (!_editTransactionActive)
         {
             return;
         }
 
-        var current = _projectService.CreateSnapshot(Project);
-        if (!string.Equals(_pendingEditSnapshot, current, StringComparison.Ordinal))
+        var candidate = _projectMapper.ToCore(Project, _editorSession.State.Revision);
+        if (candidate != _editorSession.State)
         {
-            _undoStack.Push(_pendingEditSnapshot);
-            TrimHistory(_undoStack);
-            _redoStack.Clear();
+            _editorSession.Execute(new EditTransaction(
+                status,
+                new ReplaceProjectStateCommand(candidate, status)));
             MarkChanged();
             StatusText = status;
         }
 
-        _pendingEditSnapshot = null;
+        _editTransactionActive = false;
         NotifyHistoryChanged();
     }
 
     public void Undo()
     {
-        if (_undoStack.Count == 0)
+        if (!_editorSession.Undo())
         {
             return;
         }
 
-        var current = _projectService.CreateSnapshot(Project);
-        _redoStack.Push(current);
-        RestoreFromHistory(_undoStack.Pop());
+        RestoreFromCoreState(_editorSession.State);
         StatusText = "Изменение отменено";
     }
 
     public void Redo()
     {
-        if (_redoStack.Count == 0)
+        if (!_editorSession.Redo())
         {
             return;
         }
 
-        var current = _projectService.CreateSnapshot(Project);
-        _undoStack.Push(current);
-        RestoreFromHistory(_redoStack.Pop());
+        RestoreFromCoreState(_editorSession.State);
         StatusText = "Изменение повторено";
     }
 
@@ -847,9 +850,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         CancelAutosave();
         _projectService.DeleteAutosave();
-        _undoStack.Clear();
-        _redoStack.Clear();
-        _pendingEditSnapshot = null;
+        _editTransactionActive = false;
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
@@ -857,6 +858,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SelectedAsset = null;
         Playhead = 0;
         Project = EditorProject.CreateNew();
+        _editorSession = new EditorSession(_projectMapper.ToCore(Project));
         IsDirty = false;
         StatusText = "Создан новый проект";
         NotifyHistoryChanged();
@@ -870,9 +872,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             CancelAutosave();
             _projectService.DeleteAutosave();
             var project = await _projectService.OpenAsync(path, cancellationToken);
-            _undoStack.Clear();
-            _redoStack.Clear();
-            _pendingEditSnapshot = null;
+            _editTransactionActive = false;
             _editReviewSnapshot = null;
             _editReviewReason = null;
             _editReviewSelectedClipId = null;
@@ -880,6 +880,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             SelectedAsset = null;
             Playhead = 0;
             Project = project;
+            _editorSession = new EditorSession(_projectMapper.ToCore(Project));
             IsDirty = false;
             StatusText = $"Открыт проект: {Path.GetFileName(path)}";
             NotifyHistoryChanged();
@@ -915,12 +916,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         CancelAutosave();
         var project = await _projectService.OpenAutosaveAsync(cancellationToken);
-        _undoStack.Clear();
-        _redoStack.Clear();
+        _editTransactionActive = false;
         SelectedClip = null;
         SelectedAsset = null;
         Playhead = 0;
         Project = project;
+        _editorSession = new EditorSession(_projectMapper.ToCore(Project));
         IsDirty = true;
         StatusText = "Несохранённый проект восстановлен";
         NotifyHistoryChanged();
@@ -951,6 +952,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _autosaveCancellation?.Cancel();
         _autosaveCancellation?.Dispose();
         OllamaVideoAnalysisService.Dispose();
+        _renderCoordinator.DisposeAsync().AsTask().GetAwaiter().GetResult();
         DetachProject(Project);
     }
 
@@ -971,27 +973,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void CaptureUndoPoint()
     {
-        _undoStack.Push(_projectService.CreateSnapshot(Project));
-        TrimHistory(_undoStack);
-        _redoStack.Clear();
+        BeginEdit();
         NotifyHistoryChanged();
     }
 
     private void CommitChange(string status)
     {
-        MarkChanged();
-        StatusText = status;
-        NotifyHistoryChanged();
+        CommitEdit(status);
     }
 
-    private void RestoreFromHistory(string snapshot)
+    private void RestoreFromCoreState(KadrStudio.Core.Domain.ProjectState state)
     {
         var filePath = Project.FilePath;
         _suppressDirtyTracking = true;
         try
         {
             SelectedClip = null;
-            Project = _projectService.RestoreSnapshot(snapshot, filePath);
+            Project = _projectMapper.ToUi(state, filePath);
             Playhead = Math.Min(Playhead, Project.Duration);
             IsDirty = true;
         }
@@ -1184,21 +1182,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         catch
         {
             // Автосохранение не должно прерывать монтаж. Ручное сохранение сообщит об ошибке явно.
-        }
-    }
-
-    private static void TrimHistory(Stack<string> stack)
-    {
-        if (stack.Count <= 50)
-        {
-            return;
-        }
-
-        var newest = stack.Take(50).Reverse().ToArray();
-        stack.Clear();
-        foreach (var item in newest)
-        {
-            stack.Push(item);
         }
     }
 

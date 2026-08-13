@@ -4,6 +4,15 @@ using static KadrStudio.Application.Editing.CommandHelpers;
 
 namespace KadrStudio.Application.Editing;
 
+/// <summary>
+/// Adapter command for UI migrations: the mutable view is mapped back to a full
+/// immutable candidate and the editor session validates it before committing.
+/// </summary>
+public sealed record ReplaceProjectStateCommand(ProjectState Candidate, string Description) : IEditCommand
+{
+    public ProjectState Apply(ProjectState project) => Candidate;
+}
+
 public sealed record AddSourcesCommand(IReadOnlyList<MediaSource> Sources) : IEditCommand
 {
     public string Description => "Добавить исходники";

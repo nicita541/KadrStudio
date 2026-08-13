@@ -1,25 +1,25 @@
-using System.Text;
-using System.Text.Json;
+using KadrStudio.Adapters;
+using KadrStudio.Infrastructure.Storage;
 using KadrStudio.Models;
 
 namespace KadrStudio.Services;
 
+/// <summary>
+/// Stores checkpoints inside the SQLite project document. Unsaved projects use
+/// an isolated local SQLite history document and never spill JSON snapshots.
+/// </summary>
 public sealed class ProjectHistoryService
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = true
-    };
-
+    private readonly SqliteProjectStore _store = new();
+    private readonly EditorProjectMapper _mapper = new();
     private readonly string _historyRoot;
 
     public ProjectHistoryService(string? historyRoot = null)
     {
-        _historyRoot = historyRoot ?? Path.Combine(
+        _historyRoot = Path.GetFullPath(historyRoot ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio",
-            "history");
+            "Kadr Studio", "History"));
+        Directory.CreateDirectory(_historyRoot);
     }
 
     public ProjectHistoryEntry CreateCheckpoint(
@@ -27,140 +27,69 @@ public sealed class ProjectHistoryService
         string message,
         string? existingSnapshot = null)
     {
-        var entry = new ProjectHistoryEntry
-        {
-            Id = Guid.NewGuid(),
-            ProjectId = project.Id,
-            CreatedAt = DateTimeOffset.Now,
-            Message = string.IsNullOrWhiteSpace(message) ? "Контрольная точка" : message.Trim()
-        };
-        var document = new ProjectHistoryDocument
-        {
-            Id = entry.Id,
-            ProjectId = entry.ProjectId,
-            CreatedAt = entry.CreatedAt,
-            Message = entry.Message,
-            Snapshot = existingSnapshot ?? ProjectJson.Serialize(project)
-        };
-        var directory = GetProjectDirectory(project);
-        try
-        {
-            WriteCheckpoint(entry, document, directory);
-        }
-        catch (Exception exception) when (
-            exception is UnauthorizedAccessException or IOException &&
-            !directory.Equals(GetLocalProjectDirectory(project.Id), StringComparison.OrdinalIgnoreCase))
-        {
-            WriteCheckpoint(entry, document, GetLocalProjectDirectory(project.Id));
-        }
-        return entry;
+        ArgumentNullException.ThrowIfNull(project);
+        var checkpointProject = existingSnapshot is null ? project : ProjectJson.Deserialize(existingSnapshot);
+        var path = EnsureHistoryDocument(project);
+        var core = _mapper.ToCore(checkpointProject);
+        var info = _store.CreateCheckpointAsync(path, core, NormalizeMessage(message)).GetAwaiter().GetResult();
+        return ToEntry(info.Id, info.ProjectId, info.CreatedAt, info.Name, path);
     }
 
     public IReadOnlyList<ProjectHistoryEntry> GetCheckpoints(EditorProject project)
     {
-        var entries = new List<ProjectHistoryEntry>();
-        var directories = new[] { GetProjectDirectory(project), GetLocalProjectDirectory(project.Id) }
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Where(Directory.Exists);
-        foreach (var directory in directories)
-        {
-            foreach (var path in Directory.EnumerateFiles(directory, "*.json", SearchOption.TopDirectoryOnly))
-            {
-                try
-                {
-                    var document = JsonSerializer.Deserialize<ProjectHistoryDocument>(File.ReadAllText(path), JsonOptions);
-                    if (document is null || document.ProjectId != project.Id || string.IsNullOrWhiteSpace(document.Snapshot))
-                    {
-                        continue;
-                    }
-
-                    entries.Add(new ProjectHistoryEntry
-                    {
-                        Id = document.Id,
-                        ProjectId = document.ProjectId,
-                        CreatedAt = document.CreatedAt,
-                        Message = document.Message,
-                        StoragePath = directory
-                    });
-                }
-                catch (JsonException)
-                {
-                    // Повреждённая отдельная точка не должна ломать всю историю проекта.
-                }
-                catch (IOException)
-                {
-                    // Файл мог быть временно занят другим экземпляром приложения.
-                }
-            }
-        }
-
-        return entries
-            .DistinctBy(entry => entry.Id)
-            .OrderByDescending(entry => entry.CreatedAt)
-            .ToList();
+        ArgumentNullException.ThrowIfNull(project);
+        var path = GetHistoryPath(project);
+        if (!File.Exists(path)) return [];
+        return _store.GetCheckpointsAsync(path).GetAwaiter().GetResult()
+            .Select(item => ToEntry(item.Id, item.ProjectId, item.CreatedAt, item.Name, path))
+            .ToArray();
     }
 
     public EditorProject RestoreCheckpoint(ProjectHistoryEntry entry, string? projectFilePath)
     {
-        var path = GetEntryPath(entry);
-        var document = JsonSerializer.Deserialize<ProjectHistoryDocument>(File.ReadAllText(path), JsonOptions)
-            ?? throw new InvalidDataException("Контрольная точка повреждена.");
-        if (document.ProjectId != entry.ProjectId || string.IsNullOrWhiteSpace(document.Snapshot))
-        {
-            throw new InvalidDataException("Контрольная точка не принадлежит этому проекту.");
-        }
-
-        var project = ProjectJson.Deserialize(document.Snapshot);
-        project.FilePath = projectFilePath;
-        foreach (var asset in project.Media)
-        {
-            asset.IsMissing = !File.Exists(asset.Path);
-        }
-        return project;
+        ArgumentNullException.ThrowIfNull(entry);
+        var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
+        var core = _store.RestoreCheckpointAsync(path, entry.Id).GetAwaiter().GetResult();
+        return _mapper.ToUi(core, projectFilePath);
     }
 
     public void DeleteCheckpoint(ProjectHistoryEntry entry)
     {
-        var path = GetEntryPath(entry);
-        if (File.Exists(path))
-        {
-            File.Delete(path);
-        }
+        ArgumentNullException.ThrowIfNull(entry);
+        var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
+        _store.DeleteCheckpointAsync(path, entry.Id).GetAwaiter().GetResult();
     }
 
-    private string GetProjectDirectory(EditorProject project)
+    private string EnsureHistoryDocument(EditorProject project)
+    {
+        var path = GetHistoryPath(project);
+        if (!File.Exists(path))
+            _store.SaveAsync(path, _mapper.ToCore(project)).GetAwaiter().GetResult();
+        return path;
+    }
+
+    private string GetHistoryPath(EditorProject project)
         => string.IsNullOrWhiteSpace(project.FilePath)
-            ? GetLocalProjectDirectory(project.Id)
-            : Path.GetFullPath(project.FilePath) + ".history";
+            ? Path.Combine(_historyRoot, $"{project.Id:N}.history.kadr")
+            : Path.GetFullPath(project.FilePath);
 
-    private string GetLocalProjectDirectory(Guid projectId) => Path.Combine(_historyRoot, projectId.ToString("N"));
+    private static ProjectHistoryEntry ToEntry(
+        Guid id,
+        Guid projectId,
+        DateTimeOffset createdAt,
+        string message,
+        string storagePath)
+        => new()
+        {
+            Id = id,
+            ProjectId = projectId,
+            CreatedAt = createdAt,
+            Message = message,
+            StoragePath = storagePath
+        };
 
-    private string GetEntryPath(ProjectHistoryEntry entry)
-        => Path.Combine(
-            entry.StoragePath ?? GetLocalProjectDirectory(entry.ProjectId),
-            $"{entry.CreatedAt:yyyyMMdd-HHmmss-fff}-{entry.Id:N}.json");
-
-    private static void WriteCheckpoint(
-        ProjectHistoryEntry entry,
-        ProjectHistoryDocument document,
-        string directory)
-    {
-        entry.StoragePath = directory;
-        Directory.CreateDirectory(directory);
-        var path = Path.Combine(directory, $"{entry.CreatedAt:yyyyMMdd-HHmmss-fff}-{entry.Id:N}.json");
-        var temporaryPath = path + ".tmp";
-        File.WriteAllText(temporaryPath, JsonSerializer.Serialize(document, JsonOptions), new UTF8Encoding(false));
-        File.Move(temporaryPath, path, overwrite: true);
-    }
-
-    private sealed class ProjectHistoryDocument
-    {
-        public Guid Id { get; set; }
-        public Guid ProjectId { get; set; }
-        public DateTimeOffset CreatedAt { get; set; }
-        public string Message { get; set; } = string.Empty;
-        public string Snapshot { get; set; } = string.Empty;
-    }
+    private static string NormalizeMessage(string message)
+        => string.IsNullOrWhiteSpace(message) ? "Checkpoint" : message.Trim();
 }
 
 public sealed class ProjectHistoryEntry

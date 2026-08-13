@@ -1,79 +1,88 @@
-using System.Text;
+using KadrStudio.Adapters;
+using KadrStudio.Infrastructure.Storage;
 using KadrStudio.Models;
 
 namespace KadrStudio.Services;
 
+/// <summary>
+/// WPF persistence adapter. Project files and crash recovery always use the
+/// validated SQLite core. JSON remains private to the in-memory legacy UI undo
+/// bridge until all controls emit core edit commands directly.
+/// </summary>
 public sealed class ProjectService
 {
-    private readonly string _autosavePath;
-
-    public ProjectService()
-    {
-        var dataDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio");
-        Directory.CreateDirectory(dataDirectory);
-        _autosavePath = Path.Combine(dataDirectory, "autosave.kadr");
-    }
+    private readonly SqliteProjectStore _projectStore = new();
+    private readonly SqliteRecoveryStore _recoveryStore = new();
+    private readonly EditorProjectMapper _mapper = new();
+    private readonly Dictionary<Guid, long> _revisions = [];
+    private Guid? _pendingRecoveryId;
 
     public async Task SaveAsync(EditorProject project, string path, CancellationToken cancellationToken = default)
     {
-        project.UpdatedAt = DateTimeOffset.Now;
-        var json = ProjectJson.Serialize(project);
+        project.UpdatedAt = DateTimeOffset.UtcNow;
+        var revision = NextRevision(project.Id);
+        var core = _mapper.ToCore(project, revision);
         var fullPath = Path.GetFullPath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-
-        var temporaryPath = fullPath + ".tmp";
-        await File.WriteAllTextAsync(temporaryPath, json, new UTF8Encoding(false), cancellationToken);
-        File.Move(temporaryPath, fullPath, overwrite: true);
+        await _projectStore.SaveAsync(fullPath, core, cancellationToken).ConfigureAwait(false);
         project.FilePath = fullPath;
-        DeleteAutosave();
+        await _recoveryStore.DeleteAsync(project.Id, cancellationToken).ConfigureAwait(false);
+        if (_pendingRecoveryId == project.Id) _pendingRecoveryId = null;
     }
 
     public async Task<EditorProject> OpenAsync(string path, CancellationToken cancellationToken = default)
     {
-        var json = await File.ReadAllTextAsync(path, cancellationToken);
-        var project = ProjectJson.Deserialize(json);
-        if (project.FormatVersion > 1)
-        {
-            throw new InvalidDataException("Этот проект создан более новой версией Kadr Studio.");
-        }
-
-        project.FilePath = Path.GetFullPath(path);
-        foreach (var asset in project.Media)
-        {
-            asset.IsMissing = !File.Exists(asset.Path);
-        }
-
-        return project;
+        var fullPath = Path.GetFullPath(path);
+        var core = await _projectStore.LoadAsync(fullPath, cancellationToken).ConfigureAwait(false);
+        _revisions[core.Id] = core.Revision;
+        return _mapper.ToUi(core, fullPath);
     }
 
     public async Task SaveAutosaveAsync(EditorProject project, CancellationToken cancellationToken = default)
     {
-        var json = ProjectJson.Serialize(project);
-        await File.WriteAllTextAsync(_autosavePath, json, new UTF8Encoding(false), cancellationToken);
+        project.UpdatedAt = DateTimeOffset.UtcNow;
+        var core = _mapper.ToCore(project, NextRevision(project.Id));
+        await _recoveryStore.SaveAsync(core, "Automatic recovery after editing", cancellationToken).ConfigureAwait(false);
+        _pendingRecoveryId = project.Id;
     }
 
-    public bool AutosaveExists => File.Exists(_autosavePath);
+    public bool AutosaveExists
+    {
+        get
+        {
+            try
+            {
+                var recovery = _recoveryStore.ListAsync().GetAwaiter().GetResult().FirstOrDefault();
+                _pendingRecoveryId = recovery?.ProjectId;
+                return recovery is not null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     public async Task<EditorProject> OpenAutosaveAsync(CancellationToken cancellationToken = default)
     {
-        var json = await File.ReadAllTextAsync(_autosavePath, cancellationToken);
-        var project = ProjectJson.Deserialize(json);
-        project.FilePath = null;
-        foreach (var asset in project.Media)
+        var id = _pendingRecoveryId;
+        if (id is null)
         {
-            asset.IsMissing = !File.Exists(asset.Path);
+            var latest = (await _recoveryStore.ListAsync(cancellationToken).ConfigureAwait(false)).FirstOrDefault()
+                ?? throw new FileNotFoundException("No recovery project was found.");
+            id = latest.ProjectId;
         }
-        return project;
+        var core = await _recoveryStore.LoadAsync(id.Value, cancellationToken).ConfigureAwait(false)
+            ?? throw new FileNotFoundException("The recovery project no longer exists.");
+        _revisions[core.Id] = core.Revision;
+        _pendingRecoveryId = core.Id;
+        return _mapper.ToUi(core);
     }
 
     public void DeleteAutosave()
     {
-        if (File.Exists(_autosavePath))
-        {
-            File.Delete(_autosavePath);
-        }
+        if (_pendingRecoveryId is not { } projectId) return;
+        try { _recoveryStore.DeleteAsync(projectId).GetAwaiter().GetResult(); } catch { }
+        _pendingRecoveryId = null;
     }
 
     public string CreateSnapshot(EditorProject project) => ProjectJson.Serialize(project);
@@ -83,5 +92,12 @@ public sealed class ProjectService
         var project = ProjectJson.Deserialize(snapshot);
         project.FilePath = filePath;
         return project;
+    }
+
+    private long NextRevision(Guid projectId)
+    {
+        var next = _revisions.TryGetValue(projectId, out var revision) ? checked(revision + 1) : 1;
+        _revisions[projectId] = next;
+        return next;
     }
 }

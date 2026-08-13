@@ -24,7 +24,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="NAudio" Version="2.2.1" />
     <ProjectReference Include="..\Kadr.Application\KadrStudio.Application.csproj" />
     <ProjectReference Include="..\Kadr.Core\KadrStudio.Core.csproj" />
     <ProjectReference Include="..\Kadr.Infrastructure\KadrStudio.Infrastructure.csproj" />

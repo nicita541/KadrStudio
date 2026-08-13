@@ -98,6 +98,47 @@ public sealed class MediaHostIntegrationTests
         finally { DeleteRoot(root); }
     }
 
+    [Fact(Timeout = 60_000)]
+    public async Task Empty_video_gap_emits_real_black_frame_instead_of_stale_content()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var source = Path.Combine(root, "gap-source.mp4");
+            var create = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=s=320x240:r=24:d=2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", source
+            ]);
+            Assert.Equal(0, create.ExitCode);
+            var project = CreateProject(source);
+            var clip = project.MediaClips.Single();
+            project = project with
+            {
+                MediaClips = [clip with { Start = TimelineTime.FromSeconds(1), Duration = TimelineTime.FromSeconds(2) }]
+            };
+            var plan = new RenderPlanBuilder().Build(project);
+            await using var client = new MediaHostClient(ResolveMediaHost(), locator.FfmpegPath);
+            var pending = NextFrame(client);
+
+            await client.PrepareAsync(plan, new PreviewRequest(
+                TimelineTime.Zero, new FrameRate(24), 320, 240, false, new PreviewGeneration(17, 0, 0)));
+            var frame = await pending.WaitAsync(TimeSpan.FromSeconds(15));
+
+            Assert.Equal(17, frame.Generation);
+            for (var index = 0; index < frame.Bgra.Length; index += 4)
+            {
+                Assert.Equal(0, frame.Bgra.Span[index]);
+                Assert.Equal(0, frame.Bgra.Span[index + 1]);
+                Assert.Equal(0, frame.Bgra.Span[index + 2]);
+            }
+        }
+        finally { DeleteRoot(root); }
+    }
+
     private static ProjectState CreateProject(string sourcePath)
     {
         var project = ProjectState.CreateNew("MediaHost", new FrameRate(24)) with

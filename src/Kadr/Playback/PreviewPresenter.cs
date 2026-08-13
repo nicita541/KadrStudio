@@ -6,6 +6,7 @@ using KadrStudio.Application.Preview;
 using KadrStudio.Core.Domain;
 using KadrStudio.Models;
 using KadrStudio.Services;
+using KadrStudio.Application.Caching;
 
 namespace KadrStudio.Playback;
 
@@ -30,13 +31,14 @@ public sealed class PreviewPresenter : IAsyncDisposable
     private bool _disposed;
 
     public PreviewPresenter(Image image, FrameworkElement emptyState, FfmpegLocator locator,
-        TimelineRenderCoordinator coordinator)
+        TimelineRenderCoordinator coordinator,
+        IArtifactStore? artifacts = null)
     {
         _image = image;
         _emptyState = emptyState;
         _coordinator = coordinator;
         _engine = new PreviewFrameServer(locator.FfmpegPath, coordinator);
-        _proxies = new PreviewProxyStore(locator);
+        _proxies = new PreviewProxyStore(locator, artifacts);
         _engine.FramePresented += Engine_FramePresented;
         _engine.AudioMeterUpdated += Engine_AudioMeterUpdated;
         _engine.Failed += Engine_Failed;

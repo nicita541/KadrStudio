@@ -111,8 +111,9 @@ public sealed class MediaPipelineIntegrationTests
             ]);
             Assert.Equal(0, create.ExitCode);
             var asset = await new MediaProbeService(locator, new ProcessRunner()).ProbeAsync(source);
-            await new TimelineMediaCacheService(locator, new ProcessRunner(), Path.Combine(root, "timeline-cache"))
-                .PrepareAsync(asset);
+            await using var timelineCache = new TimelineMediaCacheService(
+                locator, new ProcessRunner(), Path.Combine(root, "timeline-cache"));
+            await timelineCache.PrepareAsync(asset);
 
             Assert.False(asset.Waveform.IsEmpty);
             var basePeaks = asset.Waveform.Levels[0].Peaks;

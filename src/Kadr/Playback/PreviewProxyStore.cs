@@ -1,10 +1,9 @@
 using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
+using KadrStudio.Application.Caching;
 using KadrStudio.Application.Rendering;
+using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Models;
 using KadrStudio.Services;
 
@@ -12,8 +11,9 @@ namespace KadrStudio.Playback;
 
 public sealed class PreviewProxyStore : IAsyncDisposable
 {
-    private const long DefaultDiskLimit = 4L * 1024 * 1024 * 1024;
     private readonly FfmpegLocator _locator;
+    private readonly IArtifactStore _artifacts;
+    private readonly bool _ownsArtifacts;
     private readonly ProcessRunner _runner = new();
     private readonly ConcurrentDictionary<Guid, string> _validated = [];
     private readonly ConcurrentDictionary<Guid, Task> _jobs = [];
@@ -21,27 +21,28 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     private readonly ConcurrentBag<CancellationTokenSource> _retiredGenerations = [];
     private readonly SemaphoreSlim _encoderGate = new(1, 1);
     private CancellationTokenSource _generation = new();
-    private string _root = string.Empty;
     private Guid _projectId;
     private bool _disposed;
 
-    public PreviewProxyStore(FfmpegLocator locator) => _locator = locator;
+    public PreviewProxyStore(FfmpegLocator locator, IArtifactStore? artifacts = null)
+    {
+        _locator = locator;
+        _ownsArtifacts = artifacts is null;
+        _artifacts = artifacts ?? new DiskMediaArtifactCache(ThumbnailService.DefaultArtifactRoot());
+    }
 
     public event EventHandler<Guid>? ProxyReady;
 
     public void Configure(EditorProject project)
     {
         ArgumentNullException.ThrowIfNull(project);
-        var desiredRoot = Path.GetFullPath(ResolveRoot(project));
-        if (_projectId == project.Id && string.Equals(_root, desiredRoot, StringComparison.OrdinalIgnoreCase)) return;
+        if (_projectId == project.Id) return;
         _generation.Cancel();
         _retiredGenerations.Add(_generation);
         _generation = new CancellationTokenSource();
         _validated.Clear();
         _jobs.Clear();
         _projectId = project.Id;
-        _root = desiredRoot;
-        Directory.CreateDirectory(_root);
     }
 
     public RenderPlan UseAvailable(RenderPlan plan)
@@ -62,7 +63,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         {
             _jobs.GetOrAdd(asset.Id, _ =>
             {
-                var job = BuildOrValidateAsync(asset, project.FrameRateValue, _projectId, _root, _generation.Token);
+                var job = BuildOrValidateAsync(asset, project.FrameRateValue, _projectId, _generation.Token);
                 _allJobs.Add(job);
                 return job;
             });
@@ -87,24 +88,27 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         _generation.Dispose();
         foreach (var generation in _retiredGenerations) generation.Dispose();
         _encoderGate.Dispose();
+        if (_ownsArtifacts) await _artifacts.DisposeAsync().ConfigureAwait(false);
     }
 
-    private async Task BuildOrValidateAsync(MediaAsset asset, KadrStudio.Core.Domain.FrameRate frameRate, Guid projectId, string root, CancellationToken token)
+    private async Task BuildOrValidateAsync(
+        MediaAsset asset,
+        KadrStudio.Core.Domain.FrameRate frameRate,
+        Guid projectId,
+        CancellationToken token)
     {
         var lockTaken = false;
         try
         {
             await _encoderGate.WaitAsync(token).ConfigureAwait(false);
             lockTaken = true;
-            var fingerprint = Fingerprint(asset);
-            var hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{fingerprint}|{frameRate}|proxy-v1")));
-            var path = ResolveInsideRoot(root, Path.Combine(root, $"{asset.Id:N}-{hash}.mp4"));
-            var metadataPath = path + ".json";
-            if (!await IsValidAsync(path, metadataPath, fingerprint, token).ConfigureAwait(false))
+            var key = ThumbnailService.Key(asset, MediaArtifactKind.ProxyVideo, 0,
+                ((long)frameRate.Numerator << 32) | (uint)frameRate.Denominator, 2);
+            var path = await _artifacts.TryGetPayloadPathAsync(key, ".mp4", token).ConfigureAwait(false);
+            if (path is null || !await ProbeVideoAsync(path, token).ConfigureAwait(false))
             {
-                TryDelete(path);
-                TryDelete(metadataPath);
-                var temporary = path + $".{Guid.NewGuid():N}.tmp.mp4";
+                var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.mp4");
+                Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
                 try
                 {
                     var result = await _runner.RunAsync(_locator.FfmpegPath,
@@ -119,9 +123,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
                     ], cancellationToken: token).ConfigureAwait(false);
                     if (result.ExitCode != 0 || !await ProbeVideoAsync(temporary, token).ConfigureAwait(false))
                         throw new InvalidDataException($"FFmpeg proxy failed: {result.StandardError}");
-                    File.Move(temporary, path, overwrite: true);
-                    var metadata = new ProxyMetadata(1, fingerprint, new FileInfo(path).Length);
-                    await File.WriteAllTextAsync(metadataPath, JsonSerializer.Serialize(metadata), token).ConfigureAwait(false);
+                    path = await _artifacts.PutFileAsync(key, temporary, ".mp4", token).ConfigureAwait(false);
                 }
                 finally { TryDelete(temporary); }
             }
@@ -129,7 +131,6 @@ public sealed class PreviewProxyStore : IAsyncDisposable
             if (_projectId == projectId)
             {
                 _validated[asset.Id] = path;
-                await TrimAsync(root, DefaultDiskLimit, token).ConfigureAwait(false);
                 ProxyReady?.Invoke(this, asset.Id);
             }
         }
@@ -144,18 +145,6 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         }
     }
 
-    private async Task<bool> IsValidAsync(string path, string metadataPath, string fingerprint, CancellationToken token)
-    {
-        if (!File.Exists(path) || !File.Exists(metadataPath) || new FileInfo(path).Length < 1024) return false;
-        try
-        {
-            var metadata = JsonSerializer.Deserialize<ProxyMetadata>(await File.ReadAllTextAsync(metadataPath, token).ConfigureAwait(false));
-            return metadata is { Version: 1 } && metadata.SourceFingerprint == fingerprint &&
-                   metadata.Length == new FileInfo(path).Length && await ProbeVideoAsync(path, token).ConfigureAwait(false);
-        }
-        catch { return false; }
-    }
-
     private async Task<bool> ProbeVideoAsync(string path, CancellationToken token)
     {
         var result = await _runner.RunAsync(_locator.FfprobePath,
@@ -164,50 +153,6 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         return result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StandardOutput) && result.StandardOutput.Contains("video", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task TrimAsync(string root, long limit, CancellationToken token)
-    {
-        var files = Directory.EnumerateFiles(root, "*.mp4").Select(path => new FileInfo(path))
-            .OrderBy(file => file.LastAccessTimeUtc).ToArray();
-        var total = files.Sum(file => file.Length);
-        foreach (var file in files)
-        {
-            token.ThrowIfCancellationRequested();
-            if (total <= limit) break;
-            total -= file.Length;
-            TryDelete(file.FullName);
-            TryDelete(file.FullName + ".json");
-            foreach (var entry in _validated.Where(entry =>
-                         string.Equals(entry.Value, file.FullName, StringComparison.OrdinalIgnoreCase)).ToArray())
-                _validated.TryRemove(entry.Key, out _);
-            await Task.Yield();
-        }
-    }
-
-    private static string ResolveRoot(EditorProject project)
-    {
-        if (!string.IsNullOrWhiteSpace(project.FilePath))
-            return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(project.FilePath))!, ".kadr-cache", "proxies");
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio", "Cache", "Projects", project.Id.ToString("N"), "proxies");
-    }
-
-    private static string ResolveInsideRoot(string configuredRoot, string path)
-    {
-        var root = Path.GetFullPath(configuredRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var full = Path.GetFullPath(path);
-        if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Proxy path escaped the configured cache root.");
-        return full;
-    }
-
-    private static string Fingerprint(MediaAsset asset)
-    {
-        long ticks;
-        try { ticks = File.GetLastWriteTimeUtc(asset.Path).Ticks; } catch { ticks = 0; }
-        return $"{asset.FileSizeBytes:x}-{ticks:x}-{asset.Width}x{asset.Height}-{asset.Duration:0.###}";
-    }
-
     private static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
-    private sealed record ProxyMetadata(int Version, string SourceFingerprint, long Length);
 }

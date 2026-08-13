@@ -4,11 +4,12 @@ using KadrStudio.Application.Caching;
 
 namespace KadrStudio.Infrastructure.Caching;
 
-public sealed class DiskMediaArtifactCache : IMediaArtifactCache
+public sealed class DiskMediaArtifactCache : IArtifactStore
 {
     private static ReadOnlySpan<byte> Magic => "KADRCACH"u8;
     private const int HeaderSize = 8 + sizeof(int) + sizeof(int) + 32;
-    private readonly string _root;
+    private string _root;
+    private ArtifactStoreOptions _options;
     private readonly long _memoryLimitBytes;
     private readonly object _memoryGate = new();
     private readonly Dictionary<MediaCacheKey, MemoryEntry> _memory = [];
@@ -18,13 +19,19 @@ public sealed class DiskMediaArtifactCache : IMediaArtifactCache
     private bool _disposed;
 
     public DiskMediaArtifactCache(string root, long memoryLimitBytes = 128L * 1024 * 1024)
+        : this(new ArtifactStoreOptions(root, MemoryBudgetBytes: memoryLimitBytes))
     {
-        if (string.IsNullOrWhiteSpace(root)) throw new ArgumentException("A cache root is required.", nameof(root));
-        if (memoryLimitBytes < 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(memoryLimitBytes));
-        _root = Path.GetFullPath(root);
-        _memoryLimitBytes = memoryLimitBytes;
+    }
+
+    public DiskMediaArtifactCache(ArtifactStoreOptions options)
+    {
+        _options = options.Normalize();
+        _root = _options.Root;
+        _memoryLimitBytes = _options.MemoryBudgetBytes;
         Directory.CreateDirectory(_root);
     }
+
+    public ArtifactStoreOptions Options => _options;
 
     public async ValueTask<ReadOnlyMemory<byte>?> TryGetAsync(
         MediaCacheKey key,
@@ -106,6 +113,125 @@ public sealed class DiskMediaArtifactCache : IMediaArtifactCache
             TryDelete(temporary);
             _diskGate.Release();
         }
+        await TrimAsync(_options.DiskBudgetBytes, cancellationToken).ConfigureAwait(false);
+    }
+
+    public string GetPayloadPath(MediaCacheKey key, string extension)
+    {
+        ThrowIfDisposed();
+        ValidateKey(key);
+        var normalizedExtension = NormalizeExtension(extension);
+        return ResolveInsideRoot(Path.Combine(
+            _root, key.SourceId.ToString("N"), key.Kind.ToString(), $"v{key.FormatVersion}",
+            $"l{key.Level}", $"{key.Segment:D12}-{key.StableHash}{normalizedExtension}"));
+    }
+
+    public async Task<string?> TryGetPayloadPathAsync(
+        MediaCacheKey key,
+        string extension,
+        CancellationToken cancellationToken = default)
+    {
+        var path = GetPayloadPath(key, extension);
+        var checksumPath = path + ".sha256";
+        await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(path) || !File.Exists(checksumPath)) return null;
+            var expected = (await File.ReadAllTextAsync(checksumPath, cancellationToken).ConfigureAwait(false)).Trim();
+            string actual;
+            await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                actual = Convert.ToHexStringLower(
+                    await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
+            if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
+            {
+                TryDelete(path);
+                TryDelete(checksumPath);
+                return null;
+            }
+            TryTouch(path);
+            TryTouch(checksumPath);
+            return path;
+        }
+        finally { _diskGate.Release(); }
+    }
+
+    public async Task<string> PutFileAsync(
+        MediaCacheKey key,
+        string sourcePath,
+        string extension,
+        CancellationToken cancellationToken = default)
+    {
+        var destination = GetPayloadPath(key, extension);
+        var directory = Path.GetDirectoryName(destination)!;
+        Directory.CreateDirectory(directory);
+        var temporary = destination + $".{Guid.NewGuid():N}.tmp";
+        await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await using (var input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                             128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            {
+                await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                output.Flush(true);
+            }
+            string checksum;
+            await using (var verify = new FileStream(temporary, FileMode.Open, FileAccess.Read, FileShare.Read,
+                             128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                checksum = Convert.ToHexStringLower(
+                    await SHA256.HashDataAsync(verify, cancellationToken).ConfigureAwait(false));
+            File.Move(temporary, destination, overwrite: true);
+            await File.WriteAllTextAsync(destination + ".sha256", checksum, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            TryDelete(temporary);
+            _diskGate.Release();
+        }
+        await TrimAsync(_options.DiskBudgetBytes, cancellationToken).ConfigureAwait(false);
+        return destination;
+    }
+
+    public async Task MoveAsync(string newRoot, CancellationToken cancellationToken = default)
+    {
+        var destination = Path.GetFullPath(newRoot);
+        if (destination.Equals(_root, StringComparison.OrdinalIgnoreCase)) return;
+        Directory.CreateDirectory(destination);
+        await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            foreach (var source in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var relative = Path.GetRelativePath(_root, source);
+                var target = Path.Combine(destination, relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.Copy(source, target, overwrite: true);
+            }
+            _root = destination;
+            _options = _options with { Root = destination };
+        }
+        finally { _diskGate.Release(); }
+    }
+
+    public async Task ClearAsync(CancellationToken cancellationToken = default)
+    {
+        await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (Directory.Exists(_root)) Directory.Delete(_root, true);
+            Directory.CreateDirectory(_root);
+            lock (_memoryGate)
+            {
+                _memory.Clear();
+                _lru.Clear();
+                _memoryBytes = 0;
+            }
+        }
+        finally { _diskGate.Release(); }
     }
 
     public async Task InvalidateSourceAsync(Guid sourceId, CancellationToken cancellationToken = default)
@@ -148,6 +274,7 @@ public sealed class DiskMediaArtifactCache : IMediaArtifactCache
                 if (total <= targetDiskBytes) break;
                 var length = file.Length;
                 TryDelete(file.FullName);
+                TryDelete(file.FullName + ".sha256");
                 total -= length;
             }
         }
@@ -208,7 +335,9 @@ public sealed class DiskMediaArtifactCache : IMediaArtifactCache
     private IEnumerable<FileInfo> EnumerateArtifacts()
     {
         if (!Directory.Exists(_root)) return [];
-        return Directory.EnumerateFiles(_root, "*.cache", SearchOption.AllDirectories).Select(path => new FileInfo(path));
+        return Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories)
+            .Where(path => !path.EndsWith(".sha256", StringComparison.OrdinalIgnoreCase))
+            .Select(path => new FileInfo(path));
     }
 
     private void AddMemory(MediaCacheKey key, byte[] payload)
@@ -266,6 +395,15 @@ public sealed class DiskMediaArtifactCache : IMediaArtifactCache
         if (key.SourceId == Guid.Empty || string.IsNullOrWhiteSpace(key.SourceFingerprint) ||
             key.Level < 0 || key.Segment < 0 || key.FormatVersion < 1)
             throw new ArgumentException("The media cache key is invalid.", nameof(key));
+    }
+
+    private static string NormalizeExtension(string extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension)) throw new ArgumentException("A payload extension is required.", nameof(extension));
+        var value = extension.StartsWith('.') ? extension : "." + extension;
+        if (value.Any(character => !char.IsLetterOrDigit(character) && character != '.'))
+            throw new ArgumentException("The payload extension is invalid.", nameof(extension));
+        return value.ToLowerInvariant();
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

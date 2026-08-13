@@ -1,12 +1,25 @@
+using KadrStudio.Application.Caching;
+using KadrStudio.Infrastructure.Caching;
+using KadrStudio.Models;
 using System.Security.Cryptography;
 using System.Text;
-using KadrStudio.Models;
 
 namespace KadrStudio.Services;
 
-public sealed class ThumbnailService(FfmpegLocator locator, ProcessRunner processRunner)
+public sealed class ThumbnailService : IAsyncDisposable
 {
-    private readonly string _cacheDirectory = CreateCacheDirectory("Thumbnails");
+    private readonly FfmpegLocator _locator;
+    private readonly ProcessRunner _processRunner;
+    private readonly IArtifactStore _artifacts;
+    private readonly bool _ownsArtifacts;
+
+    public ThumbnailService(FfmpegLocator locator, ProcessRunner processRunner, IArtifactStore? artifacts = null)
+    {
+        _locator = locator;
+        _processRunner = processRunner;
+        _ownsArtifacts = artifacts is null;
+        _artifacts = artifacts ?? new DiskMediaArtifactCache(DefaultArtifactRoot());
+    }
 
     public async Task<string?> CreateAsync(MediaAsset asset, CancellationToken cancellationToken = default)
     {
@@ -20,16 +33,18 @@ public sealed class ThumbnailService(FfmpegLocator locator, ProcessRunner proces
             return null;
         }
 
-        locator.EnsureAvailable();
-        var outputPath = Path.Combine(_cacheDirectory, BuildCacheKey(asset.Path) + ".jpg");
-        if (File.Exists(outputPath))
-        {
-            return outputPath;
-        }
+        _locator.EnsureAvailable();
+        var key = Key(asset, MediaArtifactKind.Thumbnail, 0, 0, 2);
+        var cached = await _artifacts.TryGetPayloadPathAsync(key, ".jpg", cancellationToken);
+        if (cached is not null) return cached;
 
         var seek = Math.Min(5, Math.Max(0, asset.Duration * 0.12));
-        var result = await processRunner.RunAsync(
-            locator.FfmpegPath,
+        var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.jpg");
+        Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
+        try
+        {
+            var result = await _processRunner.RunAsync(
+            _locator.FfmpegPath,
             [
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", FormattableString.Invariant($"{seek:0.###}"),
@@ -37,11 +52,14 @@ public sealed class ThumbnailService(FfmpegLocator locator, ProcessRunner proces
                 "-frames:v", "1",
                 "-vf", "scale=360:-2:force_original_aspect_ratio=decrease",
                 "-q:v", "3",
-                outputPath
+                temporary
             ],
             cancellationToken: cancellationToken);
-
-        return result.ExitCode == 0 && File.Exists(outputPath) ? outputPath : null;
+            return result.ExitCode == 0 && File.Exists(temporary)
+                ? await _artifacts.PutFileAsync(key, temporary, ".jpg", cancellationToken)
+                : null;
+        }
+        finally { TryDelete(temporary); }
     }
 
     internal static string BuildCacheKey(string path)
@@ -61,5 +79,24 @@ public sealed class ThumbnailService(FfmpegLocator locator, ProcessRunner proces
         Directory.CreateDirectory(path);
         return path;
     }
-}
 
+    internal static MediaCacheKey Key(
+        MediaAsset asset,
+        MediaArtifactKind kind,
+        int level,
+        long segment,
+        int formatVersion)
+    {
+        var fingerprint = asset.ProbeResult?.Fingerprint.FastHash;
+        if (string.IsNullOrWhiteSpace(fingerprint)) fingerprint = BuildCacheKey(asset.Path);
+        return new MediaCacheKey(asset.Id, fingerprint, kind, level, segment, formatVersion);
+    }
+
+    internal static string DefaultArtifactRoot() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Kadr Studio", "Artifacts");
+
+    private static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
+
+    public ValueTask DisposeAsync() => _ownsArtifacts ? _artifacts.DisposeAsync() : ValueTask.CompletedTask;
+}

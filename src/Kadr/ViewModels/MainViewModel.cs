@@ -7,6 +7,8 @@ using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Media;
 using KadrStudio.Infrastructure.Media;
+using KadrStudio.Application.Caching;
+using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Models;
 using KadrStudio.Services;
 
@@ -23,6 +25,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private readonly AutomationProposalApplier _automationProposalApplier = new();
     private readonly AutomationProposalValidator _automationProposalValidator = new();
     private readonly IMediaRegistry _mediaRegistry;
+    private readonly IArtifactStore _artifactStore;
     private EditorSession _editorSession;
     private readonly List<TimelineClip> _subscribedClips = new();
     private readonly List<TextOverlay> _subscribedTextOverlays = new();
@@ -49,11 +52,14 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         _project = EditorProject.CreateNew();
         _editorSession = new EditorSession(_projectMapper.ToCore(_project));
+        _artifactStore = new DiskMediaArtifactCache(new ArtifactStoreOptions(
+            ThumbnailService.DefaultArtifactRoot(), 8L * 1024 * 1024 * 1024));
         MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
         _mediaRegistry = new MediaRegistry(MediaProbeService);
-        ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner);
+        ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner, _artifactStore);
         _renderCoordinator = new TimelineRenderCoordinator(_ffmpegLocator);
-        TimelineMediaCacheService = new TimelineMediaCacheService(_ffmpegLocator, _processRunner);
+        TimelineMediaCacheService = new TimelineMediaCacheService(
+            _ffmpegLocator, _processRunner, artifacts: _artifactStore);
         ExportService = new ExportService(_ffmpegLocator, _processRunner, _renderCoordinator);
         ProjectHistoryService = new ProjectHistoryService();
         AutoSubtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
@@ -76,6 +82,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public VideoAnalysisService VideoAnalysisService { get; }
     public OllamaVideoAnalysisService OllamaVideoAnalysisService { get; }
     public AutomationOrchestrator AutomationOrchestrator { get; }
+    public IArtifactStore ArtifactStore => _artifactStore;
 
     public EditorProject Project
     {
@@ -874,7 +881,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _autosaveCancellation?.Cancel();
         _autosaveCancellation?.Dispose();
         await _automationScheduler.DisposeAsync();
+        await ThumbnailService.DisposeAsync();
+        await TimelineMediaCacheService.DisposeAsync();
         await _renderCoordinator.DisposeAsync();
+        await _artifactStore.DisposeAsync();
         OllamaVideoAnalysisService.Dispose();
         DetachProject(Project);
     }

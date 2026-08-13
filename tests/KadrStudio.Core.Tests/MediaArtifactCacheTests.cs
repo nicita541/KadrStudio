@@ -55,6 +55,40 @@ public sealed class MediaArtifactCacheTests
     }
 
     [Fact]
+    public async Task Direct_payload_is_checksum_verified_and_corruption_is_rejected()
+    {
+        using var directory = new TemporaryCacheDirectory();
+        await using var store = new DiskMediaArtifactCache(new ArtifactStoreOptions(
+            directory.Path, 16 * 1024 * 1024, 1024 * 1024));
+        var source = Path.Combine(directory.Path, "source.mp4");
+        await File.WriteAllBytesAsync(source, Enumerable.Range(0, 4096).Select(item => (byte)item).ToArray());
+        var key = new MediaCacheKey(Guid.NewGuid(), "fingerprint", MediaArtifactKind.ProxyVideo, 0, 0, 2);
+        var path = await store.PutFileAsync(key, source, ".mp4");
+
+        Assert.Equal(path, await store.TryGetPayloadPathAsync(key, ".mp4"));
+        await File.WriteAllBytesAsync(path, [9, 9, 9]);
+
+        Assert.Null(await store.TryGetPayloadPathAsync(key, ".mp4"));
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public async Task Artifact_store_can_move_to_user_selected_root()
+    {
+        using var directory = new TemporaryCacheDirectory();
+        var original = Path.Combine(directory.Path, "original");
+        var destination = Path.Combine(directory.Path, "moved");
+        await using var store = new DiskMediaArtifactCache(original, 1024 * 1024);
+        var key = Key(Guid.NewGuid(), 1);
+        await store.PutAsync(key, new byte[] { 1, 2, 3 });
+
+        await store.MoveAsync(destination);
+
+        Assert.Equal(Path.GetFullPath(destination), store.Options.Root);
+        Assert.Equal(new byte[] { 1, 2, 3 }, (await store.TryGetAsync(key))!.Value.ToArray());
+    }
+
+    [Fact]
     public void Pyramid_increases_detail_as_visible_range_narrows()
     {
         var pyramid = new MediaPyramid(TimelineTime.FromSeconds(3600), targetBuckets: 100);

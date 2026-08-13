@@ -61,7 +61,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _viewModel = new MainViewModel();
         _previewPresenter = new PreviewPresenter(PreviewImage, EmptyPreview,
-            new FfmpegLocator(), _viewModel.RenderCoordinator);
+            new FfmpegLocator(), _viewModel.RenderCoordinator, _viewModel.ArtifactStore);
         _previewPresenter.Failed += (_, exception) =>
             Dispatcher.BeginInvoke(() => _viewModel.StatusText = $"Предпросмотр: {exception.Message}");
         _previewPresenter.AudioMeterUpdated += (_, level) => Dispatcher.BeginInvoke(() =>

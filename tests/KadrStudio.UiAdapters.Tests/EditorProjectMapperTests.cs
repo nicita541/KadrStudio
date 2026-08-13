@@ -2,6 +2,7 @@ using KadrStudio.Adapters;
 using KadrStudio.Models;
 using KadrStudio.Services;
 using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
+using CoreFrameRate = KadrStudio.Core.Domain.FrameRate;
 using UiTrackKind = KadrStudio.Models.TrackKind;
 
 namespace KadrStudio.UiAdapters.Tests;
@@ -46,6 +47,44 @@ public sealed class EditorProjectMapperTests
         Assert.Equal("Line 1\nLine 2", restored.TextOverlays[0].Text);
         Assert.Equal("F:\\project.kadr", restored.FilePath);
         Assert.Equal(0.8, restored.Clips.Single(item => item.Track == UiTrackKind.Audio).Volume);
+    }
+
+    [Theory]
+    [InlineData(24000, 1001)]
+    [InlineData(30000, 1001)]
+    [InlineData(60000, 1001)]
+    public void Adapter_preserves_exact_fractional_sequence_timebase(int numerator, int denominator)
+    {
+        var project = EditorProject.CreateNew();
+        project.FrameRateValue = new CoreFrameRate(numerator, denominator);
+        var mapper = new EditorProjectMapper();
+
+        var restored = mapper.ToUi(mapper.ToCore(project));
+
+        Assert.Equal(new CoreFrameRate(numerator, denominator), restored.FrameRateValue);
+    }
+
+    [Fact]
+    public void Adapter_preserves_track_identity_order_names_and_flags()
+    {
+        var id = Guid.NewGuid();
+        var project = KadrStudio.Core.Domain.ProjectState.CreateNew("tracks") with
+        {
+            Tracks =
+            [
+                new(id, CoreTrackKind.Visual, 0, "Main picture", IsMuted: true, IsLocked: true, IsVisible: false),
+                new(Guid.NewGuid(), CoreTrackKind.Visual, 1, "Overlay"),
+                new(Guid.NewGuid(), CoreTrackKind.Audio, 0, "Dialogue", IsMuted: true),
+                new(Guid.NewGuid(), CoreTrackKind.Audio, 1, "Music", IsLocked: true),
+                new(Guid.NewGuid(), CoreTrackKind.Text, 0, "Subtitles", IsVisible: false)
+            ]
+        };
+        var mapper = new EditorProjectMapper();
+
+        var restored = mapper.ToCore(mapper.ToUi(project));
+
+        Assert.Equal(project.Tracks.ToArray(), restored.Tracks.ToArray());
+        Assert.Equal(id, restored.Tracks[0].Id);
     }
 
     [Fact]

@@ -28,6 +28,7 @@ public sealed class PreviewFrameServer(
     private Task? _presentationTask;
     private Task? _audioTask;
     private Channel<VideoFrame>? _videoFrames;
+    private readonly StereoPcmMeter _audioMeter = new();
     private VideoFrame? _lastFrame;
     private readonly Stopwatch _fallbackClock = new();
     private TimelineTime _position;
@@ -39,6 +40,7 @@ public sealed class PreviewFrameServer(
     public VideoFrame? LastFrame => _lastFrame;
     public event EventHandler<PreviewState>? StateChanged;
     public event EventHandler<VideoFrame>? FramePresented;
+    public event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
     public event EventHandler<Exception>? Failed;
 
     public async Task PrepareAsync(RenderPlan plan, PreviewRequest request, CancellationToken cancellationToken = default)
@@ -316,6 +318,12 @@ public sealed class PreviewFrameServer(
                 while (audioBuffer.BufferedDuration > TimeSpan.FromSeconds(1.5))
                     await Task.Delay(10, token).ConfigureAwait(false);
                 audioBuffer.AddSamples(buffer, 0, read);
+                var complete = read - read % (sizeof(float) * 2);
+                if (complete > 0)
+                {
+                    var samples = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(buffer.AsSpan(0, complete));
+                    AudioMeterUpdated?.Invoke(this, _audioMeter.Measure(samples));
+                }
             }
         }
         catch (OperationCanceledException) { }

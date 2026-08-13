@@ -64,6 +64,11 @@ public partial class MainWindow : Window
             new FfmpegLocator(), _viewModel.RenderCoordinator);
         _previewPresenter.Failed += (_, exception) =>
             Dispatcher.BeginInvoke(() => _viewModel.StatusText = $"Предпросмотр: {exception.Message}");
+        _previewPresenter.AudioMeterUpdated += (_, level) => Dispatcher.BeginInvoke(() =>
+        {
+            AudioLeftMeter.Value = level.LeftPeak;
+            AudioRightMeter.Value = level.RightPeak;
+        });
         _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
         DataContext = _viewModel;
         LocalAiModelComboBox.ItemsSource = _localAiModels;
@@ -467,10 +472,10 @@ public partial class MainWindow : Window
     }
 
     private void PreviousFrame_Click(object sender, RoutedEventArgs e)
-        => SeekTo(_viewModel.Playhead - 1.0 / Math.Max(1, _viewModel.Project.FrameRate));
+        => SeekTo(_viewModel.Playhead - 1.0 / Math.Max(1, _viewModel.Project.FrameRateValue.FramesPerSecond));
 
     private void NextFrame_Click(object sender, RoutedEventArgs e)
-        => SeekTo(_viewModel.Playhead + 1.0 / Math.Max(1, _viewModel.Project.FrameRate));
+        => SeekTo(_viewModel.Playhead + 1.0 / Math.Max(1, _viewModel.Project.FrameRateValue.FramesPerSecond));
 
     private void ZoomIn_Click(object sender, RoutedEventArgs e) => TimelineEditor.PixelsPerSecond *= 1.2;
     private void ZoomOut_Click(object sender, RoutedEventArgs e)
@@ -1370,7 +1375,6 @@ public partial class MainWindow : Window
         _viewModel.Playhead = next;
         TimelineEditor.PlayheadSeconds = next;
         UpdatePreviewAt(next, forceSeek: false);
-        UpdateAudioMeters(FindActiveClip(TrackKind.Audio, next));
         KeepPlayheadVisible(next);
     }
 
@@ -1750,10 +1754,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var pulse = 0.72 + Math.Abs(Math.Sin(_playbackClock.Elapsed.TotalSeconds * 7.3)) * 0.25;
-        var level = Math.Clamp(clip.Volume, 0, 1) * pulse;
-        AudioLeftMeter.Value = level * (clip.Pan > 0 ? 1 - clip.Pan : 1);
-        AudioRightMeter.Value = level * (clip.Pan < 0 ? 1 + clip.Pan : 1);
+        // Values are updated from the exact mixed PCM emitted by PreviewFrameServer.
     }
 
     private void KeepPlayheadVisible(double seconds)
@@ -1951,12 +1952,12 @@ public partial class MainWindow : Window
         }
         else if (e.Key == Key.Left)
         {
-            SeekTo(_viewModel.Playhead - (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 1 : 1.0 / _viewModel.Project.FrameRate));
+            SeekTo(_viewModel.Playhead - (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 1 : 1.0 / _viewModel.Project.FrameRateValue.FramesPerSecond));
             e.Handled = true;
         }
         else if (e.Key == Key.Right)
         {
-            SeekTo(_viewModel.Playhead + (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 1 : 1.0 / _viewModel.Project.FrameRate));
+            SeekTo(_viewModel.Playhead + (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 1 : 1.0 / _viewModel.Project.FrameRateValue.FramesPerSecond));
             e.Handled = true;
         }
         else if (e.Key == Key.S && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))

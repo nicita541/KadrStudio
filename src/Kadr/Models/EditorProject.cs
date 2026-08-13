@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Text.Json.Serialization;
+using KadrStudio.Core.Domain;
 using KadrStudio.ViewModels;
 
 namespace KadrStudio.Models;
@@ -9,7 +10,8 @@ public sealed class EditorProject : ObservableObject
     private string _name = "Новый проект";
     private int _canvasWidth = 1920;
     private int _canvasHeight = 1080;
-    private int _frameRate = 30;
+    private int _frameRateNumerator = 30;
+    private int _frameRateDenominator = 1;
     private double? _inPoint;
     private double? _outPoint;
 
@@ -38,11 +40,30 @@ public sealed class EditorProject : ObservableObject
 
     public int FrameRate
     {
-        get => _frameRate;
-        set => SetProperty(ref _frameRate, Math.Clamp(value, 15, 60));
+        get => (int)Math.Round(FrameRateValue.FramesPerSecond);
+        set => FrameRateValue = new FrameRate(Math.Clamp(value, 1, 240));
+    }
+
+    /// <summary>
+    /// Exact sequence timebase. FrameRate remains a compatibility convenience
+    /// for legacy WPF bindings and must never be persisted as the source of truth.
+    /// </summary>
+    [JsonIgnore]
+    public FrameRate FrameRateValue
+    {
+        get => new(_frameRateNumerator, _frameRateDenominator);
+        set
+        {
+            if (_frameRateNumerator == value.Numerator && _frameRateDenominator == value.Denominator) return;
+            _frameRateNumerator = value.Numerator;
+            _frameRateDenominator = value.Denominator;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(FrameRate));
+        }
     }
 
     public ObservableCollection<MediaAsset> Media { get; set; } = new();
+    public ObservableCollection<EditorTrack> Tracks { get; set; } = new();
     public ObservableCollection<TimelineClip> Clips { get; set; } = new();
     public ObservableCollection<TimelineMarker> Markers { get; set; } = new();
     public ObservableCollection<TextOverlay> TextOverlays { get; set; } = new();
@@ -147,5 +168,14 @@ public sealed class EditorProject : ObservableObject
         return Math.Max(2, highestOccupied + 2);
     }
 
-    public static EditorProject CreateNew() => new();
+    public static EditorProject CreateNew()
+    {
+        var project = new EditorProject();
+        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Visual, Index = 0, Name = "V1" });
+        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Visual, Index = 1, Name = "V2" });
+        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Audio, Index = 0, Name = "A1" });
+        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Audio, Index = 1, Name = "A2" });
+        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Text, Index = 0, Name = "T1" });
+        return project;
+    }
 }

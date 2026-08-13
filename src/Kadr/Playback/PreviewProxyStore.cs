@@ -62,7 +62,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         {
             _jobs.GetOrAdd(asset.Id, _ =>
             {
-                var job = BuildOrValidateAsync(asset, project.FrameRate, _projectId, _root, _generation.Token);
+                var job = BuildOrValidateAsync(asset, project.FrameRateValue, _projectId, _root, _generation.Token);
                 _allJobs.Add(job);
                 return job;
             });
@@ -89,7 +89,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         _encoderGate.Dispose();
     }
 
-    private async Task BuildOrValidateAsync(MediaAsset asset, int frameRate, Guid projectId, string root, CancellationToken token)
+    private async Task BuildOrValidateAsync(MediaAsset asset, KadrStudio.Core.Domain.FrameRate frameRate, Guid projectId, string root, CancellationToken token)
     {
         var lockTaken = false;
         try
@@ -112,7 +112,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
                         "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
                         "-i", asset.Path, "-map", "0:v:0", "-an",
                         "-vf", "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
-                        "-r", Math.Clamp(frameRate, 15, 60).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        "-r", $"{frameRate.Numerator}/{frameRate.Denominator}",
                         "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                         "-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
                         "-movflags", "+faststart", temporary

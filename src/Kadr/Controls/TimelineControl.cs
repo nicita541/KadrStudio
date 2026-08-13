@@ -988,7 +988,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private double SnapTime(double seconds)
     {
-        var frameRate = Math.Max(1, Project?.FrameRate ?? 30);
+        var frameRate = Math.Max(1, Project?.FrameRateValue.FramesPerSecond ?? 30);
         return Math.Round(seconds * frameRate) / frameRate;
     }
 

@@ -25,12 +25,26 @@ public sealed class EditorProjectMapper
         var audioCount = Math.Max(2, project.AudioTrackCount);
         var tracks = ImmutableArray.CreateBuilder<TimelineTrack>(visualCount + audioCount + 1);
         var trackIds = new Dictionary<(CoreTrackKind Kind, int Index), Guid>();
+        foreach (var track in project.Tracks
+                     .Where(item => item.Index >= 0)
+                     .GroupBy(item => (item.Kind, item.Index))
+                     .Select(group => group.First())
+                     .OrderBy(item => item.Kind).ThenBy(item => item.Index))
+        {
+            var id = track.Id == Guid.Empty
+                ? StableGuid(TextTrackNamespace, project.Id, (int)track.Kind, track.Index)
+                : track.Id;
+            trackIds[(track.Kind, track.Index)] = id;
+            tracks.Add(new TimelineTrack(id, track.Kind, track.Index,
+                string.IsNullOrWhiteSpace(track.Name) ? DefaultTrackName(track.Kind, track.Index) : track.Name,
+                track.IsMuted, track.IsLocked, track.IsVisible));
+        }
         for (var index = 0; index < visualCount; index++)
-            AddTrack(tracks, trackIds, project.Id, CoreTrackKind.Visual, index, $"V{index + 1}");
+            EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Visual, index);
         for (var index = 0; index < audioCount; index++)
-            AddTrack(tracks, trackIds, project.Id, CoreTrackKind.Audio, index, $"A{index + 1}");
-        var textTrackId = StableGuid(TextTrackNamespace, project.Id, (int)CoreTrackKind.Text, 0);
-        tracks.Add(new TimelineTrack(textTrackId, CoreTrackKind.Text, 0, "T1"));
+            EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Audio, index);
+        EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Text, 0);
+        var textTrackId = trackIds[(CoreTrackKind.Text, 0)];
 
         var sources = project.Media.ToImmutableDictionary(asset => asset.Id, ToCoreSource);
         var clips = project.Clips.Select(clip =>
@@ -80,7 +94,7 @@ public sealed class EditorProjectMapper
             Name = project.Name,
             CanvasWidth = project.CanvasWidth,
             CanvasHeight = project.CanvasHeight,
-            FrameRate = new FrameRate(project.FrameRate),
+            FrameRate = project.FrameRateValue,
             Revision = Math.Max(0, revision),
             CreatedAt = project.CreatedAt,
             UpdatedAt = project.UpdatedAt,
@@ -105,13 +119,19 @@ public sealed class EditorProjectMapper
             Name = project.Name,
             CanvasWidth = project.CanvasWidth,
             CanvasHeight = project.CanvasHeight,
-            FrameRate = Math.Clamp((int)Math.Round(project.FrameRate.FramesPerSecond), 15, 60),
+            FrameRateValue = project.FrameRate,
             CreatedAt = project.CreatedAt,
             UpdatedAt = project.UpdatedAt,
             FilePath = filePath,
             InPoint = project.InPoint?.TotalSeconds,
             OutPoint = project.OutPoint?.TotalSeconds
         };
+        foreach (var track in project.Tracks)
+            result.Tracks.Add(new EditorTrack
+            {
+                Id = track.Id, Kind = track.Kind, Index = track.Index, Name = track.Name,
+                IsMuted = track.IsMuted, IsLocked = track.IsLocked, IsVisible = track.IsVisible
+            });
         foreach (var source in project.Sources.Values) result.Media.Add(ToUiSource(source));
         foreach (var clip in project.MediaClips)
         {
@@ -207,18 +227,25 @@ public sealed class EditorProjectMapper
                 overlay.Rotation, overlay.BoxWidth, overlay.BoxHeight, overlay.IsSubtitle));
     }
 
-    private static void AddTrack(
+    private static void EnsureTrack(
         ICollection<TimelineTrack> tracks,
         IDictionary<(CoreTrackKind Kind, int Index), Guid> ids,
         Guid projectId,
         CoreTrackKind kind,
-        int index,
-        string name)
+        int index)
     {
+        if (ids.ContainsKey((kind, index))) return;
         var id = StableGuid(TextTrackNamespace, projectId, (int)kind, index);
         ids.Add((kind, index), id);
-        tracks.Add(new TimelineTrack(id, kind, index, name));
+        tracks.Add(new TimelineTrack(id, kind, index, DefaultTrackName(kind, index)));
     }
+
+    private static string DefaultTrackName(CoreTrackKind kind, int index) => kind switch
+    {
+        CoreTrackKind.Visual => $"V{index + 1}",
+        CoreTrackKind.Audio => $"A{index + 1}",
+        _ => $"T{index + 1}"
+    };
 
     public MediaSource ToCoreSource(MediaAsset asset)
         => new(

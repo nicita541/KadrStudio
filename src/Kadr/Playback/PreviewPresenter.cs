@@ -38,11 +38,13 @@ public sealed class PreviewPresenter : IAsyncDisposable
         _engine = new PreviewFrameServer(locator.FfmpegPath, coordinator);
         _proxies = new PreviewProxyStore(locator);
         _engine.FramePresented += Engine_FramePresented;
+        _engine.AudioMeterUpdated += Engine_AudioMeterUpdated;
         _engine.Failed += Engine_Failed;
         _proxies.ProxyReady += Proxies_ProxyReady;
     }
 
     public event EventHandler<Exception>? Failed;
+    public event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
     public PreviewState State => _engine.State;
     public TimelineTime Position => _engine.Position;
 
@@ -94,7 +96,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
             var size = PreviewSizing.Resolve(_project, _halfQuality);
             if (!_prepared)
             {
-                var request = new PreviewRequest(position, new FrameRate(_project.FrameRate), size.Width, size.Height,
+                var request = new PreviewRequest(position, _project.FrameRateValue, size.Width, size.Height,
                     _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
                 await _engine.PrepareAsync(plan, request, cancellationToken).ConfigureAwait(false);
                 RememberSignatures(plan);
@@ -108,7 +110,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
                 if (videoChanged) _videoGeneration++;
                 if (audioChanged) _audioGeneration++;
                 if (overlayChanged) _overlayGeneration++;
-                var request = new PreviewRequest(position, new FrameRate(_project.FrameRate), size.Width, size.Height,
+                var request = new PreviewRequest(position, _project.FrameRateValue, size.Width, size.Height,
                     _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
                 if (videoChanged || audioChanged)
                 {
@@ -121,7 +123,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
                     _overlaySignature = plan.OverlaySignature;
                 }
 
-                var frameDuration = 1d / Math.Max(1, _project.FrameRate);
+                var frameDuration = 1d / Math.Max(1, _project.FrameRateValue.FramesPerSecond);
                 if (forceSeek && Math.Abs(position.TotalSeconds - _engine.Position.TotalSeconds) > frameDuration / 2)
                     await _engine.SeekAsync(position, cancellationToken).ConfigureAwait(false);
             }
@@ -148,6 +150,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
         if (_disposed) return;
         _disposed = true;
         _engine.FramePresented -= Engine_FramePresented;
+        _engine.AudioMeterUpdated -= Engine_AudioMeterUpdated;
         _engine.Failed -= Engine_Failed;
         _proxies.ProxyReady -= Proxies_ProxyReady;
         await _engine.DisposeAsync().ConfigureAwait(false);
@@ -170,6 +173,9 @@ public sealed class PreviewPresenter : IAsyncDisposable
     }
 
     private void Engine_Failed(object? sender, Exception exception) => Failed?.Invoke(this, exception);
+
+    private void Engine_AudioMeterUpdated(object? sender, AudioMeterLevel level)
+        => AudioMeterUpdated?.Invoke(this, level);
 
     private void Proxies_ProxyReady(object? sender, Guid sourceId)
     {

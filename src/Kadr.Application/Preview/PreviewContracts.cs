@@ -38,6 +38,48 @@ public sealed record AudioBlock(
     ReadOnlyMemory<float> InterleavedSamples,
     long Generation);
 
+public readonly record struct AudioMeterLevel(
+    float LeftPeak,
+    float RightPeak,
+    float LeftRms,
+    float RightRms,
+    float LeftPeakDb,
+    float RightPeakDb);
+
+/// <summary>Calculates channel meters from the exact interleaved PCM sent to the audio device.</summary>
+public sealed class StereoPcmMeter
+{
+    public AudioMeterLevel Measure(ReadOnlySpan<float> interleaved, int channels = 2)
+    {
+        if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels));
+        if (interleaved.IsEmpty) return default;
+        double leftSquares = 0;
+        double rightSquares = 0;
+        var leftPeak = 0f;
+        var rightPeak = 0f;
+        var frames = interleaved.Length / channels;
+        if (frames == 0) return default;
+        for (var frame = 0; frame < frames; frame++)
+        {
+            var offset = frame * channels;
+            var left = Math.Clamp(interleaved[offset], -1f, 1f);
+            var right = channels == 1 ? left : Math.Clamp(interleaved[offset + 1], -1f, 1f);
+            leftPeak = Math.Max(leftPeak, Math.Abs(left));
+            rightPeak = Math.Max(rightPeak, Math.Abs(right));
+            leftSquares += left * left;
+            rightSquares += right * right;
+        }
+        return new AudioMeterLevel(
+            leftPeak, rightPeak,
+            (float)Math.Sqrt(leftSquares / frames),
+            (float)Math.Sqrt(rightSquares / frames),
+            ToDb(leftPeak), ToDb(rightPeak));
+    }
+
+    private static float ToDb(float amplitude)
+        => amplitude <= 0 ? float.NegativeInfinity : 20f * MathF.Log10(amplitude);
+}
+
 public readonly record struct PreviewArtifactKey(
     Guid ProjectId,
     string ContentSignature,
@@ -67,6 +109,7 @@ public interface IPreviewEngine : IAsyncDisposable
     TimelineTime Position { get; }
     event EventHandler<PreviewState>? StateChanged;
     event EventHandler<VideoFrame>? FramePresented;
+    event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
     event EventHandler<Exception>? Failed;
 
     Task PrepareAsync(Rendering.RenderPlan plan, PreviewRequest request, CancellationToken cancellationToken = default);

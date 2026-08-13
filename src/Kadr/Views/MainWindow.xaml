@@ -4,7 +4,6 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:controls="clr-namespace:KadrStudio.Controls"
-        xmlns:vlc="clr-namespace:LibVLCSharp.WPF;assembly=LibVLCSharp.WPF"
         mc:Ignorable="d"
         Title="Kadr Studio"
         Width="1500"
@@ -638,7 +637,6 @@
                     </Viewbox.RenderTransform>
                     <Border Width="960" Height="540" Background="Black" BorderBrush="#383942" BorderThickness="1" CornerRadius="3" ClipToBounds="True">
                         <Grid>
-                            <vlc:VideoView x:Name="PreviewVideoView" Visibility="Collapsed" />
                             <Image x:Name="PreviewImage" Stretch="Uniform" Visibility="Collapsed" />
                             <Canvas x:Name="PreviewTextCanvas" Width="960" Height="540">
                                 <Border x:Name="PreviewTextBorder"

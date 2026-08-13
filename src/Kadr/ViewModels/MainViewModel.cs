@@ -66,6 +66,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public MediaProbeService MediaProbeService { get; }
     public ThumbnailService ThumbnailService { get; }
     public PreviewCompositionService PreviewCompositionService { get; }
+    public TimelineRenderCoordinator RenderCoordinator => _renderCoordinator;
     public TimelineMediaCacheService TimelineMediaCacheService { get; }
     public ExportService ExportService { get; }
     public ProjectHistoryService ProjectHistoryService { get; }

@@ -67,12 +67,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'tools\ffmpeg.exe'))) {
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'tools\ffprobe.exe'))) {
     throw 'В сборку не попал tools\ffprobe.exe.'
 }
-if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'libvlc\win-x64\libvlc.dll')) -or
-    -not (Test-Path -LiteralPath (Join-Path $publishPath 'libvlc\win-x64\libvlccore.dll')) -or
-    -not (Test-Path -LiteralPath (Join-Path $publishPath 'libvlc\win-x64\plugins'))) {
-    throw 'В сборку не попал полный x64 runtime LibVLC.'
-}
-
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }

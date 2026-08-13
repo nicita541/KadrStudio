@@ -89,7 +89,9 @@ public enum RenderPurpose
     Preview,
     Export,
     StillFrame,
-    AudioPreview
+    AudioPreview,
+    FrameServer,
+    AudioServer
 }
 
 public sealed record RenderOutputOptions(

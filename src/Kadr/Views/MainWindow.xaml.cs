@@ -30,10 +30,7 @@ public partial class MainWindow : Window
     private bool _isCloseConfirmationPending;
     private bool _isShutdownComplete;
     private double _playbackStartSeconds;
-    private PreviewPlaybackController? _previewPlayback;
-    private TimelinePreviewSession? _previewSession;
-    private readonly HashSet<string> _pendingPreviewRequests = [];
-    private int _previewSessionGeneration;
+    private readonly PreviewPresenter _previewPresenter;
     private readonly string? _initialProjectPath;
     private CancellationTokenSource? _analysisCancellation;
     private readonly ObservableCollection<OllamaModelInfo> _localAiModels = [];
@@ -53,10 +50,6 @@ public partial class MainWindow : Window
     private Rect _previewTextResizeStartBounds;
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
-    private CancellationTokenSource? _stillPreviewCancellation;
-    private int _stillPreviewVersion;
-    private bool _stillPreviewPending;
-    private double _stillPreviewPendingPosition = -1;
 
     public MainWindow() : this(null)
     {
@@ -67,12 +60,11 @@ public partial class MainWindow : Window
         _initialProjectPath = initialProjectPath;
         InitializeComponent();
         _viewModel = new MainViewModel();
-        _previewSession = new TimelinePreviewSession(_viewModel.PreviewCompositionService);
-        _previewPlayback = new PreviewPlaybackController(PreviewVideoView);
-        _previewPlayback.VideoPresented += PreviewPlayback_VideoPresented;
-        _previewPlayback.VideoEnded += PreviewPlayback_VideoEnded;
-        _previewPlayback.VideoFailed += PreviewPlayback_VideoFailed;
-        _previewPlayback.AudioFailed += PreviewPlayback_AudioFailed;
+        _previewPresenter = new PreviewPresenter(PreviewImage, EmptyPreview,
+            new FfmpegLocator(), _viewModel.RenderCoordinator);
+        _previewPresenter.Failed += (_, exception) =>
+            Dispatcher.BeginInvoke(() => _viewModel.StatusText = $"Предпросмотр: {exception.Message}");
+        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
         DataContext = _viewModel;
         LocalAiModelComboBox.ItemsSource = _localAiModels;
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
@@ -1337,9 +1329,7 @@ public partial class MainWindow : Window
         _isPlaying = true;
         _playbackStartSeconds = _viewModel.Playhead;
         _playbackClock.Restart();
-        _previewPlayback?.SetTimelinePosition(_viewModel.Playhead);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-        _previewPlayback?.SetPlaying(true);
         _playbackTimer.Start();
         PlayPauseButton.Content = "Ⅱ";
     }
@@ -1354,7 +1344,6 @@ public partial class MainWindow : Window
         _isPlaying = false;
         _playbackTimer.Stop();
         _playbackClock.Stop();
-        _previewPlayback?.SetPlaying(false);
         UpdateAudioMeters(null);
         PlayPauseButton.Content = "▶";
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
@@ -1363,12 +1352,13 @@ public partial class MainWindow : Window
     private void StopPlayback()
     {
         PausePlayback();
-        _previewPlayback?.SetPlaying(false);
     }
 
     private void PlaybackTimer_Tick(object? sender, EventArgs e)
     {
-        var next = _playbackStartSeconds + _playbackClock.Elapsed.TotalSeconds;
+        var next = _previewPresenter.State == KadrStudio.Application.Preview.PreviewState.Playing
+            ? _previewPresenter.Position.TotalSeconds
+            : _playbackStartSeconds + _playbackClock.Elapsed.TotalSeconds;
         if (next >= _viewModel.Project.Duration)
         {
             SeekTo(_viewModel.Project.Duration);
@@ -1393,227 +1383,28 @@ public partial class MainWindow : Window
         {
             _playbackStartSeconds = bounded;
             _playbackClock.Restart();
-            _previewPlayback?.SetTimelinePosition(bounded);
-            _previewPlayback?.SetPlaying(true);
         }
         KeepPlayheadVisible(bounded);
     }
 
     private void UpdatePreviewAt(double timelineSeconds, bool forceSeek)
     {
-        _previewPlayback?.SetTimelinePosition(timelineSeconds);
-        UpdateCompositedVideoPreview(timelineSeconds, forceSeek);
-        UpdateMixedAudioPreview(timelineSeconds, forceSeek);
+        if (forceSeek || _previewPresenter.State is KadrStudio.Application.Preview.PreviewState.Idle or
+            KadrStudio.Application.Preview.PreviewState.Paused or KadrStudio.Application.Preview.PreviewState.Failed)
+            _ = UpdatePreviewEngineAsync(timelineSeconds, forceSeek);
         UpdateTextOverlayPreview(timelineSeconds);
     }
 
-    private async Task EnsureVideoPreviewAsync(double timelinePosition)
+    private async Task UpdatePreviewEngineAsync(double timelineSeconds, bool forceSeek)
     {
-        if (_previewSession is null) return;
-        var generation = _previewSessionGeneration;
-        var bucket = Math.Floor(Math.Max(0, timelinePosition) / PreviewCompositionService.SegmentStep);
-        var requestKey = $"v:{bucket:0}";
-        if (!_pendingPreviewRequests.Add(requestKey)) return;
         try
         {
-            var segment = await _previewSession.EnsureVideoAsync(
-                _viewModel.Project, timelinePosition, _useHalfQualityPreview);
-            if (generation != _previewSessionGeneration) return;
-            if (_isPlaying && segment.Contains(_viewModel.Playhead))
-                ActivateVideoSegment(segment, _viewModel.Playhead, forceSeek: true);
-            else if (segment.TimelineStart > _viewModel.Playhead &&
-                     segment.TimelineStart - _viewModel.Playhead <= PreviewCompositionService.SegmentOverlap + 1)
-                ActivateVideoSegment(segment, _viewModel.Playhead, forceSeek: true);
+            await _previewPresenter.UpdateAsync(timelineSeconds, forceSeek, _isPlaying);
         }
-        catch (OperationCanceledException)
-        {
-        }
+        catch (OperationCanceledException) { }
         catch (Exception exception)
         {
-            _viewModel.StatusText = $"Видеопредпросмотр недоступен: {exception.Message}";
-        }
-        finally
-        {
-            _pendingPreviewRequests.Remove(requestKey);
-        }
-    }
-
-    private async Task EnsureAudioPreviewAsync(double timelinePosition)
-    {
-        if (_previewSession is null) return;
-        var generation = _previewSessionGeneration;
-        var bucket = Math.Floor(Math.Max(0, timelinePosition) / PreviewCompositionService.SegmentStep);
-        var requestKey = $"a:{bucket:0}";
-        if (!_pendingPreviewRequests.Add(requestKey)) return;
-        try
-        {
-            var segment = await _previewSession.EnsureAudioAsync(_viewModel.Project, timelinePosition);
-            if (generation != _previewSessionGeneration) return;
-            if (segment.Contains(_viewModel.Playhead))
-                ActivateAudioSegment(segment, _viewModel.Playhead, forceSeek: true);
-            else if (segment.TimelineStart > _viewModel.Playhead &&
-                     segment.TimelineStart - _viewModel.Playhead <= PreviewCompositionService.SegmentOverlap + 1)
-                ActivateAudioSegment(segment, _viewModel.Playhead, forceSeek: true);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception exception)
-        {
-            _viewModel.StatusText = $"Аудиопредпросмотр недоступен: {exception.Message}";
-        }
-        finally
-        {
-            _pendingPreviewRequests.Remove(requestKey);
-        }
-    }
-
-    private void ActivateVideoSegment(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
-    {
-        _previewPlayback?.UpdateVideo(segment, timelinePosition, forceSeek);
-    }
-
-    private void ActivateAudioSegment(TimelinePreviewSegment segment, double timelinePosition, bool forceSeek)
-    {
-        _previewPlayback?.UpdateAudio(segment, timelinePosition, forceSeek);
-    }
-
-    private void PreviewPlayback_VideoPresented(object? sender, EventArgs e)
-    {
-        PreviewImage.Visibility = Visibility.Collapsed;
-        EmptyPreview.Visibility = Visibility.Collapsed;
-    }
-
-    private void PreviewPlayback_VideoEnded(object? sender, EventArgs e)
-        => _ = EnsureVideoPreviewAsync(_viewModel.Playhead);
-
-    private async void PreviewPlayback_VideoFailed(object? sender, PreviewPlaybackFailedEventArgs e)
-    {
-        _previewSession?.InvalidateVideo(e.Segment?.Path);
-        await UpdatePausedStillFrameAsync(_viewModel.Playhead, allowDuringPlayback: true);
-        _viewModel.StatusText = DecoderRecoveryStatus(
-            "Видеодекодер перезапущен без остановки звука", e.Error);
-        await EnsureVideoPreviewAsync(_viewModel.Playhead);
-    }
-
-    private async void PreviewPlayback_AudioFailed(object? sender, PreviewPlaybackFailedEventArgs e)
-    {
-        _previewSession?.InvalidateAudio(e.Segment?.Path);
-        _viewModel.StatusText = DecoderRecoveryStatus(
-            "Аудиодекодер перезапущен независимо от видео", e.Error);
-        await EnsureAudioPreviewAsync(_viewModel.Playhead);
-    }
-
-    private static string DecoderRecoveryStatus(string message, Exception? error)
-    {
-        var detail = error?.Message?.Trim();
-        if (string.IsNullOrWhiteSpace(detail)) return message;
-        return $"{message}: {detail}";
-    }
-
-    private void ClearVideoPlayers() => _previewPlayback?.ClearVideo();
-
-    private void ClearAudioPlayers() => _previewPlayback?.ClearAudio();
-
-    private void UpdateCompositedVideoPreview(double timelineSeconds, bool forceSeek)
-    {
-        if (!_viewModel.PreviewCompositionService.HasRenderableVideo(_viewModel.Project))
-        {
-            ClearVideoPlayers();
-            PreviewImage.Source = null;
-            PreviewImage.Visibility = Visibility.Collapsed;
-            EmptyPreview.Visibility = Visibility.Visible;
-            return;
-        }
-
-        EmptyPreview.Visibility = Visibility.Collapsed;
-        if (!_isPlaying)
-        {
-            _previewPlayback?.SetPlaying(false);
-            if (forceSeek || PreviewImage.Source is null)
-                _ = UpdatePausedStillFrameAsync(timelineSeconds);
-            if (_previewSession?.TryGetVideo(_viewModel.Project, timelineSeconds, _useHalfQualityPreview) is null)
-                _ = EnsureVideoPreviewAsync(timelineSeconds);
-            return;
-        }
-
-        var segment = _previewSession?.TryGetVideo(_viewModel.Project, timelineSeconds, _useHalfQualityPreview);
-        if (segment is null)
-        {
-            if (PreviewImage.Source is null)
-                _ = UpdatePausedStillFrameAsync(timelineSeconds, allowDuringPlayback: true);
-            _ = EnsureVideoPreviewAsync(timelineSeconds);
-            return;
-        }
-
-        ActivateVideoSegment(segment, timelineSeconds, forceSeek);
-        if (segment.TimelineEnd - timelineSeconds < PreviewCompositionService.SegmentOverlap + 1 &&
-            segment.TimelineStart + PreviewCompositionService.SegmentStep < _viewModel.Project.Duration)
-        {
-            _ = EnsureVideoPreviewAsync(segment.TimelineStart + PreviewCompositionService.SegmentStep + 0.001);
-        }
-    }
-
-    private void UpdateMixedAudioPreview(double timelineSeconds, bool forceSeek)
-    {
-        if (!_viewModel.PreviewCompositionService.HasRenderableAudio(_viewModel.Project))
-        {
-            ClearAudioPlayers();
-            return;
-        }
-
-        var segment = _previewSession?.TryGetAudio(_viewModel.Project, timelineSeconds);
-        if (segment is null)
-        {
-            _ = EnsureAudioPreviewAsync(timelineSeconds);
-            return;
-        }
-
-        ActivateAudioSegment(segment, timelineSeconds, forceSeek);
-        if (segment.TimelineEnd - timelineSeconds < PreviewCompositionService.SegmentOverlap + 1 &&
-            segment.TimelineStart + PreviewCompositionService.SegmentStep < _viewModel.Project.Duration)
-        {
-            _ = EnsureAudioPreviewAsync(segment.TimelineStart + PreviewCompositionService.SegmentStep + 0.001);
-        }
-    }
-
-    private async Task UpdatePausedStillFrameAsync(double timelinePosition, bool allowDuringPlayback = false)
-    {
-        if (_stillPreviewPending && allowDuringPlayback &&
-            Math.Abs(timelinePosition - _stillPreviewPendingPosition) < 0.75)
-        {
-            return;
-        }
-        var version = ++_stillPreviewVersion;
-        _stillPreviewPending = true;
-        _stillPreviewPendingPosition = timelinePosition;
-        _stillPreviewCancellation?.Cancel();
-        _stillPreviewCancellation?.Dispose();
-        _stillPreviewCancellation = new CancellationTokenSource();
-        try
-        {
-            if (_previewSession is null) return;
-            var still = await _previewSession.EnsureStillAsync(
-                _viewModel.Project, timelinePosition, _useHalfQualityPreview, _stillPreviewCancellation.Token);
-            if (version != _stillPreviewVersion || (_isPlaying && !allowDuringPlayback) ||
-                !_previewSession.IsCurrentVideo(_viewModel.Project, _useHalfQualityPreview, still.Signature)) return;
-            PreviewImage.Source = LoadBitmap(still.Path);
-            PreviewImage.Visibility = Visibility.Visible;
-            if (!_isPlaying)
-            {
-                _previewPlayback?.HideVideo();
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception exception)
-        {
-            if (version == _stillPreviewVersion) _viewModel.StatusText = $"Кадр предпросмотра недоступен: {exception.Message}";
-        }
-        finally
-        {
-            if (version == _stillPreviewVersion) _stillPreviewPending = false;
+            _viewModel.StatusText = $"Предпросмотр недоступен: {exception.Message}";
         }
     }
 
@@ -1929,7 +1720,8 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded) return;
         _useHalfQualityPreview = (PreviewQualityComboBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() != "Original";
-        ResetCompositionPreviewSources(clearImage: false);
+        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+        _ = _previewPresenter.InvalidateAsync(video: true, audio: false, overlay: false);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         _viewModel.StatusText = _useHalfQualityPreview
             ? "Предпросмотр: 1/2 качества"
@@ -1980,24 +1772,13 @@ public partial class MainWindow : Window
 
     private void ResetPreviewState()
     {
-        _stillPreviewCancellation?.Cancel();
-        _stillPreviewPending = false;
-        _stillPreviewPendingPosition = -1;
-        ResetCompositionPreviewSources(clearImage: true);
+        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+        _ = _previewPresenter.InvalidateAsync(video: true, audio: true, overlay: true);
+        PreviewImage.Source = null;
         TimelineEditor.Project = _viewModel.Project;
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
         TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-    }
-
-    private void ResetCompositionPreviewSources(bool clearImage)
-    {
-        _previewSession?.Reset();
-        _previewSessionGeneration++;
-        _pendingPreviewRequests.Clear();
-        ClearVideoPlayers();
-        ClearAudioPlayers();
-        if (clearImage) PreviewImage.Source = null;
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -2133,17 +1914,7 @@ public partial class MainWindow : Window
     private async Task ShutdownAsync()
     {
         StopPlayback();
-        if (_previewPlayback is not null)
-        {
-            _previewPlayback.VideoPresented -= PreviewPlayback_VideoPresented;
-            _previewPlayback.VideoEnded -= PreviewPlayback_VideoEnded;
-            _previewPlayback.VideoFailed -= PreviewPlayback_VideoFailed;
-            _previewPlayback.AudioFailed -= PreviewPlayback_AudioFailed;
-            _previewPlayback.Dispose();
-            _previewPlayback = null;
-        }
-        _previewSession?.Dispose();
-        _previewSession = null;
+        await _previewPresenter.DisposeAsync();
         await _viewModel.DisposeAsync();
     }
 

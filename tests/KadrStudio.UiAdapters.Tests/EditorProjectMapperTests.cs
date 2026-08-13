@@ -1,6 +1,5 @@
 using KadrStudio.Adapters;
 using KadrStudio.Models;
-using KadrStudio.Playback;
 using KadrStudio.Services;
 using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
 using UiTrackKind = KadrStudio.Models.TrackKind;
@@ -9,24 +8,6 @@ namespace KadrStudio.UiAdapters.Tests;
 
 public sealed class EditorProjectMapperTests
 {
-    [Fact]
-    public void Published_libvlc_runtime_location_is_resolved_explicitly()
-    {
-        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "libvlc-path-tests", Guid.NewGuid().ToString("N"));
-        var runtime = Path.Combine(root, "libvlc", "win-x64");
-        Directory.CreateDirectory(Path.Combine(runtime, "plugins"));
-        File.WriteAllBytes(Path.Combine(runtime, "libvlc.dll"), [1]);
-        File.WriteAllBytes(Path.Combine(runtime, "libvlccore.dll"), [1]);
-        try
-        {
-            Assert.Equal(runtime, PreviewPlaybackController.ResolveNativeDirectory(root));
-        }
-        finally
-        {
-            try { Directory.Delete(root, recursive: true); } catch { }
-        }
-    }
-
     [Fact]
     public void Mutable_ui_project_roundtrips_through_immutable_core()
     {

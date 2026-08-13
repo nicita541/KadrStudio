@@ -112,6 +112,22 @@ public sealed class RenderPlanTests
     }
 
     [Fact]
+    public void Frame_server_writes_uncompressed_bgra_to_stdout_without_yuv_override()
+    {
+        var plan = new RenderPlanBuilder().Build(CreateProject());
+        var command = new FfmpegRenderCommandBuilder().Build(plan, new RenderOutputOptions(
+            RenderPurpose.FrameServer, "pipe:1", 960, 540,
+            IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false));
+
+        Assert.Equal("pipe:1", command.OutputPath);
+        Assert.Equal("pipe:1", command.Arguments[^1]);
+        Assert.Contains("rawvideo", command.Arguments);
+        Assert.Contains("bgra", command.Arguments);
+        Assert.DoesNotContain("yuv420p", command.Arguments);
+        Assert.DoesNotContain("[aout]", command.Arguments);
+    }
+
+    [Fact]
     public void Frame_query_returns_only_layers_active_at_exact_time()
     {
         var plan = new RenderPlanBuilder().Build(CreateProject());

@@ -19,12 +19,13 @@ public sealed class TimelineRenderCoordinator : IAsyncDisposable
     private readonly RenderPlanBuilder _planBuilder = new();
     private readonly BackgroundJobScheduler _scheduler = new();
     private readonly FfmpegRenderEngine _engine;
+    private readonly FfmpegRenderCommandBuilder _commandBuilder = new();
     private long _revision;
 
     public TimelineRenderCoordinator(FfmpegLocator locator)
     {
         ArgumentNullException.ThrowIfNull(locator);
-        _engine = new FfmpegRenderEngine(locator.FfmpegPath, new FfmpegRenderCommandBuilder(), _scheduler);
+        _engine = new FfmpegRenderEngine(locator.FfmpegPath, _commandBuilder, _scheduler);
     }
 
     public RenderPlan CreatePlan(EditorProject project, TimeRange? range = null)
@@ -36,6 +37,9 @@ public sealed class TimelineRenderCoordinator : IAsyncDisposable
         IProgress<RenderProgress>? progress = null,
         CancellationToken cancellationToken = default)
         => _engine.RenderAsync(plan, options, progress, cancellationToken);
+
+    public ExternalRenderCommand CreateCommand(RenderPlan plan, RenderOutputOptions options)
+        => _commandBuilder.Build(plan, options);
 
     public SchedulerSnapshot GetSchedulerSnapshot() => _scheduler.GetSnapshot();
 

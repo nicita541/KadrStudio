@@ -16,8 +16,9 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         if (options.Width <= 0 || options.Height <= 0) throw new ArgumentOutOfRangeException(nameof(options));
         if (!options.IncludeVideo && !options.IncludeAudio) throw new ArgumentException("At least one output stream is required.", nameof(options));
 
-        var outputPath = Path.GetFullPath(options.OutputPath);
-        var arguments = new List<string> { "-hide_banner", "-y" };
+        var isPipe = options.Purpose is RenderPurpose.FrameServer or RenderPurpose.AudioServer;
+        var outputPath = isPipe ? options.OutputPath : Path.GetFullPath(options.OutputPath);
+        var arguments = new List<string> { "-hide_banner", "-nostdin", "-y" };
         var inputs = AddInputs(arguments, plan, options);
         var filters = new List<string>();
         string? videoOutput = options.IncludeVideo ? BuildVideoGraph(filters, plan, options, inputs) : null;
@@ -118,7 +119,8 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
                 $"{Format(RelativeEnd(layer.TimelineRange, plan.Range))})'[{output}]");
             previous = output;
         }
-        filters.Add($"[{previous}]format=yuv420p[vout]");
+        var outputFormat = options.Purpose == RenderPurpose.FrameServer ? "bgra" : "yuv420p";
+        filters.Add($"[{previous}]format={outputFormat}[vout]");
         return "vout";
     }
 
@@ -156,7 +158,13 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
     {
         if (video)
         {
-            if (options.Purpose == RenderPurpose.StillFrame)
+            if (options.Purpose == RenderPurpose.FrameServer)
+            {
+                arguments.Add("-c:v"); arguments.Add("rawvideo");
+                arguments.Add("-pix_fmt"); arguments.Add("bgra");
+                arguments.Add("-f"); arguments.Add("rawvideo");
+            }
+            else if (options.Purpose == RenderPurpose.StillFrame)
             {
                 arguments.Add("-frames:v"); arguments.Add("1");
             }
@@ -173,14 +181,24 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
                 arguments.Add("-crf"); arguments.Add(options.VideoQuality.ToString(CultureInfo.InvariantCulture));
             }
             arguments.Add("-r"); arguments.Add(FrameRateValue(plan.FrameRate));
-            arguments.Add("-pix_fmt"); arguments.Add("yuv420p");
+            if (options.Purpose != RenderPurpose.FrameServer)
+            {
+                arguments.Add("-pix_fmt"); arguments.Add("yuv420p");
+            }
         }
         if (audio)
         {
-            arguments.Add("-c:a"); arguments.Add("aac");
-            arguments.Add("-b:a"); arguments.Add(options.Purpose == RenderPurpose.Preview ? "128k" : "192k");
+            arguments.Add("-c:a"); arguments.Add(options.Purpose == RenderPurpose.AudioServer ? "pcm_f32le" : "aac");
+            if (options.Purpose != RenderPurpose.AudioServer)
+            {
+                arguments.Add("-b:a"); arguments.Add(options.Purpose == RenderPurpose.Preview ? "128k" : "192k");
+            }
             arguments.Add("-ar"); arguments.Add("48000");
             arguments.Add("-ac"); arguments.Add("2");
+            if (options.Purpose == RenderPurpose.AudioServer)
+            {
+                arguments.Add("-f"); arguments.Add("f32le");
+            }
         }
         if (options.Purpose is RenderPurpose.Export or RenderPurpose.Preview)
         {

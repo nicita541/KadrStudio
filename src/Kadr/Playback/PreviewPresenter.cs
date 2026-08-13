@@ -15,7 +15,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
     private readonly Image _image;
     private readonly FrameworkElement _emptyState;
     private readonly TimelineRenderCoordinator _coordinator;
-    private readonly PreviewFrameServer _engine;
+    private readonly IPreviewEngine _engine;
     private readonly PreviewProxyStore _proxies;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private WriteableBitmap? _bitmap;
@@ -37,7 +37,8 @@ public sealed class PreviewPresenter : IAsyncDisposable
         _image = image;
         _emptyState = emptyState;
         _coordinator = coordinator;
-        _engine = new PreviewFrameServer(locator.FfmpegPath, coordinator);
+        var hostPath = Path.Combine(AppContext.BaseDirectory, "mediahost", "Kadr.MediaHost.exe");
+        _engine = new MediaHostClient(hostPath, locator.FfmpegPath);
         _proxies = new PreviewProxyStore(locator, artifacts);
         _engine.FramePresented += Engine_FramePresented;
         _engine.AudioMeterUpdated += Engine_AudioMeterUpdated;

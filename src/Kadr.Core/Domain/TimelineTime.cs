@@ -95,6 +95,7 @@ public readonly record struct FrameRate
 
 public readonly record struct TimeRange
 {
+    [JsonConstructor]
     public TimeRange(TimelineTime start, TimelineTime duration)
     {
         if (start < TimelineTime.Zero) throw new ArgumentOutOfRangeException(nameof(start));

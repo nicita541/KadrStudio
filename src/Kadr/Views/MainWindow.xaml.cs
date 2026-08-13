@@ -1754,7 +1754,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Values are updated from the exact mixed PCM emitted by PreviewFrameServer.
+        // Values are updated from the exact mixed PCM emitted by Kadr.MediaHost.
     }
 
     private void KeepPlayheadVisible(double seconds)

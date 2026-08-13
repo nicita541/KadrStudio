@@ -52,4 +52,23 @@
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
+
+  <Target Name="BuildMediaHost" BeforeTargets="Build">
+    <MSBuild Projects="..\Kadr.MediaHost\KadrStudio.MediaHost.csproj"
+             Targets="Build"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64" />
+  </Target>
+
+  <Target Name="CopyMediaHost" AfterTargets="Build" DependsOnTargets="BuildMediaHost">
+    <ItemGroup>
+      <MediaHostFiles Include="..\Kadr.MediaHost\bin\$(Configuration)\net10.0-windows\win-x64\Kadr.MediaHost.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MediaHostFiles)" DestinationFolder="$(OutDir)mediahost" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="PublishMediaHost" AfterTargets="Publish">
+    <MSBuild Projects="..\Kadr.MediaHost\KadrStudio.MediaHost.csproj"
+             Targets="Publish"
+             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64;SelfContained=true;PublishDir=$(PublishDir)mediahost\" />
+  </Target>
 </Project>

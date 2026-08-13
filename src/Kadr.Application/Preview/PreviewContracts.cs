@@ -113,6 +113,12 @@ public interface IPreviewEngine : IAsyncDisposable
     event EventHandler<Exception>? Failed;
 
     Task PrepareAsync(Rendering.RenderPlan plan, PreviewRequest request, CancellationToken cancellationToken = default);
+    Task UpdatePlanAsync(
+        Rendering.RenderPlan plan,
+        PreviewRequest request,
+        bool restartVideo,
+        bool restartAudio,
+        CancellationToken cancellationToken = default);
     Task StartAsync(CancellationToken cancellationToken = default);
     Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default);
     Task PauseAsync(CancellationToken cancellationToken = default);

@@ -90,6 +90,19 @@ public sealed class EditorSession : IEditorSession
         return true;
     }
 
+    public bool RollbackLatestTransaction()
+    {
+        if (_undo.Last is null) return false;
+        var entry = _undo.Last.Value;
+        _undo.RemoveLast();
+        var previous = _state;
+        _state = entry.Before;
+        _redo.Clear();
+        StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
+            previous, _state, $"Rollback: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
+        return true;
+    }
+
     public void ReplaceState(ProjectState state, string reason, bool clearHistory = true)
     {
         EnsureValid(state);

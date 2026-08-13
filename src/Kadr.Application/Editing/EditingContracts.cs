@@ -50,6 +50,7 @@ public interface IEditorSession
     EditResult Execute(EditTransaction transaction);
     bool Undo();
     bool Redo();
+    bool RollbackLatestTransaction();
     void ReplaceState(ProjectState state, string reason, bool clearHistory = true);
     event EventHandler<ProjectStateChangedEventArgs>? StateChanged;
 }

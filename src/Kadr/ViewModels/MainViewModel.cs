@@ -34,7 +34,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool _isDirty;
     private double _playhead;
     private bool _editTransactionActive;
-    private string? _editReviewSnapshot;
+    private KadrStudio.Core.Domain.ProjectState? _editReviewSnapshot;
     private string? _editReviewReason;
     private Guid? _editReviewSelectedClipId;
     private double _editReviewPlayhead;
@@ -469,29 +469,47 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             throw new InvalidOperationException("Сначала примите или отмените предыдущий черновик монтажа.");
         }
 
-        _editReviewSnapshot = _projectService.CreateSnapshot(Project);
+        _editReviewSnapshot = _editorSession.State;
         _editReviewReason = plan.Summary;
         _editReviewSelectedClipId = SelectedClip?.Id;
         _editReviewPlayhead = Playhead;
         _editReviewWasDirty = IsDirty;
-        BeginEdit();
-        var completed = 0;
+        var commands = new List<IEditCommand>();
         foreach (var command in plan.Commands)
         {
-            completed += command.Type switch
+            switch (command.Type)
             {
-                EditCommandType.DeleteRange => DeleteTimelineRange(command.Start, command.End),
-                EditCommandType.SplitAt => SplitAllAt(command.Start),
-                EditCommandType.DeleteSelected => DeleteSelectedWithoutHistory(),
-                _ => 0
-            };
+                case EditCommandType.DeleteRange:
+                    var start = KadrStudio.Core.Domain.TimelineTime.FromSeconds(Math.Max(0, command.Start));
+                    var end = KadrStudio.Core.Domain.TimelineTime.FromSeconds(Math.Max(0, command.End));
+                    if (end > start)
+                        commands.Add(new RippleDeleteRangeCommand(new KadrStudio.Core.Domain.TimeRange(start, end - start)));
+                    break;
+                case EditCommandType.SplitAt:
+                    commands.Add(new SplitMediaClipsCommand(
+                        KadrStudio.Core.Domain.TimelineTime.FromSeconds(Math.Max(0, command.Start))));
+                    break;
+                case EditCommandType.DeleteSelected when SelectedClip is not null:
+                    commands.Add(new DeleteMediaClipsCommand(
+                        new HashSet<Guid> { SelectedClip.Id }, IncludeLinked: true));
+                    break;
+            }
         }
 
-        if (completed == 0)
+        if (commands.Count == 0)
         {
             RejectEditPlanReview();
             return 0;
         }
+        var result = _editorSession.Execute(new EditTransaction(
+            $"AI draft: {plan.Summary}", commands, CreateCheckpoint: true, CheckpointName: $"Before AI: {plan.Summary}"));
+        if (!result.Changed)
+        {
+            _editReviewSnapshot = null;
+            return 0;
+        }
+        RestoreFromCoreState(result.State, SelectedClip?.Id);
+        var completed = commands.Count;
 
         StatusText = completed == 1
             ? "Черновик ИИ готов — проверьте и примите или верните изменения"
@@ -512,12 +530,14 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         await ProjectHistoryService.CreateCheckpointAsync(
             Project,
             $"До ИИ: {_editReviewReason ?? "команда монтажа"}",
-            _editReviewSnapshot,
+            _projectService.CreateSnapshot(_projectMapper.ToUi(_editReviewSnapshot, Project.FilePath)),
             cancellationToken);
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
-        CommitEdit("Изменения ИИ приняты");
+        MarkChanged();
+        StatusText = "Изменения ИИ приняты";
+        NotifyHistoryChanged();
         OnPropertyChanged(nameof(HasPendingEditReview));
     }
 
@@ -528,7 +548,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        var snapshot = _editReviewSnapshot;
         var selectedClipId = _editReviewSelectedClipId;
         var reviewPlayhead = _editReviewPlayhead;
         var wasDirty = _editReviewWasDirty;
@@ -541,8 +560,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _suppressDirtyTracking = true;
         try
         {
+            _editorSession.RollbackLatestTransaction();
             SelectedClip = null;
-            Project = _projectService.RestoreSnapshot(snapshot, filePath);
+            Project = _projectMapper.ToUi(_editorSession.State, filePath);
             SelectedClip = selectedClipId is Guid clipId ? Project.FindClip(clipId) : null;
             Playhead = Math.Min(reviewPlayhead, Project.Duration);
             IsDirty = wasDirty;
@@ -624,169 +644,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         await ProjectHistoryService.DeleteCheckpointAsync(entry, cancellationToken);
         StatusText = $"Контрольная точка удалена: {entry.Message}";
-    }
-
-    private int DeleteTimelineRange(double requestedStart, double requestedEnd)
-    {
-        var start = Math.Clamp(requestedStart, 0, Project.Duration);
-        var end = Math.Clamp(requestedEnd, 0, Project.Duration);
-        if (end <= start + 0.01)
-        {
-            return 0;
-        }
-
-        var removedDuration = end - start;
-        var affected = 0;
-        var tailLinkGroups = new Dictionary<Guid, Guid>();
-        foreach (var clip in Project.Clips.ToList())
-        {
-            var oldStart = clip.Start;
-            var oldEnd = clip.End;
-            if (oldEnd <= start)
-            {
-                continue;
-            }
-
-            if (oldStart >= end)
-            {
-                clip.Start = oldStart - removedDuration;
-                continue;
-            }
-
-            affected++;
-            if (oldStart >= start && oldEnd <= end)
-            {
-                if (ReferenceEquals(SelectedClip, clip))
-                {
-                    SelectedClip = null;
-                }
-                Project.Clips.Remove(clip);
-                continue;
-            }
-
-            if (oldStart < start && oldEnd > end)
-            {
-                var asset = Project.FindAsset(clip.AssetId);
-                var tail = clip.Clone();
-                tail.Id = Guid.NewGuid();
-                if (clip.LinkGroupId is Guid oldGroup)
-                {
-                    if (!tailLinkGroups.TryGetValue(oldGroup, out var rightGroup))
-                    {
-                        rightGroup = Guid.NewGuid();
-                        tailLinkGroups[oldGroup] = rightGroup;
-                    }
-                    tail.LinkGroupId = rightGroup;
-                }
-                tail.Start = start;
-                tail.SourceStart = asset?.Kind == MediaKind.Image
-                    ? clip.SourceStart
-                    : clip.SourceStart + (end - oldStart);
-                tail.Duration = oldEnd - end;
-                clip.Duration = start - oldStart;
-                Project.Clips.Add(tail);
-                continue;
-            }
-
-            if (oldStart < start)
-            {
-                clip.Duration = start - oldStart;
-                continue;
-            }
-
-            var sourceTrim = end - oldStart;
-            if (Project.FindAsset(clip.AssetId)?.Kind != MediaKind.Image)
-            {
-                clip.SourceStart += sourceTrim;
-            }
-            clip.Start = start;
-            clip.Duration = oldEnd - end;
-        }
-
-        foreach (var marker in Project.Markers.ToList())
-        {
-            var oldStart = marker.Start;
-            var oldEnd = marker.End;
-            if (oldEnd <= start)
-            {
-                continue;
-            }
-
-            if (oldStart >= end)
-            {
-                marker.Start = oldStart - removedDuration;
-            }
-            else if (oldStart >= start && oldEnd <= end)
-            {
-                Project.Markers.Remove(marker);
-            }
-            else if (oldStart < start && oldEnd > end)
-            {
-                marker.Duration -= removedDuration;
-            }
-            else if (oldStart < start)
-            {
-                marker.Duration = start - oldStart;
-            }
-            else
-            {
-                marker.SourceStart += end - oldStart;
-                marker.Start = start;
-                marker.Duration = oldEnd - end;
-            }
-        }
-
-        Playhead = Math.Min(Playhead, Project.Duration);
-        return affected > 0 ? 1 : 0;
-    }
-
-    private int SplitAllAt(double requestedTime)
-    {
-        var time = Math.Clamp(requestedTime, 0, Project.Duration);
-        var targets = Project.Clips
-            .Where(clip => time > clip.Start + 0.05 && time < clip.End - 0.05)
-            .ToList();
-        var rightLinkGroups = targets
-            .Where(clip => clip.LinkGroupId.HasValue)
-            .Select(clip => clip.LinkGroupId!.Value)
-            .Distinct()
-            .ToDictionary(groupId => groupId, _ => Guid.NewGuid());
-        foreach (var clip in targets)
-        {
-            var firstDuration = time - clip.Start;
-            var second = clip.Clone();
-            second.Id = Guid.NewGuid();
-            second.LinkGroupId = clip.LinkGroupId is Guid oldGroup ? rightLinkGroups[oldGroup] : null;
-            second.Start = time;
-            second.SourceStart = Project.FindAsset(clip.AssetId)?.Kind == MediaKind.Image
-                ? clip.SourceStart
-                : clip.SourceStart + firstDuration;
-            second.Duration = clip.Duration - firstDuration;
-            clip.Duration = firstDuration;
-            Project.Clips.Add(second);
-            SelectedClip = second;
-        }
-
-        Playhead = time;
-        return targets.Count > 0 ? 1 : 0;
-    }
-
-    private int DeleteSelectedWithoutHistory()
-    {
-        if (SelectedClip is null)
-        {
-            return 0;
-        }
-
-        var clipsToDelete = SelectedClip.LinkGroupId is Guid groupId
-            ? Project.Clips.Where(clip => clip.LinkGroupId == groupId).ToList()
-            : [SelectedClip];
-        foreach (var clip in clipsToDelete)
-        {
-            Project.Clips.Remove(clip);
-        }
-        SelectedClip = null;
-        return 1;
     }
 
     private double FindAvailableTrackStart(TrackKind kind, int trackIndex, double requestedStart, double duration)

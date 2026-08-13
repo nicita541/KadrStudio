@@ -84,7 +84,11 @@ public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool In
                 .ToHashSet();
             ids.UnionWith(project.MediaClips.Where(item => item.LinkGroupId is { } group && groups.Contains(group)).Select(item => item.Id));
         }
-        return project with { MediaClips = project.MediaClips.Where(item => !ids.Contains(item.Id)).ToImmutableArray() };
+        return project with
+        {
+            MediaClips = project.MediaClips.Where(item => !ids.Contains(item.Id)).ToImmutableArray(),
+            Transitions = RemoveTransitionsForClips(project.Transitions, ids)
+        };
     }
 }
 
@@ -113,7 +117,8 @@ public sealed record MoveMediaClipCommand(Guid ClipId, Guid TargetTrackId, Timel
                 ? item with { TrackId = TargetTrackId, Start = NewStart }
                 : linkedIds.Contains(item.Id)
                     ? item with { Start = item.Start + delta }
-                    : item).ToImmutableArray()
+                    : item).ToImmutableArray(),
+            Transitions = RemoveTransitionsForClips(project.Transitions, linkedIds)
         };
     }
 }
@@ -170,7 +175,8 @@ public sealed record TrimMediaClipCommand(Guid ClipId, TrimEdge Edge, TimelineTi
                     Duration = newDuration,
                     Audio = ClampAudioFades(item.Audio, newDuration)
                 };
-            }).ToImmutableArray()
+            }).ToImmutableArray(),
+            Transitions = RemoveTransitionsForClips(project.Transitions, linked)
         };
     }
 }
@@ -212,7 +218,9 @@ public sealed record SplitMediaClipsCommand(TimelineTime Position) : IEditComman
         return project with
         {
             MediaClips = project.MediaClips.Select(item => replacements.GetValueOrDefault(item.Id, item))
-                .Concat(additions).ToImmutableArray()
+                .Concat(additions).ToImmutableArray(),
+            Transitions = RemoveTransitionsForClips(
+                project.Transitions, targets.Select(item => item.Id).ToHashSet())
         };
     }
 }
@@ -248,7 +256,9 @@ public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Pos
         return project with
         {
             MediaClips = project.MediaClips.Select(item => left.GetValueOrDefault(item.Id, item))
-                .Concat(right).ToImmutableArray()
+                .Concat(right).ToImmutableArray(),
+            Transitions = RemoveTransitionsForClips(
+                project.Transitions, targets.Select(item => item.Id).ToHashSet())
         };
     }
 }
@@ -297,6 +307,7 @@ public sealed record RippleDeleteRangeCommand(TimeRange Range) : IEditCommand
             MediaClips = media.ToImmutableArray(),
             TextClips = text.ToImmutableArray(),
             Markers = markers.ToImmutableArray(),
+            Transitions = TransformTransitions(project.Transitions, Range, media),
             InPoint = TransformPoint(project.InPoint, Range),
             OutPoint = TransformPoint(project.OutPoint, Range)
         };
@@ -547,4 +558,35 @@ internal static class CommandHelpers
             FadeIn = audio.FadeIn > duration ? duration : audio.FadeIn,
             FadeOut = audio.FadeOut > duration ? duration : audio.FadeOut
         };
+
+    public static ImmutableArray<TimelineTransition> RemoveTransitionsForClips(
+        IEnumerable<TimelineTransition> transitions,
+        IReadOnlySet<Guid> clipIds)
+        => transitions.Where(item => !clipIds.Contains(item.FromClipId) && !clipIds.Contains(item.ToClipId))
+            .ToImmutableArray();
+
+    public static ImmutableArray<TimelineTransition> TransformTransitions(
+        IEnumerable<TimelineTransition> transitions,
+        TimeRange removedRange,
+        IReadOnlyCollection<MediaClip> media)
+    {
+        var clips = media.ToDictionary(item => item.Id);
+        var result = ImmutableArray.CreateBuilder<TimelineTransition>();
+        foreach (var transition in transitions)
+        {
+            if (!clips.TryGetValue(transition.FromClipId, out var from) ||
+                !clips.TryGetValue(transition.ToClipId, out var to)) continue;
+            TimelineTransition? transformed = transition.End <= removedRange.Start
+                ? transition
+                : transition.Start >= removedRange.End
+                    ? transition with { Start = transition.Start - removedRange.Duration }
+                    : null;
+            if (transformed is null || from.TrackId != to.TrackId || from.End != to.Start ||
+                transformed.Duration > from.Duration || transformed.Duration > to.Duration ||
+                transformed.Start < from.Start || transformed.End > to.End ||
+                !transformed.Range.Contains(from.End)) continue;
+            result.Add(transformed);
+        }
+        return result.ToImmutable();
+    }
 }

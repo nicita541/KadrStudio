@@ -195,6 +195,53 @@ public sealed class EditorSessionTests
         Assert.Equal(transition.Range, Assert.Single(result.Changes.VideoRanges));
     }
 
+    [Fact]
+    public void Editing_a_transition_endpoint_removes_transition_instead_of_corrupting_project()
+    {
+        var (project, transition, first) = CreateProjectWithTransition();
+        var session = new EditorSession(project);
+
+        var result = session.Execute(new EditTransaction(
+            "trim endpoint",
+            new TrimMediaClipCommand(first.Id, TrimEdge.Right, TimelineTime.FromSeconds(4))));
+
+        Assert.Empty(result.State.Transitions);
+        Assert.Contains(result.Changes.VideoRanges, range =>
+            range.Start <= transition.Start && range.End >= transition.End);
+    }
+
+    [Fact]
+    public void Rollback_latest_transaction_restores_state_without_creating_redo_branch()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+        session.Execute(new EditTransaction("draft", new SplitMediaClipsCommand(TimelineTime.FromSeconds(7))));
+
+        Assert.True(session.RollbackLatestTransaction());
+
+        Assert.Equal(fixture.Project, session.State);
+        Assert.False(session.CanUndo);
+        Assert.False(session.CanRedo);
+    }
+
+    private static (ProjectState Project, TimelineTransition Transition, MediaClip First) CreateProjectWithTransition()
+    {
+        var project = ProjectState.CreateNew();
+        var source = new MediaSource(
+            Guid.NewGuid(), "F:\\media\\episode.mkv", "episode.mkv", MediaKind.Video,
+            TimelineTime.FromSeconds(60), false);
+        project = project with { Sources = project.Sources.Add(source.Id, source) };
+        var track = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var first = new MediaClip(Guid.NewGuid(), source.Id, track.Id, TimelineTime.Zero, TimelineTime.Zero,
+            TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        var second = new MediaClip(Guid.NewGuid(), source.Id, track.Id, TimelineTime.FromSeconds(5), TimelineTime.FromSeconds(5),
+            TimelineTime.FromSeconds(5), Video: new VideoParameters());
+        var transition = new TimelineTransition(
+            Guid.NewGuid(), TransitionKind.CrossDissolve, track.Id, first.Id, second.Id,
+            TimelineTime.FromSeconds(4.5), TimelineTime.FromSeconds(1));
+        return (project with { MediaClips = [first, second], Transitions = [transition] }, transition, first);
+    }
+
     private static Fixture CreateLinkedProject(double startSeconds = 2, double durationSeconds = 10)
     {
         var project = ProjectState.CreateNew();

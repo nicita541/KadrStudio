@@ -1,0 +1,439 @@
+using System.Collections.Immutable;
+using KadrStudio.Core.Domain;
+using static KadrStudio.Application.Editing.CommandHelpers;
+
+namespace KadrStudio.Application.Editing;
+
+public sealed record AddSourcesCommand(IReadOnlyList<MediaSource> Sources) : IEditCommand
+{
+    public string Description => "Добавить исходники";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var sources = project.Sources;
+        foreach (var source in Sources)
+        {
+            if (sources.ContainsKey(source.Id))
+                throw new EditRejectedException($"Исходник {source.Id} уже существует.");
+            sources = sources.Add(source.Id, source);
+        }
+        return project with { Sources = sources };
+    }
+}
+
+public sealed record AddTrackCommand(TimelineTrack Track) : IEditCommand
+{
+    public string Description => "Добавить дорожку";
+    public ProjectState Apply(ProjectState project)
+        => project with { Tracks = project.Tracks.Add(Track) };
+}
+
+public sealed record AddMediaClipsCommand(IReadOnlyList<MediaClip> Clips) : IEditCommand
+{
+    public string Description => "Добавить клипы";
+    public ProjectState Apply(ProjectState project)
+        => project with { MediaClips = project.MediaClips.AddRange(Clips) };
+}
+
+public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool IncludeLinked = true) : IEditCommand
+{
+    public string Description => "Удалить клипы";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var ids = ClipIds.ToHashSet();
+        if (IncludeLinked)
+        {
+            var groups = project.MediaClips
+                .Where(item => ids.Contains(item.Id) && item.LinkGroupId.HasValue)
+                .Select(item => item.LinkGroupId!.Value)
+                .ToHashSet();
+            ids.UnionWith(project.MediaClips.Where(item => item.LinkGroupId is { } group && groups.Contains(group)).Select(item => item.Id));
+        }
+        return project with { MediaClips = project.MediaClips.Where(item => !ids.Contains(item.Id)).ToImmutableArray() };
+    }
+}
+
+public sealed record MoveMediaClipCommand(Guid ClipId, Guid TargetTrackId, TimelineTime NewStart) : IEditCommand
+{
+    public string Description => "Переместить клип";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var selected = RequireClip(project, ClipId);
+        var target = project.FindTrack(TargetTrackId)
+            ?? throw new EditRejectedException("Целевая дорожка не найдена.");
+        var sourceTrack = project.FindTrack(selected.TrackId)!;
+        if (target.Kind != sourceTrack.Kind)
+            throw new EditRejectedException("Клип нельзя переместить на дорожку другого типа.");
+        if (NewStart < TimelineTime.Zero)
+            throw new EditRejectedException("Позиция клипа не может быть отрицательной.");
+
+        var delta = NewStart - selected.Start;
+        var linkedIds = selected.LinkGroupId is { } group
+            ? project.MediaClips.Where(item => item.LinkGroupId == group).Select(item => item.Id).ToHashSet()
+            : new HashSet<Guid> { selected.Id };
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item => item.Id == selected.Id
+                ? item with { TrackId = TargetTrackId, Start = NewStart }
+                : linkedIds.Contains(item.Id)
+                    ? item with { Start = item.Start + delta }
+                    : item).ToImmutableArray()
+        };
+    }
+}
+
+public enum TrimEdge
+{
+    Left,
+    Right
+}
+
+public sealed record TrimMediaClipCommand(Guid ClipId, TrimEdge Edge, TimelineTime NewEdge) : IEditCommand
+{
+    public string Description => "Обрезать клип";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var selected = RequireClip(project, ClipId);
+        var source = project.Sources[selected.SourceId];
+        var linked = selected.LinkGroupId is { } group
+            ? project.MediaClips.Where(item => item.LinkGroupId == group).Select(item => item.Id).ToHashSet()
+            : new HashSet<Guid> { selected.Id };
+        TimelineTime startDelta;
+        TimelineTime durationDelta;
+        if (Edge == TrimEdge.Left)
+        {
+            startDelta = NewEdge - selected.Start;
+            if (NewEdge < TimelineTime.Zero || NewEdge >= selected.End)
+                throw new EditRejectedException("Левая граница обрезки находится вне клипа.");
+            if (source.Kind != MediaKind.Image && selected.SourceIn + startDelta < TimelineTime.Zero)
+                throw new EditRejectedException("Обрезка выходит за начало исходника.");
+            durationDelta = -startDelta;
+        }
+        else
+        {
+            startDelta = TimelineTime.Zero;
+            durationDelta = NewEdge - selected.End;
+            if (NewEdge <= selected.Start)
+                throw new EditRejectedException("Правая граница обрезки находится перед началом клипа.");
+        }
+
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item =>
+            {
+                if (!linked.Contains(item.Id)) return item;
+                var itemSource = project.Sources[item.SourceId];
+                var newDuration = item.Duration + durationDelta;
+                if (newDuration <= TimelineTime.Zero)
+                    throw new EditRejectedException("Длительность клипа должна быть положительной.");
+                return item with
+                {
+                    Start = item.Start + startDelta,
+                    SourceIn = itemSource.Kind == MediaKind.Image ? item.SourceIn : item.SourceIn + startDelta,
+                    Duration = newDuration,
+                    Audio = ClampAudioFades(item.Audio, newDuration)
+                };
+            }).ToImmutableArray()
+        };
+    }
+}
+
+public sealed record SplitMediaClipsCommand(TimelineTime Position) : IEditCommand
+{
+    public string Description => "Разрезать активные клипы";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var targets = project.MediaClips.Where(item => Position > item.Start && Position < item.End).ToArray();
+        if (targets.Length == 0) return project;
+        var rightGroups = targets.Where(item => item.LinkGroupId.HasValue)
+            .Select(item => item.LinkGroupId!.Value)
+            .Distinct()
+            .ToDictionary(item => item, _ => Guid.NewGuid());
+        var replacements = new Dictionary<Guid, MediaClip>();
+        var additions = new List<MediaClip>();
+        foreach (var clip in targets)
+        {
+            var source = project.Sources[clip.SourceId];
+            var leftDuration = Position - clip.Start;
+            var rightDuration = clip.Duration - leftDuration;
+            replacements[clip.Id] = clip with
+            {
+                Duration = leftDuration,
+                Audio = ClampAudioFades(clip.Audio, leftDuration)
+            };
+            additions.Add(clip with
+            {
+                Id = Guid.NewGuid(),
+                LinkGroupId = clip.LinkGroupId is { } group ? rightGroups[group] : null,
+                Start = Position,
+                SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + leftDuration,
+                Duration = rightDuration,
+                Audio = ClampAudioFades(clip.Audio, rightDuration)
+            });
+        }
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item => replacements.GetValueOrDefault(item.Id, item))
+                .Concat(additions).ToImmutableArray()
+        };
+    }
+}
+
+public sealed record UnlinkMediaClipCommand(Guid ClipId) : IEditCommand
+{
+    public string Description => "Разорвать связь";
+    public ProjectState Apply(ProjectState project)
+    {
+        var clip = RequireClip(project, ClipId);
+        if (clip.LinkGroupId is not { } group) return project;
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item => item.LinkGroupId == group
+                ? item with { LinkGroupId = null }
+                : item).ToImmutableArray()
+        };
+    }
+}
+
+public sealed record RippleDeleteRangeCommand(TimeRange Range) : IEditCommand
+{
+    public string Description => "Удалить диапазон со сдвигом";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var rightLinkGroups = project.MediaClips
+            .Where(item => item.LinkGroupId.HasValue && item.Start < Range.Start && item.End > Range.End)
+            .Select(item => item.LinkGroupId!.Value)
+            .Distinct()
+            .ToDictionary(item => item, _ => Guid.NewGuid());
+        var media = new List<MediaClip>(project.MediaClips.Length);
+        foreach (var clip in project.MediaClips)
+            TransformMediaClip(project, clip, Range, rightLinkGroups, media);
+
+        var text = new List<TextClip>(project.TextClips.Length);
+        foreach (var clip in project.TextClips)
+            TransformTextClip(clip, Range, text);
+
+        var markers = new List<TimelineMarker>(project.Markers.Length);
+        foreach (var marker in project.Markers)
+            TransformMarker(marker, Range, markers);
+
+        return project with
+        {
+            MediaClips = media.ToImmutableArray(),
+            TextClips = text.ToImmutableArray(),
+            Markers = markers.ToImmutableArray(),
+            InPoint = TransformPoint(project.InPoint, Range),
+            OutPoint = TransformPoint(project.OutPoint, Range)
+        };
+    }
+
+    private static void TransformMediaClip(
+        ProjectState project,
+        MediaClip clip,
+        TimeRange range,
+        IReadOnlyDictionary<Guid, Guid> rightLinkGroups,
+        ICollection<MediaClip> output)
+    {
+        if (clip.End <= range.Start)
+        {
+            output.Add(clip);
+            return;
+        }
+        if (clip.Start >= range.End)
+        {
+            output.Add(clip with { Start = clip.Start - range.Duration });
+            return;
+        }
+        if (clip.Start >= range.Start && clip.End <= range.End) return;
+
+        var source = project.Sources[clip.SourceId];
+        if (clip.Start < range.Start && clip.End > range.End)
+        {
+            var leftDuration = range.Start - clip.Start;
+            var rightDuration = clip.End - range.End;
+            output.Add(clip with
+            {
+                Duration = leftDuration,
+                Audio = ClampAudioFades(clip.Audio, leftDuration)
+            });
+            output.Add(clip with
+            {
+                Id = Guid.NewGuid(),
+                LinkGroupId = clip.LinkGroupId is { } group ? rightLinkGroups[group] : null,
+                Start = range.Start,
+                SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + (range.End - clip.Start),
+                Duration = rightDuration,
+                Audio = ClampAudioFades(clip.Audio, rightDuration)
+            });
+            return;
+        }
+        if (clip.Start < range.Start)
+        {
+            var duration = range.Start - clip.Start;
+            output.Add(clip with { Duration = duration, Audio = ClampAudioFades(clip.Audio, duration) });
+            return;
+        }
+
+        var trimmed = range.End - clip.Start;
+        var remaining = clip.End - range.End;
+        output.Add(clip with
+        {
+            Start = range.Start,
+            SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + trimmed,
+            Duration = remaining,
+            Audio = ClampAudioFades(clip.Audio, remaining)
+        });
+    }
+
+    private static void TransformTextClip(TextClip clip, TimeRange range, ICollection<TextClip> output)
+    {
+        if (clip.End <= range.Start)
+        {
+            output.Add(clip);
+            return;
+        }
+        if (clip.Start >= range.End)
+        {
+            output.Add(clip with { Start = clip.Start - range.Duration });
+            return;
+        }
+        if (clip.Start >= range.Start && clip.End <= range.End) return;
+        if (clip.Start < range.Start && clip.End > range.End)
+        {
+            output.Add(clip with { Duration = clip.Duration - range.Duration });
+            return;
+        }
+        if (clip.Start < range.Start)
+        {
+            output.Add(clip with { Duration = range.Start - clip.Start });
+            return;
+        }
+        output.Add(clip with { Start = range.Start, Duration = clip.End - range.End });
+    }
+
+    private static void TransformMarker(TimelineMarker marker, TimeRange range, ICollection<TimelineMarker> output)
+    {
+        if (marker.End <= range.Start)
+        {
+            output.Add(marker);
+            return;
+        }
+        if (marker.Start >= range.End)
+        {
+            output.Add(marker with { Start = marker.Start - range.Duration });
+            return;
+        }
+        if (marker.Start >= range.Start && marker.End <= range.End) return;
+        if (marker.Start < range.Start && marker.End > range.End)
+        {
+            output.Add(marker with { Duration = marker.Duration - range.Duration });
+            return;
+        }
+        if (marker.Start < range.Start)
+        {
+            output.Add(marker with { Duration = range.Start - marker.Start });
+            return;
+        }
+        output.Add(marker with
+        {
+            Start = range.Start,
+            SourceStart = marker.SourceStart + (range.End - marker.Start),
+            Duration = marker.End - range.End
+        });
+    }
+
+    private static TimelineTime? TransformPoint(TimelineTime? point, TimeRange range)
+    {
+        if (point is null || point <= range.Start) return point;
+        if (point >= range.End) return point - range.Duration;
+        return range.Start;
+    }
+}
+
+public sealed record LinkMediaClipsCommand(IReadOnlySet<Guid> ClipIds) : IEditCommand
+{
+    public string Description => "Связать клипы";
+    public ProjectState Apply(ProjectState project)
+    {
+        var clips = project.MediaClips.Where(item => ClipIds.Contains(item.Id)).ToArray();
+        if (clips.Length < 2 || clips.Length != ClipIds.Count)
+            throw new EditRejectedException("Для связи требуется минимум два существующих клипа.");
+        var first = clips[0];
+        if (clips.Any(item => item.Start != first.Start || item.SourceIn != first.SourceIn || item.Duration != first.Duration))
+            throw new EditRejectedException("Связываемые клипы должны иметь одинаковые временные диапазоны.");
+        var kinds = clips.Select(item => project.FindTrack(item.TrackId)!.Kind).ToArray();
+        if (kinds.Distinct().Count() != kinds.Length)
+            throw new EditRejectedException("Нельзя связать два клипа одного типа.");
+        var group = Guid.NewGuid();
+        return project with
+        {
+            MediaClips = project.MediaClips.Select(item => ClipIds.Contains(item.Id)
+                ? item with { LinkGroupId = group }
+                : item).ToImmutableArray()
+        };
+    }
+}
+
+public sealed record UpsertTextClipCommand(TextClip Clip) : IEditCommand
+{
+    public string Description => "Изменить текст";
+    public ProjectState Apply(ProjectState project)
+    {
+        var exists = project.TextClips.Any(item => item.Id == Clip.Id);
+        return project with
+        {
+            TextClips = exists
+                ? project.TextClips.Select(item => item.Id == Clip.Id ? Clip : item).ToImmutableArray()
+                : project.TextClips.Add(Clip)
+        };
+    }
+}
+
+public sealed record DeleteTextClipsCommand(IReadOnlySet<Guid> ClipIds) : IEditCommand
+{
+    public string Description => "Удалить текст";
+    public ProjectState Apply(ProjectState project)
+        => project with { TextClips = project.TextClips.Where(item => !ClipIds.Contains(item.Id)).ToImmutableArray() };
+}
+
+public sealed record ReplaceMarkersCommand(IReadOnlyList<TimelineMarker> Markers) : IEditCommand
+{
+    public string Description => "Заменить метки";
+    public ProjectState Apply(ProjectState project) => project with { Markers = Markers.ToImmutableArray() };
+}
+
+public sealed record SetInOutCommand(TimelineTime? InPoint, TimelineTime? OutPoint) : IEditCommand
+{
+    public string Description => "Изменить точки входа и выхода";
+    public ProjectState Apply(ProjectState project) => project with { InPoint = InPoint, OutPoint = OutPoint };
+}
+
+public sealed record RenameProjectCommand(string Name) : IEditCommand
+{
+    public string Description => "Переименовать проект";
+    public ProjectState Apply(ProjectState project)
+    {
+        var normalized = Name?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            throw new EditRejectedException("Название проекта не может быть пустым.");
+        return project with { Name = normalized };
+    }
+}
+
+internal static class CommandHelpers
+{
+    public static MediaClip RequireClip(ProjectState project, Guid id)
+        => project.FindMediaClip(id) ?? throw new EditRejectedException($"Клип {id} не найден.");
+
+    public static AudioParameters? ClampAudioFades(AudioParameters? audio, TimelineTime duration)
+        => audio is null ? null : audio with
+        {
+            FadeIn = audio.FadeIn > duration ? duration : audio.FadeIn,
+            FadeOut = audio.FadeOut > duration ? duration : audio.FadeOut
+        };
+}

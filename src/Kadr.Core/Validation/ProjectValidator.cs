@@ -1,0 +1,183 @@
+using KadrStudio.Core.Domain;
+
+namespace KadrStudio.Core.Validation;
+
+public sealed record ValidationError(string Code, string Message, Guid? EntityId = null);
+
+public sealed record ValidationResult(IReadOnlyList<ValidationError> Errors)
+{
+    public bool IsValid => Errors.Count == 0;
+    public static ValidationResult Valid { get; } = new(Array.Empty<ValidationError>());
+}
+
+public interface IProjectValidator
+{
+    ValidationResult Validate(ProjectState project);
+}
+
+public sealed class ProjectValidator : IProjectValidator
+{
+    public ValidationResult Validate(ProjectState project)
+    {
+        var errors = new List<ValidationError>();
+        ValidateProject(project, errors);
+        ValidateTracks(project, errors);
+        ValidateSources(project, errors);
+        ValidateClips(project, errors);
+        ValidateText(project, errors);
+        ValidateMarkers(project, errors);
+        ValidateInOut(project, errors);
+        return errors.Count == 0 ? ValidationResult.Valid : new ValidationResult(errors);
+    }
+
+    private static void ValidateProject(ProjectState project, ICollection<ValidationError> errors)
+    {
+        if (project.Id == Guid.Empty) errors.Add(new("project.id", "Project ID cannot be empty."));
+        if (string.IsNullOrWhiteSpace(project.Name)) errors.Add(new("project.name", "Project name cannot be empty."));
+        if (project.CanvasWidth is < 320 or > 7680 || project.CanvasHeight is < 240 or > 4320)
+            errors.Add(new("project.canvas", "Canvas size is outside the supported range."));
+    }
+
+    private static void ValidateTracks(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.Tracks.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("track.duplicate-id", "Track IDs must be unique.", duplicate.Key));
+        foreach (var duplicate in project.Tracks.GroupBy(item => (item.Kind, item.Index)).Where(group => group.Count() > 1))
+            errors.Add(new("track.duplicate-index", $"Track {duplicate.Key.Kind}{duplicate.Key.Index + 1} is duplicated."));
+        foreach (var track in project.Tracks)
+        {
+            if (track.Id == Guid.Empty) errors.Add(new("track.id", "Track ID cannot be empty."));
+            if (track.Index < 0) errors.Add(new("track.index", "Track index cannot be negative.", track.Id));
+            if (string.IsNullOrWhiteSpace(track.Name)) errors.Add(new("track.name", "Track name cannot be empty.", track.Id));
+        }
+        if (project.Tracks.Count(item => item.Kind == TrackKind.Visual) < 2)
+            errors.Add(new("track.visual-minimum", "A project must contain at least two visual tracks."));
+        if (project.Tracks.Count(item => item.Kind == TrackKind.Audio) < 2)
+            errors.Add(new("track.audio-minimum", "A project must contain at least two audio tracks."));
+    }
+
+    private static void ValidateSources(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var pair in project.Sources)
+        {
+            var source = pair.Value;
+            if (pair.Key != source.Id || source.Id == Guid.Empty)
+                errors.Add(new("source.id", "Media source dictionary key and ID must match.", source.Id));
+            if (string.IsNullOrWhiteSpace(source.Path)) errors.Add(new("source.path", "Media source path cannot be empty.", source.Id));
+            if (source.Duration <= TimelineTime.Zero) errors.Add(new("source.duration", "Media source duration must be positive.", source.Id));
+        }
+    }
+
+    private static void ValidateClips(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.MediaClips.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("clip.duplicate-id", "Clip IDs must be unique.", duplicate.Key));
+
+        foreach (var clip in project.MediaClips)
+        {
+            var track = project.FindTrack(clip.TrackId);
+            project.Sources.TryGetValue(clip.SourceId, out var source);
+            if (clip.Id == Guid.Empty) errors.Add(new("clip.id", "Clip ID cannot be empty."));
+            if (track is null) errors.Add(new("clip.track", "Clip references a missing track.", clip.Id));
+            if (source is null) errors.Add(new("clip.source", "Clip references a missing source.", clip.Id));
+            if (clip.Start < TimelineTime.Zero || clip.SourceIn < TimelineTime.Zero || clip.Duration <= TimelineTime.Zero)
+                errors.Add(new("clip.time", "Clip timing is invalid.", clip.Id));
+            if (track is not null && source is not null)
+            {
+                if (track.Kind == TrackKind.Visual && source.Kind is not (MediaKind.Video or MediaKind.Image))
+                    errors.Add(new("clip.visual-source", "Visual tracks accept video and images only.", clip.Id));
+                if (track.Kind == TrackKind.Audio && !source.HasAudio)
+                    errors.Add(new("clip.audio-source", "Audio tracks require a source with audio.", clip.Id));
+                if (track.Kind == TrackKind.Text)
+                    errors.Add(new("clip.text-track", "Media clips cannot be placed on a text track.", clip.Id));
+                if (source.Kind != MediaKind.Image && clip.SourceIn + clip.Duration > source.Duration)
+                    errors.Add(new("clip.source-range", "Clip range exceeds source duration.", clip.Id));
+            }
+            ValidateEffects(clip, errors);
+        }
+
+        foreach (var trackGroup in project.MediaClips.GroupBy(item => item.TrackId))
+        {
+            var ordered = trackGroup.OrderBy(item => item.Start).ThenBy(item => item.Id).ToArray();
+            for (var index = 1; index < ordered.Length; index++)
+            {
+                if (ordered[index].Start < ordered[index - 1].End)
+                    errors.Add(new("clip.overlap", "Clips on the same track cannot overlap.", ordered[index].Id));
+            }
+        }
+
+        foreach (var linkGroup in project.MediaClips.Where(item => item.LinkGroupId.HasValue).GroupBy(item => item.LinkGroupId!.Value))
+        {
+            var clips = linkGroup.ToArray();
+            if (clips.Length < 2)
+            {
+                errors.Add(new("link.orphan", "A link group must contain at least two clips.", linkGroup.Key));
+                continue;
+            }
+            var first = clips[0];
+            if (clips.Any(item => item.Start != first.Start || item.SourceIn != first.SourceIn || item.Duration != first.Duration))
+                errors.Add(new("link.timing", "Linked clips must have identical timeline and source ranges.", linkGroup.Key));
+            if (clips.GroupBy(item => project.FindTrack(item.TrackId)?.Kind).Any(group => group.Count() > 1))
+                errors.Add(new("link.kind", "A link group may contain only one clip of each track kind.", linkGroup.Key));
+        }
+    }
+
+    private static void ValidateEffects(MediaClip clip, ICollection<ValidationError> errors)
+    {
+        if (clip.Video is { } video &&
+            (video.Brightness is < -1 or > 1 || video.Contrast is < 0 or > 3 ||
+             video.Saturation is < 0 or > 3 || video.Temperature is < -1 or > 1))
+            errors.Add(new("clip.video-parameters", "Video parameters are outside the supported range.", clip.Id));
+        if (clip.Audio is { } audio &&
+            (audio.Volume is < 0 or > 2 || audio.Pan is < -1 or > 1 ||
+             audio.Bass is < -20 or > 20 || audio.Mid is < -20 or > 20 || audio.Treble is < -20 or > 20 ||
+             audio.FadeIn < TimelineTime.Zero || audio.FadeOut < TimelineTime.Zero ||
+             audio.FadeIn > clip.Duration || audio.FadeOut > clip.Duration))
+            errors.Add(new("clip.audio-parameters", "Audio parameters are outside the supported range.", clip.Id));
+    }
+
+    private static void ValidateText(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.TextClips.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("text.duplicate-id", "Text clip IDs must be unique.", duplicate.Key));
+        foreach (var clip in project.TextClips)
+        {
+            var track = project.FindTrack(clip.TrackId);
+            if (track?.Kind != TrackKind.Text) errors.Add(new("text.track", "Text clip requires a text track.", clip.Id));
+            if (clip.Start < TimelineTime.Zero || clip.Duration <= TimelineTime.Zero)
+                errors.Add(new("text.time", "Text clip timing is invalid.", clip.Id));
+            if (string.IsNullOrEmpty(clip.Text)) errors.Add(new("text.empty", "Text clip content cannot be empty.", clip.Id));
+            if (clip.Style.FontSize is < 4 or > 500 || clip.Style.X is < 0 or > 1 || clip.Style.Y is < 0 or > 1 ||
+                clip.Style.BoxWidth is <= 0 or > 1 || clip.Style.BoxHeight is <= 0 or > 1)
+                errors.Add(new("text.style", "Text style is outside the supported range.", clip.Id));
+        }
+        foreach (var group in project.TextClips.GroupBy(item => item.TrackId))
+        {
+            var ordered = group.OrderBy(item => item.Start).ThenBy(item => item.Id).ToArray();
+            for (var index = 1; index < ordered.Length; index++)
+                if (ordered[index].Start < ordered[index - 1].End)
+                    errors.Add(new("text.overlap", "Text clips on the same track cannot overlap.", ordered[index].Id));
+        }
+    }
+
+    private static void ValidateMarkers(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.Markers.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("marker.duplicate-id", "Marker IDs must be unique.", duplicate.Key));
+        foreach (var marker in project.Markers)
+        {
+            if (marker.Start < TimelineTime.Zero || marker.Duration <= TimelineTime.Zero)
+                errors.Add(new("marker.time", "Marker timing is invalid.", marker.Id));
+            if (marker.Confidence is < 0 or > 1)
+                errors.Add(new("marker.confidence", "Marker confidence must be between 0 and 1.", marker.Id));
+        }
+    }
+
+    private static void ValidateInOut(ProjectState project, ICollection<ValidationError> errors)
+    {
+        if (project.InPoint < TimelineTime.Zero || project.OutPoint < TimelineTime.Zero)
+            errors.Add(new("inout.negative", "In/Out points cannot be negative."));
+        if (project.InPoint is { } start && project.OutPoint is { } end && end <= start)
+            errors.Add(new("inout.order", "Out point must be after In point."));
+    }
+}

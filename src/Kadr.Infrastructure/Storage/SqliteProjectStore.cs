@@ -188,18 +188,19 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$fingerprint", source.Fingerprint)).ConfigureAwait(false);
         }
 
-        foreach (var clip in project.MediaClips)
+        for (var ordinal = 0; ordinal < project.MediaClips.Length; ordinal++)
         {
+            var clip = project.MediaClips[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO media_clips(
-                    id, source_id, track_id, start_ticks, source_in_ticks, duration_ticks, link_group_id,
+                    id, clip_order, source_id, track_id, start_ticks, source_in_ticks, duration_ticks, link_group_id,
                     brightness, contrast, saturation, temperature,
                     volume, is_muted, pan, fade_in_ticks, fade_out_ticks, bass, mid, treble)
-                VALUES($id, $sourceId, $trackId, $start, $sourceIn, $duration, $linkGroup,
+                VALUES($id, $order, $sourceId, $trackId, $start, $sourceIn, $duration, $linkGroup,
                        $brightness, $contrast, $saturation, $temperature,
                        $volume, $muted, $pan, $fadeIn, $fadeOut, $bass, $mid, $treble);
                 """, token,
-                ("$id", clip.Id.ToString("N")), ("$sourceId", clip.SourceId.ToString("N")),
+                ("$id", clip.Id.ToString("N")), ("$order", ordinal), ("$sourceId", clip.SourceId.ToString("N")),
                 ("$trackId", clip.TrackId.ToString("N")), ("$start", clip.Start.Ticks),
                 ("$sourceIn", clip.SourceIn.Ticks), ("$duration", clip.Duration.Ticks),
                 ("$linkGroup", clip.LinkGroupId?.ToString("N")),
@@ -211,16 +212,17 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$mid", clip.Audio?.Mid), ("$treble", clip.Audio?.Treble)).ConfigureAwait(false);
         }
 
-        foreach (var clip in project.TextClips)
+        for (var ordinal = 0; ordinal < project.TextClips.Length; ordinal++)
         {
+            var clip = project.TextClips[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO text_clips(
-                    id, track_id, start_ticks, duration_ticks, text, font_family, font_size, color,
+                    id, clip_order, track_id, start_ticks, duration_ticks, text, font_family, font_size, color,
                     x, y, rotation, box_width, box_height, is_subtitle)
-                VALUES($id, $trackId, $start, $duration, $text, $font, $fontSize, $color,
+                VALUES($id, $order, $trackId, $start, $duration, $text, $font, $fontSize, $color,
                        $x, $y, $rotation, $boxWidth, $boxHeight, $subtitle);
                 """, token,
-                ("$id", clip.Id.ToString("N")), ("$trackId", clip.TrackId.ToString("N")),
+                ("$id", clip.Id.ToString("N")), ("$order", ordinal), ("$trackId", clip.TrackId.ToString("N")),
                 ("$start", clip.Start.Ticks), ("$duration", clip.Duration.Ticks), ("$text", clip.Text),
                 ("$font", clip.Style.FontFamily), ("$fontSize", clip.Style.FontSize), ("$color", clip.Style.Color),
                 ("$x", clip.Style.X), ("$y", clip.Style.Y), ("$rotation", clip.Style.Rotation),
@@ -228,16 +230,17 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$subtitle", clip.Style.IsSubtitle)).ConfigureAwait(false);
         }
 
-        foreach (var marker in project.Markers)
+        for (var ordinal = 0; ordinal < project.Markers.Length; ordinal++)
         {
+            var marker = project.Markers[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO markers(
-                    id, kind, start_ticks, duration_ticks, title, description, source_id,
+                    id, marker_order, kind, start_ticks, duration_ticks, title, description, source_id,
                     source_start_ticks, confidence, query)
-                VALUES($id, $kind, $start, $duration, $title, $description, $sourceId,
+                VALUES($id, $order, $kind, $start, $duration, $title, $description, $sourceId,
                        $sourceStart, $confidence, $query);
                 """, token,
-                ("$id", marker.Id.ToString("N")), ("$kind", (int)marker.Kind),
+                ("$id", marker.Id.ToString("N")), ("$order", ordinal), ("$kind", (int)marker.Kind),
                 ("$start", marker.Start.Ticks), ("$duration", marker.Duration.Ticks),
                 ("$title", marker.Title), ("$description", marker.Description),
                 ("$sourceId", marker.SourceId?.ToString("N")), ("$sourceStart", marker.SourceStart.Ticks),
@@ -344,7 +347,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 SELECT id, source_id, track_id, start_ticks, source_in_ticks, duration_ticks, link_group_id,
                        brightness, contrast, saturation, temperature,
                        volume, is_muted, pan, fade_in_ticks, fade_out_ticks, bass, mid, treble
-                FROM media_clips ORDER BY track_id, start_ticks, id;
+                FROM media_clips ORDER BY clip_order;
                 """;
             await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
             while (await reader.ReadAsync(token).ConfigureAwait(false))
@@ -377,7 +380,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             command.CommandText = """
                 SELECT id, track_id, start_ticks, duration_ticks, text, font_family, font_size, color,
                        x, y, rotation, box_width, box_height, is_subtitle
-                FROM text_clips ORDER BY track_id, start_ticks, id;
+                FROM text_clips ORDER BY clip_order;
                 """;
             await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
             while (await reader.ReadAsync(token).ConfigureAwait(false))
@@ -399,7 +402,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             command.CommandText = """
                 SELECT id, kind, start_ticks, duration_ticks, title, description, source_id,
                        source_start_ticks, confidence, query
-                FROM markers ORDER BY start_ticks, id;
+                FROM markers ORDER BY marker_order;
                 """;
             await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
             while (await reader.ReadAsync(token).ConfigureAwait(false))
@@ -486,6 +489,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ) STRICT;
             CREATE TABLE IF NOT EXISTS media_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
                 source_id TEXT NOT NULL REFERENCES media_sources(id) ON DELETE RESTRICT,
                 track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
@@ -510,6 +514,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             CREATE INDEX IF NOT EXISTS ix_media_clips_link ON media_clips(link_group_id) WHERE link_group_id IS NOT NULL;
             CREATE TABLE IF NOT EXISTS text_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
                 track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
                 duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
@@ -527,6 +532,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             CREATE INDEX IF NOT EXISTS ix_text_clips_track_time ON text_clips(track_id, start_ticks, duration_ticks);
             CREATE TABLE IF NOT EXISTS markers(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                marker_order INTEGER NOT NULL UNIQUE CHECK(marker_order >= 0),
                 kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 9),
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
                 duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),

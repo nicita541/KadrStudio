@@ -46,6 +46,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private double _editReviewPlayhead;
     private bool _editReviewWasDirty;
     private bool _suppressDirtyTracking;
+    private long _timelinePresentationRevision;
     private int _disposeState;
 
     public MainViewModel()
@@ -83,6 +84,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public OllamaVideoAnalysisService OllamaVideoAnalysisService { get; }
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public IArtifactStore ArtifactStore => _artifactStore;
+    public long TimelinePresentationRevision => _timelinePresentationRevision;
 
     public EditorProject Project
     {
@@ -294,9 +296,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return Array.Empty<string>();
         }
 
-        BeginEdit();
         IsBusy = true;
         var errors = new List<string>();
+        var imported = new List<MediaAsset>();
         try
         {
             for (var index = 0; index < uniquePaths.Count; index++)
@@ -308,8 +310,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 {
                     var asset = await MediaProbeService.ProbeAsync(path, cancellationToken);
                     asset.ThumbnailPath = await ThumbnailService.CreateAsync(asset, cancellationToken);
-                    Project.Media.Add(asset);
-                    PrepareTimelineMedia(asset);
+                    imported.Add(asset);
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
@@ -317,9 +318,23 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 }
             }
 
-            CommitEdit();
+            if (imported.Count > 0)
+            {
+                var result = _editorSession.Execute(new EditTransaction(
+                    "Импорт медиа",
+                    new AddSourcesCommand(imported.Select(_projectMapper.ToCoreSource).ToArray())));
+                RestoreFromCoreState(result.State);
+                foreach (var importedAsset in imported)
+                {
+                    var restored = Project.FindAsset(importedAsset.Id);
+                    if (restored is null) continue;
+                    restored.ThumbnailPath = importedAsset.ThumbnailPath;
+                    restored.ProbeResult = importedAsset.ProbeResult;
+                    _ = PrepareTimelineMediaAsync(restored);
+                }
+            }
             StatusText = errors.Count == 0
-                ? $"Импортировано файлов: {uniquePaths.Count}"
+                ? $"Импортировано файлов: {imported.Count}"
                 : $"Импорт завершён с ошибками: {errors.Count}";
             return errors;
         }
@@ -924,6 +939,95 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         return true;
     }
 
+    public bool ApplyTimelineEdit(TimelineEditIntent intent)
+    {
+        ArgumentNullException.ThrowIfNull(intent);
+        return intent switch
+        {
+            MediaTimelineEditIntent media => ApplyMediaTimelineEdit(media),
+            TextTimelineEditIntent text => ApplyTextTimelineEdit(text),
+            _ => throw new ArgumentOutOfRangeException(nameof(intent))
+        };
+    }
+
+    private bool ApplyMediaTimelineEdit(MediaTimelineEditIntent intent)
+    {
+        var clip = _editorSession.State.FindMediaClip(intent.ClipId)
+            ?? throw new EditRejectedException("Клип больше не существует.");
+        IEditCommand command = intent.EditOperation switch
+        {
+            TimelineEditOperation.Move => new MoveMediaClipCommand(
+                clip.Id,
+                _editorSession.State.Tracks
+                    .FirstOrDefault(track => track.Kind == intent.TargetTrackKind &&
+                                             track.Index == intent.TargetTrackIndex)?.Id
+                ?? throw new EditRejectedException("Целевая дорожка больше не существует."),
+                intent.Start),
+            TimelineEditOperation.TrimLeft => new TrimMediaClipCommand(
+                clip.Id, TrimEdge.Left, intent.Start),
+            TimelineEditOperation.TrimRight => new TrimMediaClipCommand(
+                clip.Id, TrimEdge.Right, intent.Start + intent.Duration),
+            _ => throw new ArgumentOutOfRangeException(nameof(intent))
+        };
+        var description = intent.EditOperation == TimelineEditOperation.Move
+            ? "Клип перемещён"
+            : "Клип обрезан";
+        return ExecuteCoreCommand(description, command, clip.Id);
+    }
+
+    private bool ApplyTextTimelineEdit(TextTimelineEditIntent intent)
+    {
+        var text = _editorSession.State.FindTextClip(intent.TextClipId)
+            ?? throw new EditRejectedException("Текстовый клип больше не существует.");
+        return ExecuteCoreCommand(
+            intent.EditOperation == TimelineEditOperation.Move
+                ? "Текстовый клип перемещён"
+                : "Текстовый клип обрезан",
+            new UpsertTextClipCommand(text with { Start = intent.Start, Duration = intent.Duration }));
+    }
+
+    public bool AddTextOverlay(TextOverlay overlay, string description = "Текст добавлен")
+    {
+        ArgumentNullException.ThrowIfNull(overlay);
+        return ExecuteCoreCommand(description,
+            new AddTextClipsCommand([_projectMapper.ToCoreText(overlay, _editorSession.State)]));
+    }
+
+    public bool UpdateTextOverlay(TextOverlay overlay, string description = "Текст изменён")
+    {
+        ArgumentNullException.ThrowIfNull(overlay);
+        return ExecuteCoreCommand(description,
+            new UpsertTextClipCommand(_projectMapper.ToCoreText(overlay, _editorSession.State)));
+    }
+
+    public bool DeleteTextOverlay(Guid overlayId, string description = "Текст удалён")
+        => ExecuteCoreCommand(description, new DeleteTextClipsCommand(new HashSet<Guid> { overlayId }));
+
+    public bool SetInOut(double? inPoint, double? outPoint, string description)
+        => ExecuteCoreCommand(description, new SetInOutCommand(
+            inPoint is null ? null : KadrStudio.Core.Domain.TimelineTime.FromSeconds(inPoint.Value),
+            outPoint is null ? null : KadrStudio.Core.Domain.TimelineTime.FromSeconds(outPoint.Value)));
+
+    public Guid? SplitTextOverlay(Guid overlayId, double position)
+    {
+        var current = _editorSession.State.FindTextClip(overlayId);
+        var split = KadrStudio.Core.Domain.TimelineTime.FromSeconds(position);
+        if (current is null || split <= current.Start || split >= current.End) return null;
+        var rightId = Guid.NewGuid();
+        var left = current with { Duration = split - current.Start };
+        var right = current with
+        {
+            Id = rightId,
+            Start = split,
+            Duration = current.End - split
+        };
+        return ExecuteCoreCommand("Текстовый клип разделён",
+            new EditBatchCommand("Split text", [
+                new UpsertTextClipCommand(left),
+                new AddTextClipsCommand([right])
+            ])) ? rightId : null;
+    }
+
     private static KadrStudio.Core.Domain.MediaClip CreateCoreClip(
         Guid sourceId,
         Guid clipId,
@@ -997,11 +1101,11 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         foreach (var asset in project.Media)
         {
-            PrepareTimelineMedia(asset);
+            _ = PrepareTimelineMediaAsync(asset);
         }
     }
 
-    private async void PrepareTimelineMedia(MediaAsset asset)
+    private async Task PrepareTimelineMediaAsync(MediaAsset asset)
     {
         try
         {
@@ -1010,6 +1114,11 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         catch
         {
             // Монтаж остаётся доступным, даже если FFmpeg не смог построить визуальный кэш дорожки.
+        }
+        finally
+        {
+            _timelinePresentationRevision++;
+            OnPropertyChanged(nameof(TimelinePresentationRevision));
         }
     }
 

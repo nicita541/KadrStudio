@@ -61,4 +61,16 @@ public sealed class TimelineGeometryTests
         Assert.Equal(0, controller.PointerOffsetSeconds);
         Assert.False(controller.IsDraggingPlayhead);
     }
+
+    [Fact]
+    public void Track_layout_virtualizes_rows_outside_vertical_viewport()
+    {
+        var layout = new TrackLayout(8, 8, true);
+        var viewportTop = layout.GetTrackTop(TrackKind.Visual, 1);
+        var viewportHeight = layout.TrackHeight * 4;
+
+        Assert.True(layout.IntersectsViewport(layout.GetTrackTop(TrackKind.Visual, 1), viewportTop, viewportHeight));
+        Assert.False(layout.IntersectsViewport(layout.GetTrackTop(TrackKind.Visual, 7), viewportTop, viewportHeight));
+        Assert.False(layout.IntersectsViewport(layout.GetTrackTop(TrackKind.Audio, 7), viewportTop, viewportHeight));
+    }
 }

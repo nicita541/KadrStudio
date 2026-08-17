@@ -14,6 +14,16 @@ public sealed record ReplaceProjectStateCommand(ProjectState Candidate, string D
     public ProjectState Apply(ProjectState project) => Candidate;
 }
 
+public sealed record EditBatchCommand(string Description, IReadOnlyList<IEditCommand> Commands) : IEditCommand
+{
+    public ProjectState Apply(ProjectState project)
+    {
+        var state = project;
+        foreach (var command in Commands) state = command.Apply(state);
+        return state;
+    }
+}
+
 public sealed record AddSourcesCommand(IReadOnlyList<MediaSource> Sources) : IEditCommand
 {
     public string Description => "Добавить исходники";

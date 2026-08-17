@@ -1,12 +1,13 @@
-using System.Collections.Specialized;
-using System.ComponentModel;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using KadrStudio.Application.Editing;
 using KadrStudio.Models;
 using KadrStudio.Services;
+using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
+using TimelineTime = KadrStudio.Core.Domain.TimelineTime;
 
 namespace KadrStudio.Controls;
 
@@ -31,7 +32,7 @@ public sealed class TimelineControl : FrameworkElement
     private readonly Pen _gridPen = CreatePen(Color.FromRgb(48, 49, 57), 1);
     private readonly Pen _minorGridPen = CreatePen(Color.FromRgb(38, 39, 46), 1);
     private readonly Pen _playheadPen = CreatePen(Color.FromRgb(242, 84, 105), 2);
-    private EditorProject? _project;
+    private TimelineReadModel? _document;
     private Guid? _selectedClipId;
     private double _playheadSeconds;
     private double _pixelsPerSecond = 72;
@@ -58,21 +59,14 @@ public sealed class TimelineControl : FrameworkElement
     public event EventHandler<PlayheadChangedEventArgs>? PlayheadChanged;
     public event EventHandler<TimelineEditEventArgs>? EditStarted;
     public event EventHandler<TimelineEditEventArgs>? EditCompleted;
+    public event EventHandler<TimelineEditRequestedEventArgs>? EditRequested;
     public event EventHandler<AssetDroppedEventArgs>? AssetDropped;
 
     public EditorProject? Project
     {
-        get => _project;
         set
         {
-            if (ReferenceEquals(_project, value))
-            {
-                return;
-            }
-
-            DetachProject(_project);
-            _project = value;
-            AttachProject(_project);
+            _document = value is null ? null : TimelineReadModel.From(value);
             InvalidateMeasure();
             InvalidateVisual();
         }
@@ -111,7 +105,7 @@ public sealed class TimelineControl : FrameworkElement
         get => _playheadSeconds;
         set
         {
-            var bounded = Math.Clamp(value, 0, Math.Max(0, Project?.TimelineDisplayDuration ?? 0));
+            var bounded = Math.Clamp(value, 0, Math.Max(0, _document?.TimelineDisplayDuration ?? 0));
             if (Math.Abs(_playheadSeconds - bounded) < 0.0001)
             {
                 return;
@@ -139,13 +133,15 @@ public sealed class TimelineControl : FrameworkElement
 
     public double HorizontalViewportOffset { get; set; }
     public double HorizontalViewportWidth { get; set; }
+    public double VerticalViewportOffset { get; set; }
+    public double VerticalViewportHeight { get; set; }
     private TimelineViewport Viewport => new(PixelsPerSecond, HorizontalViewportOffset, HorizontalViewportWidth, LeftGutterWidth);
     private TrackLayout Layout => new(GetTrackCount(TrackKind.Visual), GetTrackCount(TrackKind.Audio), HasTextTrack,
         TrackAreaTop, TrackHeight, TrackGap, TrackBottomPadding);
 
     protected override Size MeasureOverride(Size availableSize)
     {
-        var duration = Math.Max(1, Project?.TimelineDisplayDuration ?? 0);
+        var duration = Math.Max(1, _document?.TimelineDisplayDuration ?? 0);
         var width = LeftGutterWidth + duration * PixelsPerSecond + TimelineEndPadding;
         if (!double.IsInfinity(availableSize.Width))
         {
@@ -168,15 +164,17 @@ public sealed class TimelineControl : FrameworkElement
         var audioCount = GetTrackCount(TrackKind.Audio);
         if (HasTextTrack)
         {
-            DrawTextTrack(context, dpi);
+            if (IsTrackVisible(Layout.TextTrackTop)) DrawTextTrack(context, dpi);
         }
         for (var index = 0; index < visualCount; index++)
         {
-            DrawTrack(context, TrackKind.Visual, index, dpi);
+            if (IsTrackVisible(Layout.GetTrackTop(TrackKind.Visual, index)))
+                DrawTrack(context, TrackKind.Visual, index, dpi);
         }
         for (var index = 0; index < audioCount; index++)
         {
-            DrawTrack(context, TrackKind.Audio, index, dpi);
+            if (IsTrackVisible(Layout.GetTrackTop(TrackKind.Audio, index)))
+                DrawTrack(context, TrackKind.Audio, index, dpi);
         }
 
         DrawClips(context, dpi);
@@ -240,14 +238,14 @@ public sealed class TimelineControl : FrameworkElement
         TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(null));
         SelectedClipId = hit.Id;
         ClipSelected?.Invoke(this, new ClipSelectedEventArgs(hit.Id));
-        _dragClip = hit;
+        _dragClip = hit.Clone();
         _dragOriginal = hit.Clone();
         _dragLinkedClips.Clear();
-        if (hit.LinkGroupId is Guid linkGroupId && Project is not null)
+        if (hit.LinkGroupId is Guid linkGroupId && _document is not null)
         {
-            _dragLinkedClips.AddRange(Project.Clips
+            _dragLinkedClips.AddRange(_document.Clips
                 .Where(clip => clip.Id != hit.Id && clip.LinkGroupId == linkGroupId)
-                .Select(clip => (clip, clip.Clone())));
+                .Select(clip => (clip.Clone(), clip.Clone())));
         }
         _dragOrigin = point;
         _dragChanged = false;
@@ -337,13 +335,24 @@ public sealed class TimelineControl : FrameworkElement
         }
         if (_dragTextOverlay is not null)
         {
-            var overlayId = _dragTextOverlay.Id;
+            var draft = _dragTextOverlay.Clone();
+            var overlayId = draft.Id;
+            var changed = _dragChanged;
+            var textOperation = _interaction.DragOperation;
             if (IsMouseCaptured) ReleaseMouseCapture();
             Cursor = Cursors.Arrow;
             _dragTextOverlay = null;
             _dragTextOriginal = null;
             _interaction.EndDrag();
-            EditCompleted?.Invoke(this, new TimelineEditEventArgs(overlayId, _dragChanged));
+            if (changed)
+            {
+                EditRequested?.Invoke(this, new TimelineEditRequestedEventArgs(new TextTimelineEditIntent(
+                    draft.Id,
+                    MapOperation(textOperation),
+                    TimelineTime.FromSeconds(draft.Start),
+                    TimelineTime.FromSeconds(draft.Duration))));
+            }
+            EditCompleted?.Invoke(this, new TimelineEditEventArgs(overlayId, changed));
             _dragChanged = false;
             e.Handled = true;
             return;
@@ -352,14 +361,28 @@ public sealed class TimelineControl : FrameworkElement
         {
             return;
         }
-        var clipId = _dragClip.Id;
+        var draftClip = _dragClip.Clone();
+        var clipId = draftClip.Id;
+        var operation = _interaction.DragOperation;
+        var changedClip = _dragChanged;
         ReleaseMouseCapture();
         Cursor = Cursors.Arrow;
         _dragClip = null;
         _dragOriginal = null;
         _dragLinkedClips.Clear();
         _interaction.EndDrag();
-        EditCompleted?.Invoke(this, new TimelineEditEventArgs(clipId, _dragChanged));
+        if (changedClip)
+        {
+            EditRequested?.Invoke(this, new TimelineEditRequestedEventArgs(new MediaTimelineEditIntent(
+                draftClip.Id,
+                MapOperation(operation),
+                draftClip.Track == TrackKind.Visual ? CoreTrackKind.Visual : CoreTrackKind.Audio,
+                draftClip.TrackIndex,
+                TimelineTime.FromSeconds(draftClip.Start),
+                TimelineTime.FromSeconds(draftClip.SourceStart),
+                TimelineTime.FromSeconds(draftClip.Duration))));
+        }
+        EditCompleted?.Invoke(this, new TimelineEditEventArgs(clipId, changedClip));
         _dragChanged = false;
         e.Handled = true;
     }
@@ -381,7 +404,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void BeginTextOverlayDrag(TextOverlay overlay, Point point)
     {
-        _dragTextOverlay = overlay;
+        _dragTextOverlay = overlay.Clone();
         _dragTextOriginal = overlay.Clone();
         _dragOrigin = point;
         _dragChanged = false;
@@ -462,12 +485,12 @@ public sealed class TimelineControl : FrameworkElement
 
     private void ApplyDrag(Point point)
     {
-        if (_dragClip is null || _dragOriginal is null || Project is null)
+        if (_dragClip is null || _dragOriginal is null || _document is null)
         {
             return;
         }
         var deltaSeconds = (point.X - _dragOrigin.X) / PixelsPerSecond;
-        var asset = Project.FindAsset(_dragClip.AssetId);
+        var asset = _document.FindAsset(_dragClip.AssetId);
         switch (_interaction.DragOperation)
         {
             case TimelineDragOperation.TrimLeft:
@@ -515,7 +538,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void MoveClip(Point point)
     {
-        if (Project is null || _dragClip is null)
+        if (_document is null || _dragClip is null)
         {
             return;
         }
@@ -547,11 +570,11 @@ public sealed class TimelineControl : FrameworkElement
 
     private double FindNonOverlappingStart(TimelineClip moving, double desiredStart)
     {
-        if (Project is null)
+        if (_document is null)
         {
             return Math.Max(0, desiredStart);
         }
-        var others = Project.GetTrackClips(moving.Track, moving.TrackIndex)
+        var others = _document.GetTrackClips(moving.Track, moving.TrackIndex)
             .Where(clip => clip.Id != moving.Id &&
                            (moving.LinkGroupId is null || clip.LinkGroupId != moving.LinkGroupId))
             .ToList();
@@ -599,7 +622,7 @@ public sealed class TimelineControl : FrameworkElement
             new Rect(LeftGutterWidth, top, Math.Max(0, RenderSize.Width - LeftGutterWidth - 7), TrackHeight),
             4,
             4);
-        var hasClips = Project?.Clips.Any(clip => clip.Track == kind && clip.TrackIndex == index) ?? false;
+        var hasClips = _document?.Clips.Any(clip => clip.Track == kind && clip.TrackIndex == index) ?? false;
         if (!hasClips)
         {
             var last = index == GetTrackCount(kind) - 1;
@@ -627,11 +650,14 @@ public sealed class TimelineControl : FrameworkElement
         context.DrawLine(_gridPen, new Point(left + LeftGutterWidth, 0), new Point(left + LeftGutterWidth, RenderSize.Height));
         var visibleTime = Viewport.VisibleTimelineStart;
         context.DrawText(CreateText(FormatRulerTime(visibleTime), 9.5, Color.FromRgb(167, 168, 176), dpi), new Point(left + 8, 1));
-        if (HasTextTrack) DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254), dpi);
+        if (HasTextTrack && IsTrackVisible(GetTextTrackTop()))
+            DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254), dpi);
         for (var index = 0; index < GetTrackCount(TrackKind.Visual); index++)
-            DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Visual, index), $"V{index + 1}", Color.FromRgb(89, 145, 245), dpi);
+            if (IsTrackVisible(GetTrackTop(TrackKind.Visual, index)))
+                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Visual, index), $"V{index + 1}", Color.FromRgb(89, 145, 245), dpi);
         for (var index = 0; index < GetTrackCount(TrackKind.Audio); index++)
-            DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Audio, index), $"A{index + 1}", Color.FromRgb(55, 190, 128), dpi);
+            if (IsTrackVisible(GetTrackTop(TrackKind.Audio, index)))
+                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Audio, index), $"A{index + 1}", Color.FromRgb(55, 190, 128), dpi);
     }
 
     private void DrawStickyTrackHeader(DrawingContext context, double left, double top, string label, Color color, double dpi)
@@ -643,20 +669,22 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawClips(DrawingContext context, double dpi)
     {
-        if (Project is null)
+        if (_document is null)
         {
             return;
         }
-        foreach (var clip in Project.Clips.OrderBy(item => item.Track).ThenBy(item => item.TrackIndex).ThenBy(item => item.Start))
+        foreach (var storedClip in _document.Clips.OrderBy(item => item.Track).ThenBy(item => item.TrackIndex).ThenBy(item => item.Start))
         {
+            var clip = ResolveClipDraft(storedClip);
             var rectangle = GetClipRectangle(clip);
+            if (!IsTrackVisible(rectangle.Top, rectangle.Height)) continue;
             var visibleLeft = Viewport.VisibleContentLeft;
             var visibleRight = Viewport.VisibleContentRight;
             if (rectangle.Right < visibleLeft || rectangle.Left > visibleRight)
             {
                 continue;
             }
-            var asset = Project.FindAsset(clip.AssetId);
+            var asset = _document.FindAsset(clip.AssetId);
             var selected = SelectedClipId == clip.Id;
             var baseColor = clip.Track == TrackKind.Audio
                 ? Color.FromRgb(31, 136, 91)
@@ -716,11 +744,11 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawClipAnalysisOverlays(DrawingContext context, TimelineClip clip, Rect rectangle, double dpi)
     {
-        if (Project is null)
+        if (_document is null)
         {
             return;
         }
-        foreach (var marker in Project.Markers.Where(marker => marker.End > clip.Start && marker.Start < clip.End).OrderBy(marker => MarkerPriority(marker.Kind)))
+        foreach (var marker in _document.Markers.Where(marker => marker.End > clip.Start && marker.Start < clip.End).OrderBy(marker => MarkerPriority(marker.Kind)))
         {
             var start = Math.Max(marker.Start, clip.Start);
             var end = Math.Min(marker.End, clip.End);
@@ -755,11 +783,11 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawSemanticFlags(DrawingContext context, double dpi)
     {
-        if (Project is null)
+        if (_document is null)
         {
             return;
         }
-        foreach (var marker in Project.Markers.Where(marker => MarkerPriority(marker.Kind) == 2).OrderBy(marker => marker.Start))
+        foreach (var marker in _document.Markers.Where(marker => MarkerPriority(marker.Kind) == 2).OrderBy(marker => marker.Start))
         {
             var x = Viewport.TimeToContentX(marker.Start);
             if (x < LeftGutterWidth || x > RenderSize.Width)
@@ -782,14 +810,16 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawTextOverlays(DrawingContext context, double dpi)
     {
-        if (Project is null || Project.TextOverlays.Count == 0)
+        if (_document is null || _document.TextOverlays.Count == 0)
         {
             return;
         }
 
-        foreach (var overlay in Project.TextOverlays.OrderBy(item => item.Start))
+        foreach (var storedOverlay in _document.TextOverlays.OrderBy(item => item.Start))
         {
+            var overlay = _dragTextOverlay?.Id == storedOverlay.Id ? _dragTextOverlay : storedOverlay;
             var rect = GetTextOverlayRectangle(overlay);
+            if (!IsTrackVisible(rect.Top, rect.Height)) continue;
             if (rect.Left > RenderSize.Width || rect.Right < LeftGutterWidth)
             {
                 continue;
@@ -870,13 +900,13 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawInOutSelection(DrawingContext context, double dpi)
     {
-        if (Project is null || (Project.InPoint is null && Project.OutPoint is null))
+        if (_document is null || (_document.InPoint is null && _document.OutPoint is null))
         {
             return;
         }
 
-        var inPoint = Math.Clamp(Project.InPoint ?? 0, 0, Project.TimelineDisplayDuration);
-        var outPoint = Math.Clamp(Project.OutPoint ?? Project.TimelineDisplayDuration, inPoint, Project.TimelineDisplayDuration);
+        var inPoint = Math.Clamp(_document.InPoint ?? 0, 0, _document.TimelineDisplayDuration);
+        var outPoint = Math.Clamp(_document.OutPoint ?? _document.TimelineDisplayDuration, inPoint, _document.TimelineDisplayDuration);
         var inX = Viewport.TimeToContentX(inPoint);
         var outX = Viewport.TimeToContentX(outPoint);
         var selectionTop = RulerHeight;
@@ -900,13 +930,13 @@ public sealed class TimelineControl : FrameworkElement
             null,
             new Rect(inX, selectionTop, Math.Max(1, outX - inX), selectionHeight));
 
-        if (Project.InPoint.HasValue)
+        if (_document.InPoint.HasValue)
         {
             var pen = CreatePen(Color.FromRgb(52, 211, 153), 2);
             context.DrawLine(pen, new Point(inX, 10), new Point(inX, RenderSize.Height));
             context.DrawText(CreateText("IN", 9, Color.FromRgb(167, 243, 208), dpi, FontWeights.Bold), new Point(inX + 4, 2));
         }
-        if (Project.OutPoint.HasValue)
+        if (_document.OutPoint.HasValue)
         {
             var pen = CreatePen(Color.FromRgb(251, 191, 36), 2);
             context.DrawLine(pen, new Point(outX, 10), new Point(outX, RenderSize.Height));
@@ -915,26 +945,26 @@ public sealed class TimelineControl : FrameworkElement
     }
 
     private TimelineClip? HitTestClip(Point point)
-        => Project?.Clips
+        => _document?.Clips
             .OrderByDescending(clip => clip.Track)
             .ThenByDescending(clip => clip.TrackIndex)
             .ThenByDescending(clip => clip.Start)
             .FirstOrDefault(clip => GetClipRectangle(clip).Contains(point));
 
     private TextOverlay? HitTestTextOverlay(Point point)
-        => Project?.TextOverlays
+        => _document?.TextOverlays
             .OrderByDescending(overlay => overlay.Start)
             .FirstOrDefault(overlay => GetTextOverlayRectangle(overlay).Contains(point));
 
     private TimelineMarker? HitTestMarker(Point point)
     {
-        if (Project is null || point.X < LeftGutterWidth)
+        if (_document is null || point.X < LeftGutterWidth)
         {
             return null;
         }
         var time = Viewport.ContentXToTime(point.X);
         var tolerance = Viewport.PixelsToDuration(10);
-        return Project.Markers
+        return _document.Markers
             .Where(marker => MarkerPriority(marker.Kind) == 2)
             .OrderBy(marker => Math.Abs(marker.Start - time))
             .FirstOrDefault(marker => Math.Abs(marker.Start - time) <= tolerance);
@@ -966,29 +996,35 @@ public sealed class TimelineControl : FrameworkElement
 
     private double GetTextTrackTop() => Layout.TextTrackTop;
 
-    private bool HasTextTrack => Project?.TextOverlays.Count > 0;
+    private bool HasTextTrack => _document?.TextOverlays.Count > 0;
 
     private int GetTrackCount(TrackKind kind)
-        => kind == TrackKind.Visual ? Project?.VisualTrackCount ?? 2 : Project?.AudioTrackCount ?? 2;
+        => kind == TrackKind.Visual ? _document?.VisualTrackCount ?? 2 : _document?.AudioTrackCount ?? 2;
 
     private double GetRequiredHeight()
         => Layout.RequiredHeight;
 
+    private bool IsTrackVisible(double top, double height = TrackHeight)
+    {
+        return Layout.IntersectsViewport(top, VerticalViewportOffset,
+            VerticalViewportHeight <= 0 ? 0 : VerticalViewportHeight + Math.Max(0, height - TrackHeight));
+    }
+
     private TimelineClip? GetPreviousClip(TimelineClip clip)
-        => Project?.GetTrackClips(clip.Track, clip.TrackIndex)
+        => _document?.GetTrackClips(clip.Track, clip.TrackIndex)
             .Where(item => item.Id != clip.Id && item.End <= clip.Start + 0.0001)
             .OrderByDescending(item => item.End)
             .FirstOrDefault();
 
     private TimelineClip? GetNextClip(TimelineClip clip)
-        => Project?.GetTrackClips(clip.Track, clip.TrackIndex)
+        => _document?.GetTrackClips(clip.Track, clip.TrackIndex)
             .Where(item => item.Id != clip.Id && item.Start >= clip.End - 0.0001)
             .OrderBy(item => item.Start)
             .FirstOrDefault();
 
     private double SnapTime(double seconds)
     {
-        var frameRate = Math.Max(1, Project?.FrameRateValue.FramesPerSecond ?? 30);
+        var frameRate = Math.Max(1, _document?.FrameRateValue.FramesPerSecond ?? 30);
         return Math.Round(seconds * frameRate) / frameRate;
     }
 
@@ -1002,154 +1038,6 @@ public sealed class TimelineControl : FrameworkElement
         }
         PlayheadSeconds = Viewport.ContentXToTime(point.X);
         PlayheadChanged?.Invoke(this, new PlayheadChangedEventArgs(PlayheadSeconds));
-    }
-
-    private void AttachProject(EditorProject? project)
-    {
-        if (project is null)
-        {
-            return;
-        }
-        project.Clips.CollectionChanged += OnClipsChanged;
-        project.Markers.CollectionChanged += OnMarkersChanged;
-        project.TextOverlays.CollectionChanged += OnTextOverlaysChanged;
-        project.Media.CollectionChanged += OnMediaChanged;
-        project.PropertyChanged += OnProjectPropertyChanged;
-        foreach (var clip in project.Clips)
-        {
-            clip.PropertyChanged += OnClipPropertyChanged;
-        }
-        foreach (var overlay in project.TextOverlays)
-        {
-            overlay.PropertyChanged += OnTextOverlayPropertyChanged;
-        }
-        foreach (var asset in project.Media)
-        {
-            asset.PropertyChanged += OnMediaPropertyChanged;
-        }
-    }
-
-    private void DetachProject(EditorProject? project)
-    {
-        if (project is null)
-        {
-            return;
-        }
-        project.Clips.CollectionChanged -= OnClipsChanged;
-        project.Markers.CollectionChanged -= OnMarkersChanged;
-        project.TextOverlays.CollectionChanged -= OnTextOverlaysChanged;
-        project.Media.CollectionChanged -= OnMediaChanged;
-        project.PropertyChanged -= OnProjectPropertyChanged;
-        foreach (var clip in project.Clips)
-        {
-            clip.PropertyChanged -= OnClipPropertyChanged;
-        }
-        foreach (var overlay in project.TextOverlays)
-        {
-            overlay.PropertyChanged -= OnTextOverlayPropertyChanged;
-        }
-        foreach (var asset in project.Media)
-        {
-            asset.PropertyChanged -= OnMediaPropertyChanged;
-        }
-    }
-
-    private void OnClipsChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (e.OldItems is not null)
-        {
-            foreach (TimelineClip clip in e.OldItems)
-            {
-                clip.PropertyChanged -= OnClipPropertyChanged;
-            }
-        }
-        if (e.NewItems is not null)
-        {
-            foreach (TimelineClip clip in e.NewItems)
-            {
-                clip.PropertyChanged += OnClipPropertyChanged;
-            }
-        }
-        InvalidateMeasure();
-        InvalidateVisual();
-    }
-
-    private void OnClipPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        InvalidateMeasure();
-        InvalidateVisual();
-    }
-
-    private void OnMarkersChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        InvalidateMeasure();
-        InvalidateVisual();
-    }
-
-    private void OnTextOverlaysChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (e.OldItems is not null)
-        {
-            foreach (TextOverlay overlay in e.OldItems)
-            {
-                overlay.PropertyChanged -= OnTextOverlayPropertyChanged;
-            }
-        }
-        if (e.NewItems is not null)
-        {
-            foreach (TextOverlay overlay in e.NewItems)
-            {
-                overlay.PropertyChanged += OnTextOverlayPropertyChanged;
-            }
-        }
-        InvalidateMeasure();
-        InvalidateVisual();
-    }
-
-    private void OnTextOverlayPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        InvalidateMeasure();
-        InvalidateVisual();
-    }
-
-    private void OnMediaChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (e.OldItems is not null)
-        {
-            foreach (MediaAsset asset in e.OldItems)
-            {
-                asset.PropertyChanged -= OnMediaPropertyChanged;
-            }
-        }
-        if (e.NewItems is not null)
-        {
-            foreach (MediaAsset asset in e.NewItems)
-            {
-                asset.PropertyChanged += OnMediaPropertyChanged;
-            }
-        }
-        InvalidateVisual();
-    }
-
-    private void OnMediaPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName is nameof(MediaAsset.TimelineFramePaths) or nameof(MediaAsset.Waveform))
-        {
-            if (Dispatcher.CheckAccess())
-            {
-                InvalidateVisual();
-            }
-            else
-            {
-                _ = Dispatcher.BeginInvoke(InvalidateVisual);
-            }
-        }
-    }
-
-    private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        InvalidateMeasure();
-        InvalidateVisual();
     }
 
     private static double NiceTimeStep(double desiredSeconds)
@@ -1226,6 +1114,20 @@ public sealed class TimelineControl : FrameworkElement
         => Math.Abs(left.Start - right.Start) < 0.0001 &&
            Math.Abs(left.Duration - right.Duration) < 0.0001;
 
+    private TimelineClip ResolveClipDraft(TimelineClip stored)
+    {
+        if (_dragClip?.Id == stored.Id) return _dragClip;
+        return _dragLinkedClips.FirstOrDefault(item => item.Clip.Id == stored.Id).Clip ?? stored;
+    }
+
+    private static TimelineEditOperation MapOperation(TimelineDragOperation operation) => operation switch
+    {
+        TimelineDragOperation.Move => TimelineEditOperation.Move,
+        TimelineDragOperation.TrimLeft => TimelineEditOperation.TrimLeft,
+        TimelineDragOperation.TrimRight => TimelineEditOperation.TrimRight,
+        _ => throw new InvalidOperationException("Timeline gesture ended without an edit operation.")
+    };
+
 }
 
 public sealed class ClipSelectedEventArgs(Guid? clipId) : EventArgs
@@ -1247,6 +1149,11 @@ public sealed class TimelineEditEventArgs(Guid clipId, bool changed) : EventArgs
 {
     public Guid ClipId { get; } = clipId;
     public bool Changed { get; } = changed;
+}
+
+public sealed class TimelineEditRequestedEventArgs(TimelineEditIntent intent) : EventArgs
+{
+    public TimelineEditIntent Intent { get; } = intent;
 }
 
 public sealed class AssetDroppedEventArgs(Guid assetId, double requestedStart, TrackKind requestedTrack, int requestedTrackIndex) : EventArgs

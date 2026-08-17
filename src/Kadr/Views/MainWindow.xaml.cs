@@ -50,6 +50,7 @@ public partial class MainWindow : Window
     private Rect _previewTextResizeStartBounds;
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
+    private TextOverlay? _textPanelEditBefore;
 
     public MainWindow() : this(null)
     {
@@ -84,8 +85,7 @@ public partial class MainWindow : Window
         TimelineEditor.TextOverlaySelected += TimelineEditor_TextOverlaySelected;
         TimelineEditor.TextOverlayEditRequested += TimelineEditor_TextOverlayEditRequested;
         TimelineEditor.PlayheadChanged += TimelineEditor_PlayheadChanged;
-        TimelineEditor.EditStarted += TimelineEditor_EditStarted;
-        TimelineEditor.EditCompleted += TimelineEditor_EditCompleted;
+        TimelineEditor.EditRequested += TimelineEditor_EditRequested;
         TimelineEditor.AssetDropped += TimelineEditor_AssetDropped;
     }
 
@@ -371,16 +371,10 @@ public partial class MainWindow : Window
             TimelineEditor.SelectedTextOverlayId == overlay.Id &&
             _viewModel.Playhead > overlay.Start + 0.1 && _viewModel.Playhead < overlay.End - 0.1)
         {
-            _viewModel.BeginEdit();
-            var right = overlay.Clone();
-            right.Id = Guid.NewGuid();
-            right.Start = _viewModel.Playhead;
-            right.Duration = overlay.End - _viewModel.Playhead;
-            overlay.Duration = _viewModel.Playhead - overlay.Start;
-            _viewModel.Project.TextOverlays.Add(right);
-            _viewModel.CommitEdit("Текстовый клип разделён");
-            TextOverlayList.SelectedItem = right;
-            TimelineEditor.SelectedTextOverlayId = right.Id;
+            var rightId = _viewModel.SplitTextOverlay(overlay.Id, _viewModel.Playhead);
+            if (rightId is null) return;
+            TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == rightId);
+            TimelineEditor.SelectedTextOverlayId = rightId;
             return;
         }
         if (!_viewModel.SplitSelectedAtPlayhead())
@@ -396,9 +390,7 @@ public partial class MainWindow : Window
         StopPlayback();
         if (TextOverlayList.SelectedItem is TextOverlay overlay && TimelineEditor.SelectedTextOverlayId == overlay.Id)
         {
-            _viewModel.BeginEdit();
-            _viewModel.Project.TextOverlays.Remove(overlay);
-            _viewModel.CommitEdit("Текст удалён");
+            _viewModel.DeleteTextOverlay(overlay.Id);
             TimelineEditor.SelectedTextOverlayId = null;
             TextOverlayList.SelectedItem = null;
             UpdateTextOverlayPreview(_viewModel.Playhead);
@@ -422,26 +414,24 @@ public partial class MainWindow : Window
 
     private void SetInPoint_Click(object sender, RoutedEventArgs e)
     {
-        _viewModel.BeginEdit();
-        _viewModel.Project.InPoint = _viewModel.Playhead;
-        if (_viewModel.Project.OutPoint is double outPoint && outPoint <= _viewModel.Playhead)
-        {
-            _viewModel.Project.OutPoint = null;
-        }
-        _viewModel.CommitEdit($"Точка входа: {FormatEditorTime(_viewModel.Playhead)}");
+        var existingOut = _viewModel.Project.OutPoint;
+        double? outPoint = existingOut is double outValue && outValue > _viewModel.Playhead
+            ? outValue
+            : null;
+        _viewModel.SetInOut(_viewModel.Playhead, outPoint,
+            $"Точка входа: {FormatEditorTime(_viewModel.Playhead)}");
         AnalysisStartTextBox.Text = FormatEditorTime(_viewModel.Playhead);
         TimelineEditor.InvalidateVisual();
     }
 
     private void SetOutPoint_Click(object sender, RoutedEventArgs e)
     {
-        _viewModel.BeginEdit();
-        _viewModel.Project.OutPoint = _viewModel.Playhead;
-        if (_viewModel.Project.InPoint is double inPoint && inPoint >= _viewModel.Playhead)
-        {
-            _viewModel.Project.InPoint = null;
-        }
-        _viewModel.CommitEdit($"Точка выхода: {FormatEditorTime(_viewModel.Playhead)}");
+        var existingIn = _viewModel.Project.InPoint;
+        double? inPoint = existingIn is double inValue && inValue < _viewModel.Playhead
+            ? inValue
+            : null;
+        _viewModel.SetInOut(inPoint, _viewModel.Playhead,
+            $"Точка выхода: {FormatEditorTime(_viewModel.Playhead)}");
         AnalysisEndTextBox.Text = FormatEditorTime(_viewModel.Playhead);
         TimelineEditor.InvalidateVisual();
     }
@@ -452,10 +442,7 @@ public partial class MainWindow : Window
         {
             return;
         }
-        _viewModel.BeginEdit();
-        _viewModel.Project.InPoint = null;
-        _viewModel.Project.OutPoint = null;
-        _viewModel.CommitEdit("Точки In/Out очищены");
+        _viewModel.SetInOut(null, null, "Точки In/Out очищены");
         TimelineEditor.InvalidateVisual();
     }
 
@@ -633,10 +620,8 @@ public partial class MainWindow : Window
             X = 0.5,
             Y = 0.82
         };
-        _viewModel.BeginEdit();
-        _viewModel.Project.TextOverlays.Add(overlay);
-        _viewModel.CommitEdit("Текст добавлен");
-        TextOverlayList.SelectedItem = overlay;
+        _viewModel.AddTextOverlay(overlay);
+        TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == overlay.Id);
         TimelineEditor.SelectedTextOverlayId = overlay.Id;
         TimelineEditor.SelectedClipId = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
@@ -648,21 +633,26 @@ public partial class MainWindow : Window
         {
             return;
         }
-        _viewModel.BeginEdit();
-        _viewModel.Project.TextOverlays.Remove(overlay);
-        _viewModel.CommitEdit("Текст удалён");
+        _viewModel.DeleteTextOverlay(overlay.Id);
         TimelineEditor.SelectedTextOverlayId = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
     private void TextOverlayEdit_Begin(object sender, RoutedEventArgs e)
     {
-        if (TextOverlayList.SelectedItem is not null) _viewModel.BeginEdit();
+        _textPanelEditBefore = (TextOverlayList.SelectedItem as TextOverlay)?.Clone();
     }
 
     private void TextOverlayEdit_End(object sender, RoutedEventArgs e)
     {
-        _viewModel.CommitEdit("Текст изменён");
+        if (TextOverlayList.SelectedItem is TextOverlay overlay &&
+            (_textPanelEditBefore is null || !TextOverlayPresentationEquals(_textPanelEditBefore, overlay)))
+        {
+            var id = overlay.Id;
+            _viewModel.UpdateTextOverlay(overlay.Clone());
+            TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == id);
+        }
+        _textPanelEditBefore = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
@@ -1187,19 +1177,19 @@ public partial class MainWindow : Window
 
     private void TimelineEditor_PlayheadChanged(object? sender, PlayheadChangedEventArgs e) => SeekTo(e.Seconds);
 
-    private void TimelineEditor_EditStarted(object? sender, TimelineEditEventArgs e) => _viewModel.BeginEdit();
-
-    private void TimelineEditor_EditCompleted(object? sender, TimelineEditEventArgs e)
+    private void TimelineEditor_EditRequested(object? sender, TimelineEditRequestedEventArgs e)
     {
-        var editingText = TimelineEditor.SelectedTextOverlayId.HasValue;
-        if (!editingText)
+        try
         {
-            _viewModel.NormalizeSelectedClip();
+            if (!_viewModel.ApplyTimelineEdit(e.Intent)) return;
+            _viewModel.Playhead = Math.Min(_viewModel.Playhead, _viewModel.Project.Duration);
+            TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
+            UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         }
-        _viewModel.CommitEdit(e.Changed ? (editingText ? "Текстовый клип изменён" : "Клип изменён") : "Готово");
-        _viewModel.Playhead = Math.Min(_viewModel.Playhead, _viewModel.Project.Duration);
-        TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
-        UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+        catch (Exception exception)
+        {
+            ShowError("Не удалось изменить таймлайн", exception);
+        }
     }
 
     private void TimelineEditor_AssetDropped(object? sender, AssetDroppedEventArgs e)
@@ -1317,6 +1307,8 @@ public partial class MainWindow : Window
     {
         TimelineEditor.HorizontalViewportOffset = e.HorizontalOffset;
         TimelineEditor.HorizontalViewportWidth = TimelineScrollViewer.ViewportWidth;
+        TimelineEditor.VerticalViewportOffset = e.VerticalOffset;
+        TimelineEditor.VerticalViewportHeight = TimelineScrollViewer.ViewportHeight;
         TimelineEditor.InvalidateVisual();
     }
 
@@ -1415,8 +1407,15 @@ public partial class MainWindow : Window
 
     private void UpdateTextOverlayPreview(double timelineSeconds)
     {
-        var overlay = _viewModel.Project.TextOverlays
-            .LastOrDefault(item => timelineSeconds >= item.Start && timelineSeconds < item.End);
+        var active = _viewModel.Project.TextOverlays
+            .Where(item => timelineSeconds >= item.Start && timelineSeconds < item.End)
+            .OrderBy(item => item.Start)
+            .ThenBy(item => item.Id)
+            .ToArray();
+        var selectedId = (TextOverlayList.SelectedItem as TextOverlay)?.Id ?? TimelineEditor.SelectedTextOverlayId;
+        var storedOverlay = active.LastOrDefault(item => item.Id == selectedId) ?? active.LastOrDefault();
+        RenderPassiveTextOverlays(active.Where(item => item.Id != storedOverlay?.Id));
+        var overlay = ResolvePreviewTextDraft(storedOverlay);
         if (overlay is null)
         {
             FinishPreviewTextEditing(commit: true, refresh: false);
@@ -1446,7 +1445,7 @@ public partial class MainWindow : Window
         PreviewTextBorder.Height = height;
         Canvas.SetLeft(PreviewTextBorder, Math.Clamp(overlay.X * 960 - width / 2, 0, 960 - width));
         Canvas.SetTop(PreviewTextBorder, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
-        var selected = TextOverlayList.SelectedItem == overlay;
+        var selected = selectedId == overlay.Id;
         PreviewTextSelectionOutline.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
         PreviewTextResizeHandles.Visibility = selected && !_isEditingPreviewText ? Visibility.Visible : Visibility.Collapsed;
         PreviewTextBorder.Visibility = Visibility.Visible;
@@ -1454,8 +1453,7 @@ public partial class MainWindow : Window
 
     private void PreviewTextBorder_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        var overlay = _viewModel.Project.TextOverlays
-            .LastOrDefault(item => _viewModel.Playhead >= item.Start && _viewModel.Playhead < item.End);
+        var overlay = GetDisplayedTextOverlay();
         if (overlay is null)
         {
             return;
@@ -1481,8 +1479,7 @@ public partial class MainWindow : Window
         {
             return;
         }
-        _viewModel.BeginEdit();
-        _previewDraggedOverlay = overlay;
+        _previewDraggedOverlay = overlay.Clone();
         _previewTextDragOffset = e.GetPosition(PreviewTextBorder);
         _isDraggingPreviewText = true;
         TextOverlayList.SelectedItem = overlay;
@@ -1527,25 +1524,29 @@ public partial class MainWindow : Window
         {
             return;
         }
+        var draft = _previewDraggedOverlay?.Clone();
         _isDraggingPreviewText = false;
         _previewDraggedOverlay = null;
         PreviewTextBorder.ReleaseMouseCapture();
-        _viewModel.CommitEdit("Положение текста изменено");
+        if (draft is not null)
+        {
+            _viewModel.UpdateTextOverlay(draft, "Положение текста изменено");
+            TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == draft.Id);
+        }
         TimelineEditor.InvalidateVisual();
         e.Handled = true;
     }
 
     private void BeginPreviewTextEditing(TextOverlay overlay)
     {
-        if (_isEditingPreviewText && _previewEditedOverlay == overlay)
+        if (_isEditingPreviewText && _previewEditedOverlay?.Id == overlay.Id)
         {
             PreviewTextEditor.Focus();
             return;
         }
         FinishPreviewTextEditing(commit: true, refresh: false);
         StopPlayback();
-        _viewModel.BeginEdit();
-        _previewEditedOverlay = overlay;
+        _previewEditedOverlay = overlay.Clone();
         _previewTextBeforeEdit = overlay.Text;
         _isEditingPreviewText = true;
         TextOverlayList.SelectedItem = overlay;
@@ -1570,11 +1571,11 @@ public partial class MainWindow : Window
         _previewEditedOverlay = null;
         PreviewTextEditor.Visibility = Visibility.Collapsed;
         PreviewTextBlock.Visibility = Visibility.Visible;
-        if (!commit && overlay is not null)
+        if (commit && overlay is not null && overlay.Text != _previewTextBeforeEdit)
         {
-            overlay.Text = _previewTextBeforeEdit;
+            _viewModel.UpdateTextOverlay(overlay, "Текст изменён");
+            TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == overlay.Id);
         }
-        _viewModel.CommitEdit(commit ? "Текст изменён" : "Редактирование текста отменено");
         TimelineEditor.InvalidateVisual();
         if (refresh)
         {
@@ -1615,6 +1616,80 @@ public partial class MainWindow : Window
         }
     }
 
+    private TextOverlay? GetDisplayedTextOverlay()
+    {
+        var selectedId = (TextOverlayList.SelectedItem as TextOverlay)?.Id ?? TimelineEditor.SelectedTextOverlayId;
+        var active = _viewModel.Project.TextOverlays
+            .Where(item => _viewModel.Playhead >= item.Start && _viewModel.Playhead < item.End)
+            .OrderBy(item => item.Start)
+            .ThenBy(item => item.Id)
+            .ToArray();
+        return active.LastOrDefault(item => item.Id == selectedId) ?? active.LastOrDefault();
+    }
+
+    private TextOverlay? ResolvePreviewTextDraft(TextOverlay? stored)
+    {
+        if (stored is null) return null;
+        if (_previewEditedOverlay?.Id == stored.Id) return _previewEditedOverlay;
+        if (_previewDraggedOverlay?.Id == stored.Id) return _previewDraggedOverlay;
+        return stored;
+    }
+
+    private void RenderPassiveTextOverlays(IEnumerable<TextOverlay> overlays)
+    {
+        PreviewPassiveTextLayer.Children.Clear();
+        foreach (var overlay in overlays)
+        {
+            var width = Math.Clamp(overlay.BoxWidth * 960, 80, 960);
+            var height = Math.Clamp(overlay.BoxHeight * 540, 36, 540);
+            var text = new TextBlock
+            {
+                Text = overlay.Text,
+                TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center,
+                FontFamily = new FontFamily(overlay.FontFamily),
+                FontSize = overlay.FontSize,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                Margin = new Thickness(8),
+                Foreground = ParseTextBrush(overlay.Color)
+            };
+            var border = new Border
+            {
+                Width = width,
+                Height = height,
+                Background = new SolidColorBrush(Color.FromArgb(102, 0, 0, 0)),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(8, 3, 8, 3),
+                RenderTransformOrigin = new Point(0.5, 0.5),
+                RenderTransform = new RotateTransform(overlay.Rotation),
+                Child = text
+            };
+            Canvas.SetLeft(border, Math.Clamp(overlay.X * 960 - width / 2, 0, 960 - width));
+            Canvas.SetTop(border, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
+            PreviewPassiveTextLayer.Children.Add(border);
+        }
+    }
+
+    private static Brush ParseTextBrush(string color)
+    {
+        try { return new SolidColorBrush((Color)ColorConverter.ConvertFromString(color)); }
+        catch (FormatException) { return Brushes.White; }
+        catch (NotSupportedException) { return Brushes.White; }
+    }
+
+    private static bool TextOverlayPresentationEquals(TextOverlay left, TextOverlay right)
+        => left.Id == right.Id && left.Text == right.Text && left.FontFamily == right.FontFamily &&
+           left.Color == right.Color && left.IsSubtitle == right.IsSubtitle &&
+           Math.Abs(left.Start - right.Start) < 0.0001 &&
+           Math.Abs(left.Duration - right.Duration) < 0.0001 &&
+           Math.Abs(left.FontSize - right.FontSize) < 0.0001 &&
+           Math.Abs(left.X - right.X) < 0.0001 && Math.Abs(left.Y - right.Y) < 0.0001 &&
+           Math.Abs(left.Rotation - right.Rotation) < 0.0001 &&
+           Math.Abs(left.BoxWidth - right.BoxWidth) < 0.0001 &&
+           Math.Abs(left.BoxHeight - right.BoxHeight) < 0.0001;
+
     private static FrameworkElement? FindResizeHandle(DependencyObject? source)
     {
         while (source is not null)
@@ -1633,7 +1708,7 @@ public partial class MainWindow : Window
     {
         FinishPreviewTextEditing(commit: true, refresh: false);
         _isResizingPreviewText = true;
-        _previewDraggedOverlay = overlay;
+        _previewDraggedOverlay = overlay.Clone();
         _previewTextResizeHandle = handle.Tag as string ?? "BottomRight";
         _previewTextResizeStartPoint = startPoint;
         _previewTextResizeStartBounds = new Rect(
@@ -1641,7 +1716,6 @@ public partial class MainWindow : Window
             Canvas.GetTop(PreviewTextBorder),
             PreviewTextBorder.Width,
             PreviewTextBorder.Height);
-        _viewModel.BeginEdit();
     }
 
     private void ResizePreviewTextTo(Point point)
@@ -1699,9 +1773,14 @@ public partial class MainWindow : Window
         {
             return;
         }
+        var draft = _previewDraggedOverlay?.Clone();
         _isResizingPreviewText = false;
         _previewDraggedOverlay = null;
-        _viewModel.CommitEdit("Размер текстового блока изменён");
+        if (draft is not null)
+        {
+            _viewModel.UpdateTextOverlay(draft, "Размер текстового блока изменён");
+            TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == draft.Id);
+        }
         TimelineEditor.InvalidateVisual();
     }
 
@@ -1787,6 +1866,9 @@ public partial class MainWindow : Window
         {
             case nameof(MainViewModel.Project):
                 ResetPreviewState();
+                break;
+            case nameof(MainViewModel.TimelinePresentationRevision):
+                TimelineEditor.Project = _viewModel.Project;
                 break;
             case nameof(MainViewModel.SelectedClip):
                 TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;

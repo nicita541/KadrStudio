@@ -144,6 +144,33 @@ public sealed class EditorSessionTests
     }
 
     [Fact]
+    public void Text_split_batch_is_atomic_and_undoes_as_one_revision()
+    {
+        var fixture = CreateLinkedProject();
+        var textTrack = fixture.Project.Tracks.Single(item => item.Kind == TrackKind.Text);
+        var original = new TextClip(
+            Guid.NewGuid(), textTrack.Id, TimelineTime.FromSeconds(2), TimelineTime.FromSeconds(6),
+            "multiline\ncaption", new TextStyle());
+        var initial = fixture.Project with { TextClips = [original] };
+        var session = new EditorSession(initial);
+        var cut = TimelineTime.FromSeconds(5);
+        var right = original with
+        {
+            Id = Guid.NewGuid(), Start = cut, Duration = original.End - cut
+        };
+
+        session.Execute(new EditTransaction("split text", new EditBatchCommand("split text", [
+            new UpsertTextClipCommand(original with { Duration = cut - original.Start }),
+            new AddTextClipsCommand([right])
+        ])));
+
+        Assert.Equal(2, session.State.TextClips.Length);
+        Assert.Equal(cut, session.State.TextClips.OrderBy(item => item.Start).Last().Start);
+        Assert.True(session.Undo());
+        Assert.Equal(original, Assert.Single(session.State.TextClips));
+    }
+
+    [Fact]
     public void Undo_reports_the_same_pipeline_range_as_the_original_edit()
     {
         var fixture = CreateLinkedProject();

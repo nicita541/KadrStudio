@@ -638,6 +638,10 @@
                         <Grid>
                             <Image x:Name="PreviewImage" Stretch="Uniform" Visibility="Collapsed" />
                             <Canvas x:Name="PreviewTextCanvas" Width="960" Height="540">
+                                <Canvas x:Name="PreviewPassiveTextLayer"
+                                        Width="960"
+                                        Height="540"
+                                        IsHitTestVisible="False" />
                                 <Border x:Name="PreviewTextBorder"
                                         Visibility="Collapsed"
                                         Background="#66000000"

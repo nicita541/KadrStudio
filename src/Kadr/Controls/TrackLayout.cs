@@ -29,6 +29,10 @@ public sealed class TrackLayout(
 
     public double TextTrackTop => areaTop;
 
+    public bool IntersectsViewport(double trackTop, double viewportOffset, double viewportHeight)
+        => viewportHeight <= 0 ||
+           trackTop + trackHeight >= viewportOffset && trackTop <= viewportOffset + viewportHeight;
+
     public TrackAddress? GetTrackAt(double y)
     {
         if (y < areaTop) return null;

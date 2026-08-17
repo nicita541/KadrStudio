@@ -33,7 +33,8 @@ public sealed class AutomationOrchestrator(
         VideoAnalysisRequest request,
         string? ollamaModel,
         IProgress<VideoAnalysisProgress>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        JobPriority priority = JobPriority.UserInitiated)
     {
         var isolatedRequest = request with { Asset = CopyAsset(request.Asset) };
         var key = JobKey.Create(
@@ -42,7 +43,7 @@ public sealed class AutomationOrchestrator(
         var job = scheduler.Schedule(new JobRequest<VideoAnalysisPipelineResult>(
             key,
             JobLane.Analysis,
-            JobPriority.UserInitiated,
+            priority,
             async token =>
             {
                 var result = await analysis.AnalyzeAsync(isolatedRequest, progress, token).ConfigureAwait(false);
@@ -68,7 +69,8 @@ public sealed class AutomationOrchestrator(
                 result = await analysis.RefineSemanticBoundariesAsync(
                     isolatedRequest.Asset, result, progress, token).ConfigureAwait(false);
                 return new VideoAnalysisPipelineResult(result, warning);
-            }));
+            },
+            PauseDuringExport: priority >= JobPriority.Background));
         return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
     }
 

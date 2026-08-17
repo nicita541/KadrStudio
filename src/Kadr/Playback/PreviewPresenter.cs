@@ -67,7 +67,6 @@ public sealed class PreviewPresenter : IAsyncDisposable
             _overlayGeneration++;
         }
         _proxies.Configure(project);
-        if (halfQuality) _proxies.Queue(project);
     }
 
     public async Task UpdateAsync(double timelineSeconds, bool forceSeek, bool playing,
@@ -95,7 +94,9 @@ public sealed class PreviewPresenter : IAsyncDisposable
             var plan = _coordinator.CreatePlan(_project);
             if (_halfQuality)
             {
-                _proxies.Queue(_project);
+                // Interactive playback must stay responsive. Explicit proxy
+                // preparation may populate this store, but merely dropping or
+                // playing a clip must never start a full-length transcode.
                 plan = _proxies.UseAvailable(plan);
             }
             var position = TimelineTime.FromSeconds(Math.Clamp(

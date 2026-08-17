@@ -40,6 +40,10 @@ public sealed class WaveformPyramidBuilder(int sampleRate = 48_000, int framesPe
         levels.Add(new WaveformLevel(scale, current));
         while (current.Length > 1)
         {
+            // FramesPerPeak is intentionally an int in the cache contract. For
+            // extremely long recordings, keep the last safe level instead of
+            // overflowing while creating a single all-source peak.
+            if (scale > int.MaxValue / 4) break;
             var next = ImmutableArray.CreateBuilder<WaveformPeak>((current.Length + 3) / 4);
             for (var index = 0; index < current.Length; index += 4)
                 next.Add(WaveformPyramid.Aggregate(current.AsSpan().Slice(index, Math.Min(4, current.Length - index))));

@@ -68,6 +68,23 @@ public sealed class MediaHostProtocolTests
         Assert.Equal(expected, actual);
     }
 
+    [Fact]
+    public async Task Silent_audio_meter_is_finite_and_can_cross_the_media_host_protocol()
+    {
+        var level = new StereoPcmMeter().Measure(new float[64]);
+        var expected = new MediaHostAudioMeterHeader(level, TimelineTime.Zero, 7);
+        await using var stream = new MemoryStream();
+
+        await MediaHostPacketIO.WriteAsync(stream,
+            MediaHostPacket.Create(MediaHostPacketType.AudioMeter, expected));
+        stream.Position = 0;
+        var actual = (await MediaHostPacketIO.ReadAsync(stream))!.ReadHeader<MediaHostAudioMeterHeader>();
+
+        Assert.True(float.IsFinite(actual.Level.LeftPeakDb));
+        Assert.True(float.IsFinite(actual.Level.RightPeakDb));
+        Assert.Equal(StereoPcmMeter.SilenceFloorDb, actual.Level.LeftPeakDb);
+    }
+
     private static ProjectState CreateProject()
     {
         var project = ProjectState.CreateNew("IPC", FrameRate.Fps23976) with

@@ -231,8 +231,17 @@ public sealed record ProjectState
     public ImmutableArray<TextClip> TextClips { get; init; } = [];
     public ImmutableArray<TimelineTransition> Transitions { get; init; } = [];
     public ImmutableArray<TimelineMarker> Markers { get; init; } = [];
+    public ImmutableArray<SequenceState> Sequences { get; init; } = [];
+    public Guid? ActiveSequenceId { get; init; }
+    public ImmutableArray<SourceAnnotation> SourceAnnotations { get; init; } = [];
+    public ImmutableArray<MediaAnalysisReference> AnalysisReferences { get; init; } = [];
+    public ImmutableArray<MontagePlan> MontagePlans { get; init; } = [];
     public TimelineTime? InPoint { get; init; }
     public TimelineTime? OutPoint { get; init; }
+
+    public SequenceState? ActiveSequence => ActiveSequenceId is { } id
+        ? Sequences.FirstOrDefault(item => item.Id == id)
+        : null;
 
     public TimelineTime Duration
     {
@@ -247,6 +256,47 @@ public sealed record ProjectState
     public TimelineTrack? FindTrack(Guid id) => Tracks.FirstOrDefault(item => item.Id == id);
     public MediaClip? FindMediaClip(Guid id) => MediaClips.FirstOrDefault(item => item.Id == id);
     public TextClip? FindTextClip(Guid id) => TextClips.FirstOrDefault(item => item.Id == id);
+
+    public SequenceState? FindSequence(Guid id) => Sequences.FirstOrDefault(item => item.Id == id);
+    public MontagePlan? FindMontagePlan(Guid id) => MontagePlans.FirstOrDefault(item => item.Id == id);
+
+    public ProjectState EnsureSequenceContainer(string name = "Исходный монтаж")
+    {
+        if (!Sequences.IsDefaultOrEmpty && ActiveSequence is not null) return this;
+        var id = Guid.NewGuid();
+        var sequence = SequenceState.Capture(this, id, name);
+        return this with { Sequences = [sequence], ActiveSequenceId = id };
+    }
+
+    public ProjectState SynchronizeActiveSequence(bool incrementRevision = true)
+    {
+        var active = ActiveSequence;
+        if (active is null || active.Matches(this)) return this;
+        var replacement = active.CaptureTimeline(this, incrementRevision);
+        return this with
+        {
+            Sequences = Sequences.Select(item => item.Id == replacement.Id ? replacement : item).ToImmutableArray()
+        };
+    }
+
+    public ProjectState ActivateSequence(Guid sequenceId)
+    {
+        var synchronized = SynchronizeActiveSequence();
+        var target = synchronized.FindSequence(sequenceId)
+            ?? throw new InvalidOperationException("Последовательность не найдена.");
+        return synchronized with
+        {
+            ActiveSequenceId = target.Id,
+            Sequence = target.Settings,
+            Tracks = target.Tracks,
+            MediaClips = target.MediaClips,
+            TextClips = target.TextClips,
+            Transitions = target.Transitions,
+            Markers = target.Markers,
+            InPoint = target.InPoint,
+            OutPoint = target.OutPoint
+        };
+    }
 
     public static ProjectState CreateNew(string name = "Новый проект", FrameRate? frameRate = null)
     {

@@ -28,6 +28,9 @@ public sealed class ProjectValidator : IProjectValidator
         ValidateTransitions(project, errors);
         ValidateMarkers(project, errors);
         ValidateInOut(project, errors);
+        ValidateSequenceWorkspace(project, errors);
+        ValidateSourceAnnotations(project, errors);
+        ValidateMontagePlans(project, errors);
         return errors.Count == 0 ? ValidationResult.Valid : new ValidationResult(errors);
     }
 
@@ -233,5 +236,103 @@ public sealed class ProjectValidator : IProjectValidator
             errors.Add(new("inout.negative", "In/Out points cannot be negative."));
         if (project.InPoint is { } start && project.OutPoint is { } end && end <= start)
             errors.Add(new("inout.order", "Out point must be after In point."));
+    }
+
+    private static void ValidateSequenceWorkspace(ProjectState project, ICollection<ValidationError> errors)
+    {
+        if (project.Sequences.IsDefaultOrEmpty)
+        {
+            if (project.ActiveSequenceId is not null)
+                errors.Add(new("sequence.active-without-items", "Active sequence cannot be set when the project has no sequences."));
+            return;
+        }
+
+        foreach (var duplicate in project.Sequences.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("sequence.duplicate-id", "Sequence IDs must be unique.", duplicate.Key));
+        if (project.ActiveSequenceId is not Guid activeId || project.FindSequence(activeId) is null)
+        {
+            errors.Add(new("sequence.active", "Active sequence is missing."));
+            return;
+        }
+
+        var active = project.FindSequence(activeId)!;
+        if (!active.Matches(project))
+            errors.Add(new("sequence.snapshot", "Active sequence snapshot is not synchronized with the live timeline.", active.Id));
+
+        foreach (var sequence in project.Sequences)
+        {
+            if (sequence.Id == Guid.Empty || string.IsNullOrWhiteSpace(sequence.Name) || sequence.Revision < 0)
+            {
+                errors.Add(new("sequence.identity", "Sequence identity or revision is invalid.", sequence.Id));
+                continue;
+            }
+            if (sequence.ParentSequenceId is { } parentId && project.FindSequence(parentId) is null)
+                errors.Add(new("sequence.parent", "Sequence parent is missing.", sequence.Id));
+            if (sequence.MontagePlanId is { } planId && project.FindMontagePlan(planId) is null)
+                errors.Add(new("sequence.plan", "Sequence montage plan is missing.", sequence.Id));
+
+            if (sequence.Id == activeId) continue;
+            var view = project with
+            {
+                Sequences = [],
+                ActiveSequenceId = null,
+                Sequence = sequence.Settings,
+                Tracks = sequence.Tracks,
+                MediaClips = sequence.MediaClips,
+                TextClips = sequence.TextClips,
+                Transitions = sequence.Transitions,
+                Markers = sequence.Markers,
+                InPoint = sequence.InPoint,
+                OutPoint = sequence.OutPoint
+            };
+            ValidateProject(view, errors);
+            ValidateTracks(view, errors);
+            ValidateClips(view, errors);
+            ValidateText(view, errors);
+            ValidateTransitions(view, errors);
+            ValidateMarkers(view, errors);
+            ValidateInOut(view, errors);
+        }
+    }
+
+    private static void ValidateSourceAnnotations(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.SourceAnnotations.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("annotation.duplicate-id", "Source annotation IDs must be unique.", duplicate.Key));
+        foreach (var annotation in project.SourceAnnotations)
+        {
+            if (!project.Sources.TryGetValue(annotation.SourceId, out var source))
+            {
+                errors.Add(new("annotation.source", "Source annotation references missing media.", annotation.Id));
+                continue;
+            }
+            if (annotation.SourceRange.Start < TimelineTime.Zero || annotation.SourceRange.Duration <= TimelineTime.Zero ||
+                annotation.SourceRange.End > source.Duration)
+                errors.Add(new("annotation.range", "Source annotation is outside the media range.", annotation.Id));
+        }
+    }
+
+    private static void ValidateMontagePlans(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.MontagePlans.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("montage-plan.duplicate-id", "Montage plan IDs must be unique.", duplicate.Key));
+        foreach (var plan in project.MontagePlans)
+        {
+            if (plan.Id == Guid.Empty || plan.Dependencies.ProjectId != project.Id || string.IsNullOrWhiteSpace(plan.Title))
+                errors.Add(new("montage-plan.identity", "Montage plan identity is invalid.", plan.Id));
+            if (plan.Items.Select(item => item.Order).Distinct().Count() != plan.Items.Length)
+                errors.Add(new("montage-plan.order", "Montage plan item order must be unique.", plan.Id));
+            if (plan.Items.Select(item => item.Id).Distinct().Count() != plan.Items.Length)
+                errors.Add(new("montage-plan.item-id", "Montage plan item IDs must be unique.", plan.Id));
+            foreach (var item in plan.Items)
+            {
+                if (!project.Sources.TryGetValue(item.SourceId, out var source) ||
+                    item.SourceRange.Start < TimelineTime.Zero || item.SourceRange.Duration <= TimelineTime.Zero ||
+                    source is not null && item.SourceRange.End > source.Duration)
+                    errors.Add(new("montage-plan.range", "Montage plan item references an invalid source range.", item.Id));
+                if (item.Confidence is < 0 or > 1 || item.Volume is < 0 or > 2)
+                    errors.Add(new("montage-plan.parameters", "Montage plan item parameters are invalid.", item.Id));
+            }
+        }
     }
 }

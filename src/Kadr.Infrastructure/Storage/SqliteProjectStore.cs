@@ -10,7 +10,7 @@ namespace KadrStudio.Infrastructure.Storage;
 
 public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IProjectStore
 {
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 4;
     private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
@@ -127,6 +127,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
 
     private static async Task WriteProjectAsync(SqliteConnection connection, ProjectState project, CancellationToken token)
     {
+        project = PrepareForStorage(project);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(token).ConfigureAwait(false);
         await using var metadata = connection.CreateCommand();
         metadata.Transaction = transaction;
@@ -165,14 +166,15 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             VALUES(1, $sampleRate);
             """, token, ("$sampleRate", project.Sequence.AudioSampleRate)).ConfigureAwait(false);
 
+        var activeSequenceId = project.ActiveSequenceId!.Value.ToString("N");
         for (var ordinal = 0; ordinal < project.Tracks.Length; ordinal++)
         {
             var track = project.Tracks[ordinal];
             await ExecuteAsync(connection, transaction, """
-                INSERT INTO tracks(id, track_order, kind, track_index, name, is_muted, is_locked, is_visible)
-                VALUES($id, $order, $kind, $index, $name, $muted, $locked, $visible);
+                INSERT INTO tracks(id, sequence_id, track_order, kind, track_index, name, is_muted, is_locked, is_visible)
+                VALUES($id, $sequenceId, $order, $kind, $index, $name, $muted, $locked, $visible);
                 """, token,
-                ("$id", track.Id.ToString("N")), ("$order", ordinal),
+                ("$id", track.Id.ToString("N")), ("$sequenceId", activeSequenceId), ("$order", ordinal),
                 ("$kind", (int)track.Kind), ("$index", track.Index),
                 ("$name", track.Name), ("$muted", track.IsMuted), ("$locked", track.IsLocked),
                 ("$visible", track.IsVisible)).ConfigureAwait(false);
@@ -209,19 +211,84 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 ("$vfr", source.IsVariableFrameRate), ("$proxyPath", source.ProxyPath)).ConfigureAwait(false);
         }
 
+        foreach (var sequence in project.Sequences)
+        {
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO sequences(
+                    id, name, revision, status, target_format, parent_sequence_id, montage_plan_id,
+                    is_active, snapshot_json)
+                VALUES($id, $name, $revision, $status, $target, $parent, $plan, $active, $snapshot);
+                """, token,
+                ("$id", sequence.Id.ToString("N")), ("$name", sequence.Name), ("$revision", sequence.Revision),
+                ("$status", (int)sequence.Status), ("$target", (int)sequence.TargetFormat),
+                ("$parent", sequence.ParentSequenceId?.ToString("N")),
+                ("$plan", sequence.MontagePlanId?.ToString("N")),
+                ("$active", sequence.Id == project.ActiveSequenceId),
+                ("$snapshot", ProjectDocumentSerializer.SerializeSequence(sequence))).ConfigureAwait(false);
+        }
+
+        foreach (var annotation in project.SourceAnnotations)
+        {
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO source_annotations(
+                    id, source_id, kind, source_start_ticks, duration_ticks, note, created_at)
+                VALUES($id, $sourceId, $kind, $start, $duration, $note, $createdAt);
+                """, token,
+                ("$id", annotation.Id.ToString("N")), ("$sourceId", annotation.SourceId.ToString("N")),
+                ("$kind", (int)annotation.Kind), ("$start", annotation.SourceRange.Start.Ticks),
+                ("$duration", annotation.SourceRange.Duration.Ticks), ("$note", annotation.Note),
+                ("$createdAt", annotation.CreatedAt.ToString("O", CultureInfo.InvariantCulture))).ConfigureAwait(false);
+        }
+
+        foreach (var reference in project.AnalysisReferences)
+        {
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO analysis_references(
+                    source_id, source_fingerprint, pipeline_version, model, profile_id, profile_version, updated_at)
+                VALUES($sourceId, $fingerprint, $pipeline, $model, $profile, $profileVersion, $updatedAt);
+                """, token,
+                ("$sourceId", reference.SourceId.ToString("N")), ("$fingerprint", reference.SourceFingerprint),
+                ("$pipeline", reference.PipelineVersion), ("$model", reference.Model),
+                ("$profile", reference.ProfileId), ("$profileVersion", reference.ProfileVersion),
+                ("$updatedAt", reference.UpdatedAt.ToString("O", CultureInfo.InvariantCulture))).ConfigureAwait(false);
+        }
+
+        foreach (var plan in project.MontagePlans)
+        {
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO montage_plans(id, request_id, status, target_format, created_at, updated_at, plan_json)
+                VALUES($id, $requestId, $status, $target, $createdAt, $updatedAt, $json);
+                """, token,
+                ("$id", plan.Id.ToString("N")), ("$requestId", plan.RequestId.ToString("N")),
+                ("$status", (int)plan.Status), ("$target", (int)plan.TargetFormat),
+                ("$createdAt", plan.CreatedAt.ToString("O", CultureInfo.InvariantCulture)),
+                ("$updatedAt", plan.UpdatedAt.ToString("O", CultureInfo.InvariantCulture)),
+                ("$json", JsonSerializer.Serialize(plan))).ConfigureAwait(false);
+            foreach (var item in plan.Items)
+            {
+                await ExecuteAsync(connection, transaction, """
+                    INSERT INTO montage_plan_items(plan_id, item_id, item_order, item_json)
+                    VALUES($planId, $itemId, $order, $json);
+                    """, token,
+                    ("$planId", plan.Id.ToString("N")), ("$itemId", item.Id.ToString("N")),
+                    ("$order", item.Order), ("$json", JsonSerializer.Serialize(item))).ConfigureAwait(false);
+            }
+        }
+
         for (var ordinal = 0; ordinal < project.MediaClips.Length; ordinal++)
         {
             var clip = project.MediaClips[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO media_clips(
-                    id, clip_order, source_id, track_id, start_ticks, source_in_ticks, duration_ticks, link_group_id,
+                    id, sequence_id, clip_order, source_id, track_id, start_ticks, source_in_ticks, duration_ticks, link_group_id,
                     brightness, contrast, saturation, temperature,
                     volume, is_muted, pan, fade_in_ticks, fade_out_ticks, bass, mid, treble)
-                VALUES($id, $order, $sourceId, $trackId, $start, $sourceIn, $duration, $linkGroup,
+                VALUES($id, $sequenceId, $order, $sourceId, $trackId, $start, $sourceIn, $duration, $linkGroup,
                        $brightness, $contrast, $saturation, $temperature,
                        $volume, $muted, $pan, $fadeIn, $fadeOut, $bass, $mid, $treble);
                 """, token,
-                ("$id", clip.Id.ToString("N")), ("$order", ordinal), ("$sourceId", clip.SourceId.ToString("N")),
+                ("$id", clip.Id.ToString("N")), ("$sequenceId", activeSequenceId),
+                ("$order", ordinal), ("$sourceId", clip.SourceId.ToString("N")),
                 ("$trackId", clip.TrackId.ToString("N")), ("$start", clip.Start.Ticks),
                 ("$sourceIn", clip.SourceIn.Ticks), ("$duration", clip.Duration.Ticks),
                 ("$linkGroup", clip.LinkGroupId?.ToString("N")),
@@ -253,12 +320,13 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             var clip = project.TextClips[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO text_clips(
-                    id, clip_order, track_id, start_ticks, duration_ticks, text, font_family, font_size, color,
+                    id, sequence_id, clip_order, track_id, start_ticks, duration_ticks, text, font_family, font_size, color,
                     x, y, rotation, box_width, box_height, is_subtitle)
-                VALUES($id, $order, $trackId, $start, $duration, $text, $font, $fontSize, $color,
+                VALUES($id, $sequenceId, $order, $trackId, $start, $duration, $text, $font, $fontSize, $color,
                        $x, $y, $rotation, $boxWidth, $boxHeight, $subtitle);
                 """, token,
-                ("$id", clip.Id.ToString("N")), ("$order", ordinal), ("$trackId", clip.TrackId.ToString("N")),
+                ("$id", clip.Id.ToString("N")), ("$sequenceId", activeSequenceId),
+                ("$order", ordinal), ("$trackId", clip.TrackId.ToString("N")),
                 ("$start", clip.Start.Ticks), ("$duration", clip.Duration.Ticks), ("$text", clip.Text),
                 ("$font", clip.Style.FontFamily), ("$fontSize", clip.Style.FontSize), ("$color", clip.Style.Color),
                 ("$x", clip.Style.X), ("$y", clip.Style.Y), ("$rotation", clip.Style.Rotation),
@@ -271,12 +339,13 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             var marker = project.Markers[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO markers(
-                    id, marker_order, kind, start_ticks, duration_ticks, title, description, source_id,
+                    id, sequence_id, marker_order, kind, start_ticks, duration_ticks, title, description, source_id,
                     source_start_ticks, confidence, query)
-                VALUES($id, $order, $kind, $start, $duration, $title, $description, $sourceId,
+                VALUES($id, $sequenceId, $order, $kind, $start, $duration, $title, $description, $sourceId,
                        $sourceStart, $confidence, $query);
                 """, token,
-                ("$id", marker.Id.ToString("N")), ("$order", ordinal), ("$kind", (int)marker.Kind),
+                ("$id", marker.Id.ToString("N")), ("$sequenceId", activeSequenceId),
+                ("$order", ordinal), ("$kind", (int)marker.Kind),
                 ("$start", marker.Start.Ticks), ("$duration", marker.Duration.Ticks),
                 ("$title", marker.Title), ("$description", marker.Description),
                 ("$sourceId", marker.SourceId?.ToString("N")), ("$sourceStart", marker.SourceStart.Ticks),
@@ -287,10 +356,11 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             var transition = project.Transitions[ordinal];
             await ExecuteAsync(connection, transaction, """
                 INSERT INTO transitions(
-                    id, transition_order, kind, track_id, from_clip_id, to_clip_id, start_ticks, duration_ticks)
-                VALUES($id, $order, $kind, $trackId, $fromClipId, $toClipId, $start, $duration);
+                    id, sequence_id, transition_order, kind, track_id, from_clip_id, to_clip_id, start_ticks, duration_ticks)
+                VALUES($id, $sequenceId, $order, $kind, $trackId, $fromClipId, $toClipId, $start, $duration);
                 """, token,
-                ("$id", transition.Id.ToString("N")), ("$order", ordinal), ("$kind", (int)transition.Kind),
+                ("$id", transition.Id.ToString("N")), ("$sequenceId", activeSequenceId),
+                ("$order", ordinal), ("$kind", (int)transition.Kind),
                 ("$trackId", transition.TrackId.ToString("N")),
                 ("$fromClipId", transition.FromClipId.ToString("N")),
                 ("$toClipId", transition.ToClipId.ToString("N")),
@@ -555,7 +625,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                     new TimelineTime(reader.GetInt64(6))));
         }
 
-        return new ProjectState
+        var project = new ProjectState
         {
             Id = projectId,
             Name = name,
@@ -571,6 +641,98 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             Markers = markers.ToImmutable(),
             InPoint = inPoint,
             OutPoint = outPoint
+        };
+        return await ReadAiWorkspaceAsync(connection, project, token).ConfigureAwait(false);
+    }
+
+    private static async Task<ProjectState> ReadAiWorkspaceAsync(
+        SqliteConnection connection,
+        ProjectState project,
+        CancellationToken token)
+    {
+        var plans = ImmutableArray.CreateBuilder<MontagePlan>();
+        if (await HasTableAsync(connection, "montage_plans", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT plan_json FROM montage_plans ORDER BY created_at;";
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            {
+                var plan = JsonSerializer.Deserialize<MontagePlan>(reader.GetString(0))
+                    ?? throw new InvalidDataException("Сохранённый план ИИ-монтажа повреждён.");
+                plans.Add(plan);
+            }
+        }
+
+        var sequences = ImmutableArray.CreateBuilder<SequenceState>();
+        Guid? activeSequenceId = null;
+        if (await HasTableAsync(connection, "sequences", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id, is_active, snapshot_json FROM sequences ORDER BY rowid;";
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            {
+                var sequence = ProjectDocumentSerializer.DeserializeSequence(reader.GetString(2));
+                if (sequence.Id != ReadGuid(reader, 0))
+                    throw new InvalidDataException("ID варианта монтажа не совпадает с его снимком.");
+                sequences.Add(sequence);
+                if (ReadBoolean(reader, 1)) activeSequenceId = sequence.Id;
+            }
+        }
+
+        if (sequences.Count == 0)
+        {
+            activeSequenceId = project.Id;
+            sequences.Add(SequenceState.Capture(project, project.Id, "Исходный монтаж"));
+        }
+
+        var annotations = ImmutableArray.CreateBuilder<SourceAnnotation>();
+        if (await HasTableAsync(connection, "source_annotations", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT id, source_id, kind, source_start_ticks, duration_ticks, note, created_at
+                FROM source_annotations ORDER BY created_at, id;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+                annotations.Add(new SourceAnnotation(
+                    ReadGuid(reader, 0), ReadGuid(reader, 1), (SourceAnnotationKind)reader.GetInt32(2),
+                    new TimeRange(new TimelineTime(reader.GetInt64(3)), new TimelineTime(reader.GetInt64(4))),
+                    reader.GetString(5), ReadDateTimeOffset(reader, 6)));
+        }
+
+        var references = ImmutableArray.CreateBuilder<MediaAnalysisReference>();
+        if (await HasTableAsync(connection, "analysis_references", token).ConfigureAwait(false))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT source_id, source_fingerprint, pipeline_version, model, profile_id, profile_version, updated_at
+                FROM analysis_references ORDER BY source_id, updated_at;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+                references.Add(new MediaAnalysisReference(
+                    ReadGuid(reader, 0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
+                    reader.GetString(4), reader.GetInt32(5), ReadDateTimeOffset(reader, 6)));
+        }
+
+        activeSequenceId ??= sequences[0].Id;
+        var active = sequences.FirstOrDefault(item => item.Id == activeSequenceId.Value);
+        if (active is null)
+            throw new InvalidDataException("Активный вариант монтажа отсутствует.");
+
+        // Relational timeline tables contain the active sequence for fast loading.
+        // Its snapshot is refreshed from those authoritative rows so both representations stay identical.
+        var synchronizedActive = active.CaptureTimeline(project, incrementRevision: false);
+        return project with
+        {
+            Sequences = sequences.Select(item => item.Id == synchronizedActive.Id ? synchronizedActive : item).ToImmutableArray(),
+            ActiveSequenceId = synchronizedActive.Id,
+            SourceAnnotations = annotations.ToImmutable(),
+            AnalysisReferences = references.ToImmutable(),
+            MontagePlans = plans.ToImmutable()
         };
     }
 
@@ -603,16 +765,30 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
                 audio_sample_rate INTEGER NOT NULL CHECK(audio_sample_rate BETWEEN 8000 AND 192000)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS sequences(
+                id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                name TEXT NOT NULL CHECK(length(name) > 0),
+                revision INTEGER NOT NULL CHECK(revision >= 0),
+                status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 2),
+                target_format INTEGER NOT NULL CHECK(target_format BETWEEN 0 AND 2),
+                parent_sequence_id TEXT NULL CHECK(parent_sequence_id IS NULL OR length(parent_sequence_id) = 32),
+                montage_plan_id TEXT NULL CHECK(montage_plan_id IS NULL OR length(montage_plan_id) = 32),
+                is_active INTEGER NOT NULL CHECK(is_active IN (0,1)),
+                snapshot_json TEXT NOT NULL CHECK(length(snapshot_json) > 2)
+            ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_sequences_active ON sequences(is_active) WHERE is_active = 1;
             CREATE TABLE IF NOT EXISTS tracks(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
-                track_order INTEGER NOT NULL UNIQUE CHECK(track_order >= 0),
+                sequence_id TEXT NOT NULL CHECK(length(sequence_id) = 32),
+                track_order INTEGER NOT NULL CHECK(track_order >= 0),
                 kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
                 track_index INTEGER NOT NULL CHECK(track_index >= 0),
                 name TEXT NOT NULL CHECK(length(name) > 0),
                 is_muted INTEGER NOT NULL CHECK(is_muted IN (0,1)),
                 is_locked INTEGER NOT NULL CHECK(is_locked IN (0,1)),
                 is_visible INTEGER NOT NULL CHECK(is_visible IN (0,1)),
-                UNIQUE(kind, track_index)
+                UNIQUE(sequence_id, track_order),
+                UNIQUE(sequence_id, kind, track_index)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS media_sources(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
@@ -643,7 +819,8 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ) STRICT;
             CREATE TABLE IF NOT EXISTS media_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
-                clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
+                sequence_id TEXT NOT NULL CHECK(length(sequence_id) = 32),
+                clip_order INTEGER NOT NULL CHECK(clip_order >= 0),
                 source_id TEXT NOT NULL REFERENCES media_sources(id) ON DELETE RESTRICT,
                 track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
@@ -663,6 +840,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 mid REAL NULL CHECK(mid IS NULL OR mid BETWEEN -20 AND 20),
                 treble REAL NULL CHECK(treble IS NULL OR treble BETWEEN -20 AND 20)
             ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_media_clips_sequence_order ON media_clips(sequence_id, clip_order);
             CREATE INDEX IF NOT EXISTS ix_media_clips_track_time ON media_clips(track_id, start_ticks, duration_ticks);
             CREATE INDEX IF NOT EXISTS ix_media_clips_source ON media_clips(source_id);
             CREATE INDEX IF NOT EXISTS ix_media_clips_link ON media_clips(link_group_id) WHERE link_group_id IS NOT NULL;
@@ -683,7 +861,8 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ) STRICT;
             CREATE TABLE IF NOT EXISTS text_clips(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
-                clip_order INTEGER NOT NULL UNIQUE CHECK(clip_order >= 0),
+                sequence_id TEXT NOT NULL CHECK(length(sequence_id) = 32),
+                clip_order INTEGER NOT NULL CHECK(clip_order >= 0),
                 track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
                 duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
@@ -698,10 +877,12 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 box_height REAL NOT NULL CHECK(box_height > 0 AND box_height <= 1),
                 is_subtitle INTEGER NOT NULL CHECK(is_subtitle IN (0,1))
             ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_text_clips_sequence_order ON text_clips(sequence_id, clip_order);
             CREATE INDEX IF NOT EXISTS ix_text_clips_track_time ON text_clips(track_id, start_ticks, duration_ticks);
             CREATE TABLE IF NOT EXISTS markers(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
-                marker_order INTEGER NOT NULL UNIQUE CHECK(marker_order >= 0),
+                sequence_id TEXT NOT NULL CHECK(length(sequence_id) = 32),
+                marker_order INTEGER NOT NULL CHECK(marker_order >= 0),
                 kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 9),
                 start_ticks INTEGER NOT NULL CHECK(start_ticks >= 0),
                 duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
@@ -712,10 +893,12 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 confidence REAL NOT NULL CHECK(confidence BETWEEN 0 AND 1),
                 query TEXT NOT NULL
             ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_markers_sequence_order ON markers(sequence_id, marker_order);
             CREATE INDEX IF NOT EXISTS ix_markers_time ON markers(start_ticks, duration_ticks);
             CREATE TABLE IF NOT EXISTS transitions(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
-                transition_order INTEGER NOT NULL UNIQUE CHECK(transition_order >= 0),
+                sequence_id TEXT NOT NULL CHECK(length(sequence_id) = 32),
+                transition_order INTEGER NOT NULL CHECK(transition_order >= 0),
                 kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
                 track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
                 from_clip_id TEXT NOT NULL REFERENCES media_clips(id) ON DELETE CASCADE,
@@ -724,7 +907,45 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
                 CHECK(from_clip_id <> to_clip_id)
             ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_transitions_sequence_order ON transitions(sequence_id, transition_order);
             CREATE INDEX IF NOT EXISTS ix_transitions_track_time ON transitions(track_id, start_ticks, duration_ticks);
+            CREATE TABLE IF NOT EXISTS source_annotations(
+                id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                source_id TEXT NOT NULL REFERENCES media_sources(id) ON DELETE CASCADE,
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
+                source_start_ticks INTEGER NOT NULL CHECK(source_start_ticks >= 0),
+                duration_ticks INTEGER NOT NULL CHECK(duration_ticks > 0),
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS ix_source_annotations_source ON source_annotations(source_id, source_start_ticks);
+            CREATE TABLE IF NOT EXISTS analysis_references(
+                source_id TEXT NOT NULL REFERENCES media_sources(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                pipeline_version TEXT NOT NULL,
+                model TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                profile_version INTEGER NOT NULL CHECK(profile_version > 0),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(source_id, pipeline_version, model, profile_id, profile_version)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS montage_plans(
+                id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                request_id TEXT NOT NULL CHECK(length(request_id) = 32),
+                status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 3),
+                target_format INTEGER NOT NULL CHECK(target_format BETWEEN 0 AND 2),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                plan_json TEXT NOT NULL CHECK(length(plan_json) > 2)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS montage_plan_items(
+                plan_id TEXT NOT NULL REFERENCES montage_plans(id) ON DELETE CASCADE,
+                item_id TEXT NOT NULL CHECK(length(item_id) = 32),
+                item_order INTEGER NOT NULL CHECK(item_order >= 0),
+                item_json TEXT NOT NULL CHECK(length(item_json) > 2),
+                PRIMARY KEY(plan_id, item_id),
+                UNIQUE(plan_id, item_order)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS checkpoints(
                 id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),
                 project_id TEXT NOT NULL CHECK(length(project_id) = 32),
@@ -881,6 +1102,18 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+    }
+
+    private static ProjectState PrepareForStorage(ProjectState project)
+    {
+        if (project.Sequences.IsDefaultOrEmpty)
+        {
+            var sequence = SequenceState.Capture(project, project.Id, "Исходный монтаж");
+            return project with { Sequences = [sequence], ActiveSequenceId = sequence.Id };
+        }
+        if (project.ActiveSequence is null)
+            throw new InvalidDataException("В проекте не выбран активный вариант монтажа.");
+        return project.SynchronizeActiveSequence(incrementRevision: false);
     }
 
     private void EnsureValid(ProjectState project)

@@ -43,7 +43,7 @@ public sealed class SqliteProjectStoreTests
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM text_clips;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM markers;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM transitions;"));
-        Assert.Equal(3L, await ScalarInt64Async(connection,
+        Assert.Equal(4L, await ScalarInt64Async(connection,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
         Assert.Equal(0L, await ScalarInt64Async(connection,
@@ -179,7 +179,7 @@ public sealed class SqliteProjectStoreTests
     }
 
     [Fact]
-    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v3()
+    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v4()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "v2.kadr");
@@ -211,7 +211,7 @@ public sealed class SqliteProjectStoreTests
         await store.SaveAsync(path, loaded);
         await using var migrated = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
         await migrated.OpenAsync();
-        Assert.Equal(3L, await ScalarInt64Async(migrated,
+        Assert.Equal(4L, await ScalarInt64Async(migrated,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(1L, await ScalarInt64Async(migrated,
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transitions';"));

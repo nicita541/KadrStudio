@@ -21,8 +21,8 @@ public sealed class TimelineRenderSnapshotTests
             waveform.AddInterleavedStereo(Enumerable.Range(0, 32_000)
                 .SelectMany(index => new[]
                 {
-                    MathF.Sin(index / 17f) * (index % 257) / 257f,
-                    MathF.Cos(index / 29f) * (index % 113) / 113f
+                    MathF.Sin(index / 17f) * (index % 257) / 257f * 0.035f,
+                    MathF.Cos(index / 29f) * (index % 113) / 113f * 0.035f
                 }).ToArray());
             var project = new ProjectViewMapper().ToUi(KadrStudio.Core.Domain.ProjectState.CreateNew());
             project.Media.Add(new MediaAsset
@@ -54,6 +54,8 @@ public sealed class TimelineRenderSnapshotTests
                 "Video track did not render its blue body.");
             Assert.True(CountPixels(first, (r, g, b) => g > 120 && g > r * 1.25) > 500,
                 "Stereo waveform/audio track did not render visible green peaks.");
+            Assert.True(CountPixels(first, (r, g, b) => r > 100 && g > 220 && b > 100) > 100,
+                "Quiet audio did not receive enough display gain to render readable peaks.");
         });
 
     private static byte[] Render(FrameworkElement element, int width, int height)

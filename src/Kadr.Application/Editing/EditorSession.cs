@@ -54,6 +54,7 @@ public sealed class EditorSession : IEditorSession
             Revision = checked(before.Revision + 1),
             UpdatedAt = DateTimeOffset.UtcNow
         };
+        candidate = candidate.SynchronizeActiveSequence();
         EnsureValid(candidate);
         var changes = ProjectChangeSet.Between(before, candidate);
 

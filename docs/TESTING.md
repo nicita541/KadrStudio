@@ -12,7 +12,8 @@ dotnet test KadrStudio.sln -c Release --no-build --no-restore -m:1 -nr:false
 
 - domain/property tests точного времени, edit-команд, undo/redo, link groups, transitions и range invalidation;
 - architecture tests направления зависимостей, отсутствия старого mutable project/JSON bridge и Process/File construction во ViewModel;
-- SQLite schema 1/2/3, checksum corruption, history, 20 recovery-версий и write lease;
+- SQLite schema 1/2/3/4, миграция старого таймлайна в исходную последовательность, checksum corruption, history, 20 recovery-версий и write lease;
+- ИИ-монтаж: независимые последовательности и Undo/Redo, Required/Excluded/locked-инварианты, stale fingerprint/revision, source-range scope, связанный V/A rough cut, субтитры и статический 9:16 reframe;
 - cache fingerprint/checksum/LRU/move/budget и stereo waveform pyramid;
 - UI geometry/render snapshots общего viewport, thumbnail virtualization/zoom precision и DPI-dependent waveform density;
 - реальные FFmpeg V-only/A-only/AV, multitrack, transitions, proxy corruption, точные on-demand thumbnail, fractional FPS, subtitles и analysis;

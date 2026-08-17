@@ -196,14 +196,31 @@ public sealed class MediaPipelineIntegrationTests
                 FastFingerprint: asset.ProbeResult.Fingerprint.FastHash,
                 VerifiedFingerprint: asset.ProbeResult.Fingerprint.VerifiedHash ?? string.Empty,
                 Streams: asset.ProbeResult.Streams);
-            var derived = await timelineCache.PrepareAsync(sourceInfo);
+            var preparations = await Task.WhenAll(
+                timelineCache.PrepareAsync(sourceInfo),
+                timelineCache.PrepareAsync(sourceInfo));
+            var derived = preparations[0];
 
+            Assert.Same(derived.Waveform, preparations[1].Waveform);
             Assert.False(derived.Waveform.IsEmpty);
             var basePeaks = derived.Waveform.Levels[0].Peaks;
             Assert.Contains(basePeaks, peak => peak == default);
             Assert.Contains(basePeaks, peak => peak.MaximumLeft > 0.7f && peak.MaximumRight == 0);
             Assert.Contains(basePeaks, peak => peak.MaximumRight > 0.3f);
             Assert.Equal(800, derived.Waveform.ReadColumns(0, 1, 800).Length);
+
+            const string longFingerprint = "long-recording-waveform-policy";
+            var longRecording = sourceInfo with
+            {
+                Id = Guid.NewGuid(),
+                Duration = TimelineTime.FromSeconds(10 * 60 * 60),
+                Fingerprint = longFingerprint,
+                FastFingerprint = longFingerprint,
+                VerifiedFingerprint = longFingerprint
+            };
+            var bounded = await timelineCache.PrepareAsync(longRecording);
+            Assert.True(bounded.Waveform.Levels[0].FramesPerPeak > 256);
+            Assert.True(bounded.Waveform.Levels[0].Count < basePeaks.Length);
         }
         finally { DeleteRoot(root); }
     }

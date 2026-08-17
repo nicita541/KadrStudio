@@ -1,13 +1,26 @@
 using System.Diagnostics;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using KadrStudio.Application.Automation;
 using KadrStudio.Models;
 using CoreMediaClip = KadrStudio.Core.Domain.MediaClip;
 using CoreProjectState = KadrStudio.Core.Domain.ProjectState;
+using CoreAnalysisEvidence = KadrStudio.Core.Domain.AnalysisEvidence;
+using CoreAnalysisSegment = KadrStudio.Core.Domain.AnalysisSegment;
+using CoreGameEditingProfile = KadrStudio.Core.Domain.GameEditingProfile;
+using CoreMontageEvidenceKind = KadrStudio.Core.Domain.MontageEvidenceKind;
+using CoreTimeRange = KadrStudio.Core.Domain.TimeRange;
+using CoreTimelineTime = KadrStudio.Core.Domain.TimelineTime;
+using CoreMontagePlan = KadrStudio.Core.Domain.MontagePlan;
+using CoreMontagePlanItem = KadrStudio.Core.Domain.MontagePlanItem;
+using CoreMontageRole = KadrStudio.Core.Domain.MontageRole;
+using CoreSourceAnnotationKind = KadrStudio.Core.Domain.SourceAnnotationKind;
+using CoreTransitionKind = KadrStudio.Core.Domain.TransitionKind;
 
 namespace KadrStudio.Services;
 
@@ -155,6 +168,146 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         }
     }
 
+    public async Task<ImmutableArray<CoreAnalysisSegment>> AnalyzeGameplayAsync(
+        MediaAsset asset,
+        VideoAnalysisResult baseline,
+        CoreGameEditingProfile profile,
+        string model,
+        IProgress<VideoAnalysisProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureServerAsync(cancellationToken);
+        var capabilities = await GetCapabilitiesAsync(model, cancellationToken);
+        if (!capabilities.Contains("vision", StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Модель {model} не поддерживает анализ изображений.");
+
+        var specs = BuildGameplayContactSheetSpecs(baseline);
+        var paths = new List<string>();
+        var images = new List<string>();
+        try
+        {
+            for (var index = 0; index < specs.Count; index++)
+            {
+                progress?.Report(new VideoAnalysisProgress(
+                    86 + 8d * index / Math.Max(1, specs.Count),
+                    $"Игровой vision-анализ: обзор {index + 1}/{specs.Count}"));
+                var spec = specs[index];
+                var path = await CreateContactSheetAsync(
+                    asset.Path, spec.Start, spec.End, spec.FrameCount, cancellationToken);
+                paths.Add(path);
+                images.Add(Convert.ToBase64String(await File.ReadAllBytesAsync(path, cancellationToken)));
+            }
+
+            var sheetDescription = string.Join(Environment.NewLine, specs.Select((spec, index) =>
+                $"- изображение {index + 1}: {Format(spec.Start)}–{Format(spec.End)} сек., кадры слева направо и сверху вниз"));
+            var tags = string.Join(", ", profile.EventTags);
+            var messages = new object[]
+            {
+                new
+                {
+                    role = "system",
+                    content =
+                        "Ты анализатор игрового видео. Верни только JSON без Markdown: " +
+                        "{\"segments\":[{\"start\":0.0,\"end\":3.0,\"title\":\"событие\",\"description\":\"что видно\"," +
+                        "\"confidence\":0.8,\"tags\":{\"tag\":0.9}}]}. " +
+                        "start/end — абсолютные секунды исходника. Используй только события, которые видны на кадрах; " +
+                        "не выдумывай содержание между редкими кадрами. Один сегмент должен описывать одно событие."
+                },
+                new
+                {
+                    role = "user",
+                    content =
+                        $"Игра/профиль: {profile.DisplayName} ({profile.GameFamily}).\n" +
+                        $"Искомые теги: {tags}.\nПравила монтажа: {profile.PlanningGuidance}\n" +
+                        $"Диапазон: {Format(baseline.SourceStart)}–{Format(baseline.SourceEnd)} сек.\n" +
+                        $"Контактные листы:\n{sheetDescription}\n" +
+                        "Отмечай только уверенно распознанные игровые события и интерфейсные признаки.",
+                    images = images.ToArray()
+                }
+            };
+            using var response = await _httpClient.PostAsJsonAsync(
+                "api/chat",
+                new
+                {
+                    model,
+                    stream = false,
+                    think = false,
+                    format = "json",
+                    messages,
+                    options = new { temperature = 0.08, num_ctx = 16384, num_predict = 4096 }
+                },
+                cancellationToken);
+            await EnsureSuccessAsync(response, $"Локальная модель {model} не выполнила игровой анализ", cancellationToken);
+            var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
+            var parsed = ParseGameplaySegments(responseJson, asset.Id, baseline, profile);
+            return await RefineGameplayBoundariesAsync(
+                asset, parsed, baseline, progress, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (var path in paths) TryDelete(path);
+        }
+    }
+
+    private async Task<ImmutableArray<CoreAnalysisSegment>> RefineGameplayBoundariesAsync(
+        MediaAsset asset,
+        ImmutableArray<CoreAnalysisSegment> segments,
+        VideoAnalysisResult baseline,
+        IProgress<VideoAnalysisProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        if (segments.IsDefaultOrEmpty) return [];
+        var selected = segments
+            .OrderByDescending(item => item.Confidence)
+            .ThenByDescending(item => item.MotionScore + item.LoudnessScore)
+            .Take(16)
+            .Select(item => item.Id)
+            .ToHashSet();
+        var verifier = new VideoAnalysisService(_ffmpegLocator, _processRunner);
+        var fps = asset.FrameRate > 0 ? asset.FrameRate : 30;
+        var output = ImmutableArray.CreateBuilder<CoreAnalysisSegment>(segments.Length);
+        var completed = 0;
+        foreach (var segment in segments)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!selected.Contains(segment.Id))
+            {
+                output.Add(segment);
+                continue;
+            }
+
+            progress?.Report(new VideoAnalysisProgress(
+                95 + 5d * completed / Math.Max(1, selected.Count),
+                $"Уточнение игровых границ FFmpeg: {completed + 1}/{selected.Count}"));
+            var start = await verifier.VerifyBoundaryAsync(
+                asset.Path, segment.SourceRange.Start.TotalSeconds,
+                baseline.SourceStart, baseline.SourceEnd, fps, cancellationToken).ConfigureAwait(false);
+            var end = await verifier.VerifyBoundaryAsync(
+                asset.Path, segment.SourceRange.End.TotalSeconds,
+                baseline.SourceStart, baseline.SourceEnd, fps, cancellationToken).ConfigureAwait(false);
+            completed++;
+            if (end.VerifiedTime <= start.VerifiedTime + 0.15)
+            {
+                output.Add(segment);
+                continue;
+            }
+
+            var evidence = segment.Evidence.Add(new CoreAnalysisEvidence(
+                CoreMontageEvidenceKind.Technical,
+                "Границы уточнены плотным FFmpeg-проходом около игрового события.",
+                $"start:{start.FrameCandidateCount};end:{end.FrameCandidateCount}"));
+            output.Add(segment with
+            {
+                SourceRange = new CoreTimeRange(
+                    CoreTimelineTime.FromSeconds(start.VerifiedTime),
+                    CoreTimelineTime.FromSeconds(end.VerifiedTime - start.VerifiedTime)),
+                Evidence = evidence
+            });
+        }
+        progress?.Report(new VideoAnalysisProgress(100, "Игровые события и их границы уточнены"));
+        return output.ToImmutable();
+    }
+
     public async Task<EditCommandPlan> PlanEditsAsync(
         CoreProjectState project,
         string prompt,
@@ -280,6 +433,172 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             throw new InvalidOperationException("Не удалось преобразовать запрос в безопасные команды монтажа.");
         }
         return new EditCommandPlan(string.IsNullOrWhiteSpace(summary) ? "План монтажа подготовлен." : summary, commands);
+    }
+
+    public async Task<CoreMontagePlan> PlanMontageAsync(
+        MontagePlanningContext context,
+        CancellationToken cancellationToken = default)
+    {
+        var baselineProvider = new EvidenceMontagePlanningProvider();
+        var baseline = context.PreviousPlan is null
+            ? await baselineProvider.CreatePlanAsync(context, cancellationToken).ConfigureAwait(false)
+            : await baselineProvider.RevisePlanAsync(context, cancellationToken).ConfigureAwait(false);
+        var model = context.Manifests.Values
+            .Select(item => item.Model)
+            .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item) && !item.Equals("technical+whisper", StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(model)) return baseline;
+
+        await EnsureServerAsync(cancellationToken);
+        var permittedItems = baseline.Items.ToDictionary(item => item.Id);
+        var segments = context.Manifests.Values
+            .SelectMany(item => item.Segments)
+            .Where(item => permittedItems.ContainsKey(item.Id) && !item.Evidence.IsDefaultOrEmpty)
+            .Select(item => item with { SourceRange = permittedItems[item.Id].SourceRange })
+            .OrderByDescending(item => ScoreForPrompt(item, context.Request.Profile))
+            .ThenBy(item => item.SourceId)
+            .ThenBy(item => item.SourceRange.Start)
+            .Take(140)
+            .ToDictionary(item => item.Id);
+        foreach (var item in permittedItems.Values.Where(item => !segments.ContainsKey(item.Id)))
+            segments[item.Id] = new CoreAnalysisSegment(
+                item.Id, item.SourceId, item.SourceRange, 0, 0, 0, string.Empty,
+                ImmutableDictionary<string, double>.Empty.Add("plan-candidate", item.Confidence),
+                item.Confidence,
+                item.Evidence);
+        foreach (var required in context.Request.Constraints.Where(item => item.Kind == CoreSourceAnnotationKind.Required))
+        {
+            if (segments.Values.Any(item => item.SourceId == required.SourceId &&
+                                            item.SourceRange.Start <= required.SourceRange.Start &&
+                                            item.SourceRange.End >= required.SourceRange.End))
+                continue;
+            segments[required.Id] = new CoreAnalysisSegment(
+                required.Id, required.SourceId, required.SourceRange, 0, 0, 0, string.Empty,
+                ImmutableDictionary<string, double>.Empty.Add("required", 1), 1,
+                [new CoreAnalysisEvidence(CoreMontageEvidenceKind.UserAnnotation, required.Note, required.Id.ToString("N"))]);
+        }
+
+        var contextText = new StringBuilder();
+        contextText.AppendLine($"Формат: {context.Request.TargetFormat}; цель {Format(context.Request.TargetDuration.TotalSeconds)} сек.");
+        contextText.AppendLine($"Профиль: {context.Request.Profile.DisplayName}. {context.Request.Profile.PlanningGuidance}");
+        contextText.AppendLine($"Запрос пользователя: {context.Request.Brief}");
+        if (!string.IsNullOrWhiteSpace(context.RevisionRequest))
+            contextText.AppendLine($"Корректировка: {context.RevisionRequest}");
+        contextText.AppendLine("Кандидаты (можно использовать только эти segment_id):");
+        foreach (var segment in segments.Values)
+        {
+            context.Project.Sources.TryGetValue(segment.SourceId, out var source);
+            contextText.Append("- ").Append(segment.Id.ToString("N"))
+                .Append(" | ").Append(source?.Name)
+                .Append(" | ").Append(Format(segment.SourceRange.Start.TotalSeconds)).Append('–')
+                .Append(Format(segment.SourceRange.End.TotalSeconds)).Append(" | tags=")
+                .Append(string.Join(',', segment.Tags.OrderByDescending(item => item.Value).Select(item => $"{item.Key}:{Format(item.Value)}")))
+                .Append(" | transcript=").Append(segment.Transcript)
+                .Append(" | evidence=")
+                .AppendLine(string.Join("; ", segment.Evidence.Select(item => item.Summary)));
+        }
+        contextText.AppendLine("Обязательные диапазоны:");
+        foreach (var required in context.Request.Constraints.Where(item => item.Kind == CoreSourceAnnotationKind.Required))
+            contextText.AppendLine($"- {required.Id:N}: {required.Note}");
+        contextText.AppendLine("Заметки пользователя:");
+        foreach (var note in context.Request.Constraints.Where(item => item.Kind == CoreSourceAnnotationKind.Note))
+            contextText.AppendLine($"- {note.SourceId:N} {Format(note.SourceRange.Start.TotalSeconds)}–{Format(note.SourceRange.End.TotalSeconds)}: {note.Note}");
+        if (context.PreviousPlan is not null)
+        {
+            contextText.AppendLine("Заблокированные элементы предыдущего плана нельзя менять:");
+            foreach (var item in context.PreviousPlan.Items.Where(item => item.IsLocked))
+                contextText.AppendLine($"- {item.Id:N}");
+        }
+
+        using var response = await _httpClient.PostAsJsonAsync(
+            "api/chat",
+            new
+            {
+                model,
+                stream = false,
+                think = false,
+                format = "json",
+                messages = new object[]
+                {
+                    new
+                    {
+                        role = "system",
+                        content =
+                            "Ты режиссёр игрового видео. Ты не меняешь таймлайн, а возвращаешь декларативный план JSON без Markdown: " +
+                            "{\"summary\":\"...\",\"items\":[{\"segment_id\":\"32 hex\",\"role\":\"hook|setup|development|payoff|ending\"," +
+                            "\"reason\":\"почему\",\"transition_after\":\"none|cross_dissolve|dip_to_black\",\"volume\":1.0,\"subtitles\":true}]}. " +
+                            "Используй только переданные segment_id, каждый максимум один раз. Обязательные элементы включай всегда. " +
+                            "Строй понятную причинно-следственную историю и соблюдай целевую длительность."
+                    },
+                    new { role = "user", content = contextText.ToString() }
+                },
+                options = new { temperature = 0.12, num_ctx = 16384, num_predict = 4096 }
+            },
+            cancellationToken);
+        await EnsureSuccessAsync(response, $"Локальная модель {model} не составила план игрового монтажа", cancellationToken);
+        var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
+        using var envelope = JsonDocument.Parse(responseJson);
+        var rawContent = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+        using var result = JsonDocument.Parse(ExtractJson(rawContent));
+        var summary = GetString(result.RootElement, "summary");
+        var items = new List<CoreMontagePlanItem>();
+        if (result.RootElement.TryGetProperty("items", out var itemElements) && itemElements.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var element in itemElements.EnumerateArray())
+            {
+                var idText = GetString(element, "segment_id").Replace("-", string.Empty, StringComparison.Ordinal);
+                if (!Guid.TryParseExact(idText, "N", out var segmentId) || !segments.TryGetValue(segmentId, out var segment) ||
+                    items.Any(item => item.Id == segmentId))
+                    continue;
+                var role = ParseMontageRole(GetString(element, "role"));
+                var transition = ParseMontageTransition(GetString(element, "transition_after"));
+                var volume = TryGetNumber(element, "volume", out var parsedVolume) ? Math.Clamp(parsedVolume, 0, 2) : 1;
+                var includeSubtitles = !element.TryGetProperty("subtitles", out var subtitlesElement) ||
+                                       subtitlesElement.ValueKind != JsonValueKind.False;
+                var required = context.Request.Constraints.FirstOrDefault(item =>
+                    item.Kind == CoreSourceAnnotationKind.Required && item.SourceId == segment.SourceId &&
+                    segment.SourceRange.Start <= item.SourceRange.Start && segment.SourceRange.End >= item.SourceRange.End);
+                var range = required?.SourceRange ?? segment.SourceRange;
+                items.Add(new CoreMontagePlanItem(
+                    segment.Id, segment.SourceId, range, role, items.Count,
+                    string.IsNullOrWhiteSpace(GetString(element, "reason")) ? "Выбрано ИИ по данным анализа" : GetString(element, "reason"),
+                    segment.Confidence, segment.Evidence, required is not null, TransitionAfter: transition,
+                    Volume: volume, IncludeSubtitles: includeSubtitles));
+            }
+        }
+
+        foreach (var requiredItem in baseline.Items.Where(item =>
+                     context.Request.Constraints.Any(constraint =>
+                         constraint.Kind == CoreSourceAnnotationKind.Required && constraint.Id == item.Id)))
+            if (items.All(item => item.Id != requiredItem.Id)) items.Add(requiredItem);
+
+        var protectedLocked = context.PreviousPlan?.Items.Where(item => item.IsLocked).ToArray() ?? [];
+        if (protectedLocked.Length > 0)
+        {
+            var lockedIds = protectedLocked.Select(item => item.Id).ToHashSet();
+            items.RemoveAll(item => lockedIds.Contains(item.Id));
+            items.AddRange(protectedLocked);
+        }
+        if (items.Count == 0)
+            throw new InvalidOperationException("Локальная модель не выбрала ни одного допустимого фрагмента.");
+        var lockedOrders = protectedLocked.Select(item => item.Order).ToHashSet();
+        var nextOrder = 0;
+        var normalized = items
+            .Where(item => !item.IsLocked || protectedLocked.All(locked => locked.Id != item.Id))
+            .Select(item =>
+            {
+                while (lockedOrders.Contains(nextOrder)) nextOrder++;
+                return item with { Order = nextOrder++ };
+            })
+            .Concat(protectedLocked)
+            .OrderBy(item => item.Order)
+            .ToImmutableArray();
+        return baseline with
+        {
+            Summary = string.IsNullOrWhiteSpace(summary) ? baseline.Summary : summary,
+            Items = normalized,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            Dependencies = baseline.Dependencies with { Model = model }
+        };
     }
 
     public async Task EnsureServerAsync(CancellationToken cancellationToken = default)
@@ -772,6 +1091,122 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         }
         return sheets.Take(5).ToList();
     }
+
+    private static IReadOnlyList<ContactSheetSpec> BuildGameplayContactSheetSpecs(VideoAnalysisResult baseline)
+    {
+        var duration = Math.Max(0.1, baseline.SourceEnd - baseline.SourceStart);
+        var count = Math.Clamp((int)Math.Ceiling(duration / 300), 1, 8);
+        var window = duration / count;
+        var specs = new List<ContactSheetSpec>(count);
+        for (var index = 0; index < count; index++)
+        {
+            var start = baseline.SourceStart + index * window;
+            var end = index == count - 1 ? baseline.SourceEnd : Math.Min(baseline.SourceEnd, start + window);
+            specs.Add(new ContactSheetSpec(start, end, duration >= 3 ? 16 : 4, $"игровой обзор {index + 1}"));
+        }
+        return specs;
+    }
+
+    private static ImmutableArray<CoreAnalysisSegment> ParseGameplaySegments(
+        string responseJson,
+        Guid sourceId,
+        VideoAnalysisResult baseline,
+        CoreGameEditingProfile profile)
+    {
+        using var envelope = JsonDocument.Parse(responseJson);
+        if (!envelope.RootElement.TryGetProperty("message", out var message) ||
+            !message.TryGetProperty("content", out var contentElement))
+            throw new InvalidOperationException("Локальный ИИ вернул игровой анализ без результата.");
+        var raw = contentElement.GetString() ?? string.Empty;
+        if (!raw.Contains('{') && message.TryGetProperty("thinking", out var thinking) &&
+            thinking.ValueKind == JsonValueKind.String)
+            raw = thinking.GetString() ?? raw;
+        using var document = JsonDocument.Parse(ExtractJson(raw));
+        if (!document.RootElement.TryGetProperty("segments", out var elements) ||
+            elements.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var allowedTags = profile.EventTags.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var segments = ImmutableArray.CreateBuilder<CoreAnalysisSegment>();
+        foreach (var element in elements.EnumerateArray())
+        {
+            if (!TryGetNumber(element, "start", out var start) || !TryGetNumber(element, "end", out var end))
+                continue;
+            start = Math.Clamp(start, baseline.SourceStart, baseline.SourceEnd);
+            end = Math.Clamp(end, baseline.SourceStart, baseline.SourceEnd);
+            if (end <= start + 0.1) continue;
+            start = SnapToDetectedBoundary(start, baseline, 8);
+            end = SnapToDetectedBoundary(end, baseline, 8);
+            if (end <= start + 0.1) continue;
+
+            var tags = ImmutableDictionary.CreateBuilder<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (element.TryGetProperty("tags", out var tagsElement) && tagsElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in tagsElement.EnumerateObject())
+                {
+                    if (!allowedTags.Contains(property.Name) || !TryReadNumber(property.Value, out var score)) continue;
+                    tags[property.Name] = Math.Clamp(score, 0.05, 1);
+                }
+            }
+            if (tags.Count == 0) continue;
+
+            var confidence = TryGetNumber(element, "confidence", out var parsedConfidence)
+                ? Math.Clamp(parsedConfidence, 0.05, 0.98)
+                : 0.6;
+            var title = GetString(element, "title");
+            var description = GetString(element, "description");
+            var summary = string.IsNullOrWhiteSpace(description)
+                ? string.IsNullOrWhiteSpace(title) ? "Игровое событие подтверждено кадрами." : title
+                : description;
+            segments.Add(new CoreAnalysisSegment(
+                Guid.NewGuid(),
+                sourceId,
+                new CoreTimeRange(CoreTimelineTime.FromSeconds(start), CoreTimelineTime.FromSeconds(end - start)),
+                tags.ContainsKey("teamfight") || tags.ContainsKey("pvp") || tags.ContainsKey("boss") ? 0.9 : 0.65,
+                0.55,
+                0,
+                string.Empty,
+                tags.ToImmutable(),
+                confidence,
+                [new CoreAnalysisEvidence(CoreMontageEvidenceKind.Vision, summary, title)]));
+        }
+        return segments
+            .OrderBy(item => item.SourceRange.Start)
+            .ThenByDescending(item => item.Confidence)
+            .ToImmutableArray();
+    }
+
+    private static bool TryReadNumber(JsonElement element, out double value)
+    {
+        value = 0;
+        if (element.ValueKind == JsonValueKind.Number) return element.TryGetDouble(out value);
+        return element.ValueKind == JsonValueKind.String &&
+               double.TryParse(element.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static double ScoreForPrompt(CoreAnalysisSegment segment, CoreGameEditingProfile profile)
+    {
+        var tags = segment.Tags.Sum(item =>
+            profile.EventWeights.TryGetValue(item.Key, out var weight) ? item.Value * weight : item.Value * 0.15);
+        return tags + segment.MotionScore * 0.2 + segment.LoudnessScore * 0.1 +
+               segment.SpeechScore * 0.15 + segment.Confidence * 0.1;
+    }
+
+    private static CoreMontageRole ParseMontageRole(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "hook" => CoreMontageRole.Hook,
+        "setup" => CoreMontageRole.Setup,
+        "payoff" => CoreMontageRole.Payoff,
+        "ending" => CoreMontageRole.Ending,
+        _ => CoreMontageRole.Development
+    };
+
+    private static CoreTransitionKind? ParseMontageTransition(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "cross_dissolve" or "crossdissolve" => CoreTransitionKind.CrossDissolve,
+        "dip_to_black" or "diptoblack" => CoreTransitionKind.DipToBlack,
+        _ => null
+    };
 
     private static void AddCandidateSheet(
         ICollection<ContactSheetSpec> sheets,

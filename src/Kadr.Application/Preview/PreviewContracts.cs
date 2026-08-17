@@ -49,6 +49,8 @@ public readonly record struct AudioMeterLevel(
 /// <summary>Calculates channel meters from the exact interleaved PCM sent to the audio device.</summary>
 public sealed class StereoPcmMeter
 {
+    public const float SilenceFloorDb = -96f;
+
     public AudioMeterLevel Measure(ReadOnlySpan<float> interleaved, int channels = 2)
     {
         if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels));
@@ -77,7 +79,7 @@ public sealed class StereoPcmMeter
     }
 
     private static float ToDb(float amplitude)
-        => amplitude <= 0 ? float.NegativeInfinity : 20f * MathF.Log10(amplitude);
+        => amplitude <= 0 ? SilenceFloorDb : Math.Max(SilenceFloorDb, 20f * MathF.Log10(amplitude));
 }
 
 public readonly record struct PreviewArtifactKey(

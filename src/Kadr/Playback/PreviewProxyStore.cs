@@ -23,6 +23,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     private CancellationTokenSource _generation = new();
     private Guid _projectId;
     private bool _disposed;
+    private const int ProxyEncoderThreads = 1;
 
     public PreviewProxyStore(FfmpegLocator locator, IArtifactStore? artifacts = null)
     {
@@ -58,7 +59,12 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     {
         ThrowIfDisposed();
         Configure(project);
+        var timelineVideoSources = project.MediaClips
+            .Where(clip => project.FindTrack(clip.TrackId)?.Kind == TrackKind.Visual)
+            .Select(clip => clip.SourceId)
+            .ToHashSet();
         foreach (var source in project.Sources.Values.Where(source =>
+                     timelineVideoSources.Contains(source.Id) &&
                      source.Kind == MediaKind.Video &&
                      source.OnlineState == MediaOnlineState.Online && File.Exists(source.Path)))
         {
@@ -101,6 +107,9 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         var lockTaken = false;
         try
         {
+            // Let the drop/edit transaction paint first. Proxy generation is an
+            // optimization and must not compete with the interaction itself.
+            await Task.Delay(TimeSpan.FromMilliseconds(750), token).ConfigureAwait(false);
             await _encoderGate.WaitAsync(token).ConfigureAwait(false);
             lockTaken = true;
             var fingerprint = !string.IsNullOrWhiteSpace(source.VerifiedFingerprint)
@@ -123,7 +132,9 @@ public sealed class PreviewProxyStore : IAsyncDisposable
                         "-i", source.Path, "-map", "0:v:0", "-an",
                         "-vf", "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
                         "-r", $"{frameRate.Numerator}/{frameRate.Denominator}",
-                        "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                        "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "veryfast",
+                        "-threads", ProxyEncoderThreads.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        "-crf", "23",
                         "-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
                         "-movflags", "+faststart", temporary
                     ], cancellationToken: token).ConfigureAwait(false);

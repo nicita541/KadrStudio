@@ -5,13 +5,13 @@ namespace KadrStudio.Core.Tests;
 public sealed class StereoPcmMeterTests
 {
     [Fact]
-    public void Silence_is_exactly_zero_and_negative_infinity_db()
+    public void Silence_is_exactly_zero_and_uses_a_json_safe_meter_floor()
     {
         var level = new StereoPcmMeter().Measure(new float[32]);
         Assert.Equal(0, level.LeftPeak);
         Assert.Equal(0, level.RightPeak);
-        Assert.True(float.IsNegativeInfinity(level.LeftPeakDb));
-        Assert.True(float.IsNegativeInfinity(level.RightPeakDb));
+        Assert.Equal(StereoPcmMeter.SilenceFloorDb, level.LeftPeakDb);
+        Assert.Equal(StereoPcmMeter.SilenceFloorDb, level.RightPeakDb);
     }
 
     [Fact]

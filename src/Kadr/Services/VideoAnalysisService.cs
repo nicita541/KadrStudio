@@ -40,7 +40,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var videoResult = await processRunner.RunAsync(
             locator.FfmpegPath,
             [
-                "-hide_banner", "-ss", Format(rangeStart), "-t", Format(rangeDuration), "-i", request.Asset.Path,
+                "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                "-filter_complex_threads", "1", "-ss", Format(rangeStart), "-t", Format(rangeDuration),
+                "-i", request.Asset.Path,
                 "-filter_complex",
                 "[0:v]scale=320:-2,fps=3,split=3[scenein][blackin][freezein];" +
                 "[scenein]select='gt(scene,0.28)',showinfo[sceneout];" +
@@ -60,7 +62,8 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             var audioResult = await processRunner.RunAsync(
                 locator.FfmpegPath,
                 [
-                    "-hide_banner", "-ss", Format(rangeStart), "-t", Format(rangeDuration), "-i", request.Asset.Path,
+                    "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                    "-ss", Format(rangeStart), "-t", Format(rangeDuration), "-i", request.Asset.Path,
                     "-vn", "-af", "silencedetect=noise=-38dB:d=0.6", "-f", "null", "-"
                 ],
                 line => audioLines.Add(line),
@@ -215,7 +218,8 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var lines = new List<string>();
         var scan = await processRunner.RunAsync(locator.FfmpegPath,
             [
-                "-hide_banner", "-ss", Format(windowStart), "-t", Format(windowEnd - windowStart), "-i", path,
+                "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                "-ss", Format(windowStart), "-t", Format(windowEnd - windowStart), "-i", path,
                 "-vf", $"scale=640:-2,select='gt(scene,{Format(threshold)})',showinfo", "-an", "-f", "null", "-"
             ], line => lines.Add(line), cancellationToken);
         if (scan.ExitCode != 0) return Array.Empty<double>();

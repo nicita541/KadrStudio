@@ -233,8 +233,16 @@
                              SelectedItem="{Binding SelectedAsset}"
                              PreviewMouseLeftButtonDown="MediaList_PreviewMouseLeftButtonDown"
                              PreviewMouseMove="MediaList_PreviewMouseMove"
+                             PreviewMouseRightButtonDown="MediaList_PreviewMouseRightButtonDown"
                              MouseDoubleClick="MediaList_MouseDoubleClick"
                              Panel.ZIndex="1">
+                        <ListBox.ContextMenu>
+                            <ContextMenu Background="{StaticResource PanelRaisedBrush}" Foreground="{StaticResource TextBrush}">
+                                <MenuItem Header="Обязательно вставить в ИИ-монтаж" Click="MediaAiRequired_Click"/>
+                                <MenuItem Header="Не использовать в ИИ-монтаже" Click="MediaAiExcluded_Click"/>
+                                <MenuItem Header="Заметка для ИИ…" Click="MediaAiNote_Click"/>
+                            </ContextMenu>
+                        </ListBox.ContextMenu>
                         <ListBox.ItemsPanel>
                             <ItemsPanelTemplate>
                                 <WrapPanel ItemWidth="137" />
@@ -275,233 +283,132 @@
                 BorderBrush="{StaticResource BorderBrush}"
                 BorderThickness="0,0,1,0"
                 Visibility="Collapsed">
-            <ScrollViewer VerticalScrollBarVisibility="Auto"
-                          HorizontalScrollBarVisibility="Disabled">
-            <Grid Margin="14">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="130" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-
-                <StackPanel Grid.Row="0" Margin="2,2,0,13">
-                    <TextBlock Text="AI-анализ" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Каскад: общий обзор → точная зона → граница до кадра"
-                               Foreground="{StaticResource MutedTextBrush}"
-                               FontSize="10"
-                               TextWrapping="Wrap"
-                               Margin="0,5,0,0" />
+            <Grid Margin="12">
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <StackPanel Grid.Row="0" Margin="2,2,0,10">
+                    <TextBlock Text="ИИ-монтаж" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="Анализ → редактируемый план → отдельный вариант таймлайна"
+                               Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,0" />
                 </StackPanel>
 
-                <StackPanel Grid.Row="1" Margin="0,0,0,10">
-                    <TextBlock Text="Видео" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Margin="0,0,0,5" />
-                    <ComboBox x:Name="AnalysisAssetComboBox"
-                              ItemsSource="{Binding Project.Media}"
-                              SelectedItem="{Binding SelectedAsset}"
-                              TextSearch.TextPath="Name">
-                        <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" /></DataTemplate></ComboBox.ItemTemplate>
-                    </ComboBox>
-                </StackPanel>
-
-                <StackPanel Grid.Row="2" Margin="0,0,0,10">
-                    <TextBlock Text="Запрос" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Margin="0,0,0,5" />
-                    <TextBox x:Name="AnalysisPromptTextBox"
-                             Text="Найди опенинг, эндинг и превью"
-                             AcceptsReturn="True"
-                             TextWrapping="Wrap"
-                             VerticalScrollBarVisibility="Auto"
-                             Height="78" />
-                </StackPanel>
-
-                <Grid Grid.Row="3" Margin="0,0,0,8" Visibility="Collapsed">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="8" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0">
-                        <TextBlock Text="От" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Margin="0,0,0,5" />
-                        <TextBox x:Name="AnalysisStartTextBox" Text="0:00" />
-                    </StackPanel>
-                    <StackPanel Grid.Column="2">
-                        <TextBlock Text="До" Foreground="{StaticResource MutedTextBrush}" FontSize="10" Margin="0,0,0,5" />
-                        <TextBox x:Name="AnalysisEndTextBox" Text="0:00" />
-                    </StackPanel>
-                </Grid>
-
-                <Expander Grid.Row="4"
-                          Header="Дополнительно: локальная модель"
-                          IsExpanded="False"
-                          Foreground="{StaticResource TextBrush}"
-                          Margin="0,0,0,9">
-                <Border
-                        Background="#171820"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="1"
-                        CornerRadius="5"
-                        Padding="9"
-                        Margin="0,7,0,0">
-                    <StackPanel>
-                        <CheckBox x:Name="UseLocalAiCheckBox"
-                                  IsChecked="True"
-                                  Content="Уточнить локальным ИИ (Ollama)"
-                                  FontWeight="SemiBold" />
-                        <Grid Margin="0,8,0,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="6" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <ComboBox x:Name="LocalAiModelComboBox"
-                                      DisplayMemberPath="DisplayName"
-                                      MinWidth="150" />
-                            <Button x:Name="RefreshLocalAiModelsButton"
-                                    Grid.Column="2"
-                                    Style="{StaticResource ButtonBase}"
-                                    Click="RefreshLocalAiModels_Click"
-                                    Content="Обновить"
-                                    Padding="8,5" />
-                        </Grid>
-                        <TextBlock x:Name="LocalAiStatusTextBlock"
-                                   Text="Проверка локальной модели…"
-                                   Foreground="{StaticResource MutedTextBrush}"
-                                   FontSize="9"
-                                   TextWrapping="Wrap"
-                                   Margin="0,6,0,0" />
-                    </StackPanel>
-                </Border>
-                </Expander>
-
-                <Button Grid.Row="5"
-                        Visibility="Collapsed"
-                        Style="{StaticResource ButtonBase}"
-                        Click="UseSelectedClipRange_Click"
-                        Content="Взять диапазон выбранного клипа"
-                        Padding="10,7"
-                        Margin="0,0,0,9" />
-
-                <StackPanel Grid.Row="6" Margin="0,0,0,10">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="8" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <Button x:Name="RunAnalysisButton"
-                                Grid.Column="0"
-                                Style="{StaticResource AccentButton}"
-                                Click="RunAnalysis_Click"
-                                Content="Анализировать точно"
-                                Padding="13,9" />
-                        <Button x:Name="CancelAnalysisButton"
-                                Grid.Column="2"
-                                Style="{StaticResource ButtonBase}"
-                                Click="CancelAnalysis_Click"
-                                Content="Отмена"
-                                Padding="12,9"
-                                IsEnabled="False" />
-                    </Grid>
-
-                    <Button x:Name="ApplyEditPromptButton"
-                            Style="{StaticResource ButtonBase}"
-                            Click="ApplyEditPrompt_Click"
-                            Content="Применить как команду монтажа"
-                            ToolTip="ИИ применит команды во временном черновике. Результат можно принять или полностью вернуть."
-                            Padding="10,8"
-                            Margin="0,8,0,0" />
-
-                    <Border x:Name="EditReviewPanel"
-                            Background="#202133"
-                            BorderBrush="{StaticResource AccentBrush}"
-                            BorderThickness="1"
-                            CornerRadius="5"
-                            Padding="9"
-                            Margin="0,8,0,0"
-                            Visibility="Collapsed">
-                        <StackPanel>
-                            <TextBlock Text="Черновик ИИ применён"
-                                       FontWeight="SemiBold"
-                                       Foreground="#CBB8FF" />
-                            <TextBlock x:Name="EditReviewSummaryTextBlock"
-                                       TextWrapping="Wrap"
-                                       Foreground="{StaticResource MutedTextBrush}"
-                                       FontSize="10"
-                                       Margin="0,4,0,8" />
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="6" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <Button Grid.Column="0"
-                                        Style="{StaticResource AccentButton}"
-                                        Click="AcceptEditReview_Click"
-                                        Content="Принять" />
-                                <Button Grid.Column="2"
-                                        Style="{StaticResource ButtonBase}"
-                                        Click="RejectEditReview_Click"
-                                        Content="Вернуть как было" />
+                <TabControl x:Name="AiMontageTabControl" Grid.Row="1" Background="Transparent" BorderThickness="0">
+                    <TabItem Header="Материал">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
+                            <TextBlock Text="Область материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <ComboBox x:Name="AiScopeComboBox" SelectedIndex="0" Margin="0,4,0,8">
+                                <ComboBoxItem Content="Вся медиатека" Tag="MediaLibrary"/>
+                                <ComboBoxItem Content="Выбранные файлы" Tag="SelectedSources"/>
+                                <ComboBoxItem Content="Текущий таймлайн" Tag="CurrentSequence"/>
+                                <ComboBoxItem Content="Выбранные клипы" Tag="SelectedClips"/>
+                                <ComboBoxItem Content="Диапазон In/Out" Tag="InOutRange"/>
+                            </ComboBox>
+                            <ListBox x:Name="AiSourceListBox" ItemsSource="{Binding Project.Media}" SelectionMode="Extended" Height="112" Margin="0,0,0,9">
+                                <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" Margin="5,3"/></DataTemplate></ListBox.ItemTemplate>
+                            </ListBox>
+                            <TextBlock Text="Профиль игры" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <ComboBox x:Name="AiGameProfileComboBox" DisplayMemberPath="DisplayName" Margin="0,4,0,8"/>
+                            <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <StackPanel><TextBlock Text="Формат" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                                    <ComboBox x:Name="AiTargetFormatComboBox" SelectedIndex="0" Margin="0,4,0,0" SelectionChanged="AiTargetFormat_Changed">
+                                        <ComboBoxItem Content="YouTube 16:9" Tag="YouTube"/><ComboBoxItem Content="Shorts 9:16" Tag="Shorts"/>
+                                    </ComboBox></StackPanel>
+                                <StackPanel Grid.Column="2"><TextBlock Text="Цель, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                                    <TextBox x:Name="AiTargetDurationTextBox" Text="720" Margin="0,4,0,0"/></StackPanel>
                             </Grid>
-                        </StackPanel>
-                    </Border>
-                </StackPanel>
+                            <TextBlock Text="Задание режиссёру" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <TextBox x:Name="AnalysisPromptTextBox" Text="Собери понятную историю из лучших игровых моментов"
+                                     AcceptsReturn="True" TextWrapping="Wrap" Height="72" Margin="0,4,0,8"/>
+                            <TextBlock Text="Точный диапазон выбранного исходника" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <Grid Margin="0,4,0,5"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <TextBox x:Name="AnalysisStartTextBox" Text="0:00"/><TextBox x:Name="AnalysisEndTextBox" Grid.Column="2" Text="0:00"/>
+                            </Grid>
+                            <TextBox x:Name="AiAnnotationNoteTextBox" Text="Почему этот момент важен" Margin="0,0,0,5"/>
+                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <Button Style="{StaticResource ButtonBase}" Content="Обязательно" Click="AiAddRequired_Click" Padding="5"/>
+                                <Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="Не использовать" Click="AiAddExcluded_Click" Padding="5"/>
+                                <Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Заметка" Click="AiAddNote_Click" Padding="5"/>
+                            </Grid>
+                            <ListBox x:Name="AiAnnotationsListBox" Height="82" Margin="0,7,0,0" MouseDoubleClick="AiDeleteAnnotation_DoubleClick"/>
+                        </StackPanel></ScrollViewer>
+                    </TabItem>
 
-                <Grid Grid.Row="7">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                    </Grid.RowDefinitions>
-                    <ProgressBar x:Name="AnalysisProgressBar" Grid.Row="0" Height="5" Minimum="0" Maximum="100" Foreground="{StaticResource AccentBrush}" Visibility="Collapsed" />
-                    <TextBlock x:Name="AnalysisSummaryTextBlock"
-                               Grid.Row="1"
-                               Text="Выберите видео и задайте запрос."
-                               Foreground="{StaticResource MutedTextBrush}"
-                               FontSize="10"
-                               TextWrapping="Wrap"
-                               Margin="0,8,0,8" />
-                    <ListBox x:Name="AnalysisMarkersList"
-                             Grid.Row="2"
-                             ItemsSource="{Binding Project.Markers}"
-                             MouseDoubleClick="AnalysisMarkersList_MouseDoubleClick">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <Grid Margin="7,6">
-                                    <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                    </Grid.RowDefinitions>
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="Auto" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" FontSize="11" TextTrimming="CharacterEllipsis" />
-                                        <TextBlock Grid.Column="1" Text="{Binding ConfidenceLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9" Margin="8,0,0,0" />
-                                    </Grid>
-                                    <TextBlock Grid.Row="1" Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9" Margin="0,3,0,0" />
-                                    <TextBlock Grid.Row="2" Text="{Binding Description}" Foreground="#AEB2C5" FontSize="9" TextWrapping="Wrap" MaxHeight="42" Margin="0,3,0,0" />
+                    <TabItem Header="Анализ">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
+                            <CheckBox x:Name="UseLocalAiCheckBox" IsChecked="True" Content="Глубокий игровой анализ Ollama Vision" FontWeight="SemiBold"/>
+                            <Grid Margin="0,7,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <ComboBox x:Name="LocalAiModelComboBox" DisplayMemberPath="DisplayName" MinWidth="150"/>
+                                <Button x:Name="RefreshLocalAiModelsButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="RefreshLocalAiModels_Click" Content="Обновить" Padding="8,5"/>
+                            </Grid>
+                            <TextBlock x:Name="LocalAiStatusTextBlock" Text="Проверка локальной модели…" Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,5,0,8"/>
+                            <Button x:Name="AiAnalyzeSourcesButton" Style="{StaticResource AccentButton}" Click="AiAnalyzeSources_Click" Content="Проанализировать материал" Padding="10,8"/>
+                            <Separator Margin="0,10"/>
+                            <TextBlock Text="Технические метки текущего клипа" FontWeight="SemiBold"/>
+                            <ComboBox x:Name="AnalysisAssetComboBox" ItemsSource="{Binding Project.Media}" SelectedItem="{Binding SelectedAsset}" TextSearch.TextPath="Name" Margin="0,6,0,6">
+                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
+                            </ComboBox>
+                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <Button x:Name="RunAnalysisButton" Style="{StaticResource ButtonBase}" Click="RunAnalysis_Click" Content="Создать метки" Padding="8"/>
+                                <Button x:Name="CancelAnalysisButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="CancelAnalysis_Click" Content="Отмена" Padding="8" IsEnabled="False"/>
+                            </Grid>
+                            <Button x:Name="ApplyEditPromptButton" Style="{StaticResource ButtonBase}" Click="ApplyEditPrompt_Click" Content="Быстрая команда текущему таймлайну" Padding="8" Margin="0,6,0,0"/>
+                            <Border x:Name="EditReviewPanel" Background="#202133" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="5" Padding="8" Margin="0,7,0,0" Visibility="Collapsed">
+                                <StackPanel><TextBlock Text="Черновик быстрой команды" FontWeight="SemiBold"/><TextBlock x:Name="EditReviewSummaryTextBlock" TextWrapping="Wrap" FontSize="9" Margin="0,4,0,6"/>
+                                    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                        <Button Style="{StaticResource AccentButton}" Click="AcceptEditReview_Click" Content="Принять"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Click="RejectEditReview_Click" Content="Вернуть"/>
+                                    </Grid></StackPanel>
+                            </Border>
+                            <ListBox x:Name="AnalysisMarkersList" ItemsSource="{Binding Project.Markers}" Height="130" Margin="0,8,0,0" MouseDoubleClick="AnalysisMarkersList_MouseDoubleClick" DisplayMemberPath="Title"/>
+                            <Button Style="{StaticResource ButtonBase}" Click="ClearAnalysisMarkers_Click" Content="Очистить технические метки" Padding="7" Margin="0,6,0,0"/>
+                        </StackPanel></ScrollViewer>
+                    </TabItem>
+
+                    <TabItem Header="План">
+                        <Grid Margin="3,10,3,6"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                            <StackPanel Grid.Row="0"><Button x:Name="AiGeneratePlanButton" Style="{StaticResource AccentButton}" Click="AiGeneratePlan_Click" Content="Составить план монтажа" Padding="10,8"/>
+                                <TextBlock x:Name="AiPlanSummaryTextBlock" Text="Сначала проанализируйте материал." Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,6,0,6"/></StackPanel>
+                            <ListBox x:Name="AiPlanItemsListBox" Grid.Row="1" MinHeight="180" SelectionChanged="AiPlanSelection_Changed">
+                                <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
+                                    <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Grid.Column="1" Text="{Binding LockLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
+                                        <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/><TextBlock Text="{Binding Reason}" TextWrapping="Wrap" FontSize="9" MaxHeight="36"/></StackPanel>
+                                </Border></DataTemplate></ListBox.ItemTemplate>
+                            </ListBox>
+                            <StackPanel Grid.Row="2" Margin="0,7,0,0">
+                                <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <Button Style="{StaticResource ButtonBase}" Content="↑" Click="AiPlanMoveUp_Click"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="↓" Click="AiPlanMoveDown_Click"/><Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Замок" Click="AiPlanToggleLock_Click"/><Button Grid.Column="6" Style="{StaticResource ButtonBase}" Content="Убрать" Click="AiPlanRemove_Click"/>
                                 </Grid>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-                </Grid>
+                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                    <TextBox x:Name="AiPlanItemStartTextBox"/><TextBox x:Name="AiPlanItemEndTextBox" Grid.Column="2"/><Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Обрезать" Click="AiPlanTrim_Click" Padding="7,4"/>
+                                </Grid>
+                                <TextBox x:Name="AiRevisionTextBox" Text="Сделай начало динамичнее" Margin="0,6,0,0"/>
+                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <Button x:Name="AiRevisePlanButton" Style="{StaticResource ButtonBase}" Click="AiRevisePlan_Click" Content="Исправить план" Padding="7" IsEnabled="False"/>
+                                    <Button x:Name="AiCreateDraftButton" Grid.Column="2" Style="{StaticResource AccentButton}" Click="AiCreateDraft_Click" Content="Создать черновик" Padding="7" IsEnabled="False"/>
+                                </Grid>
+                            </StackPanel>
+                        </Grid>
+                    </TabItem>
 
-                <Button Grid.Row="8"
-                        Style="{StaticResource ButtonBase}"
-                        Click="ClearAnalysisMarkers_Click"
-                        Content="Очистить метки анализа"
-                        Padding="10,7"
-                        Margin="0,10,0,0" />
+                    <TabItem Header="Версии">
+                        <Grid Margin="3,10,3,6"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                            <ListBox x:Name="AiSequencesListBox" MinHeight="230">
+                                <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="7">
+                                    <StackPanel><TextBlock Text="{Binding Name}" FontWeight="SemiBold"/><TextBlock Text="{Binding Details}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/></StackPanel>
+                                </Border></DataTemplate></ListBox.ItemTemplate>
+                            </ListBox>
+                            <StackPanel Grid.Row="1"><Button Style="{StaticResource ButtonBase}" Click="AiOpenSequence_Click" Content="Открыть выбранную версию" Padding="8"/>
+                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <Button Style="{StaticResource AccentButton}" Click="AiAcceptDraft_Click" Content="Принять активный черновик" Padding="7"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Click="AiDeleteDraft_Click" Content="Удалить активный черновик" Padding="7"/>
+                                </Grid></StackPanel>
+                        </Grid>
+                    </TabItem>
+                </TabControl>
+
+                <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                    <ProgressBar x:Name="AnalysisProgressBar" Height="5" Minimum="0" Maximum="100" Foreground="{StaticResource AccentBrush}" Visibility="Collapsed"/>
+                    <TextBlock x:Name="AnalysisSummaryTextBlock" Text="Выберите материал и профиль игры." Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,5,0,0"/>
+                </StackPanel>
             </Grid>
-            </ScrollViewer>
         </Border>
 
         <!-- Встроенная история версий -->
@@ -859,6 +766,10 @@
                                 <MenuItem Header="Поставить точку входа (I)" Click="SetInPoint_Click" Padding="12,8" />
                                 <MenuItem Header="Поставить точку выхода (O)" Click="SetOutPoint_Click" Padding="12,8" />
                                 <MenuItem Header="Очистить In/Out" Click="ClearInOut_Click" Padding="12,8" />
+                                <Separator Background="{StaticResource BorderBrush}" Margin="4,2" />
+                                <MenuItem Header="Обязательно вставить в ИИ-монтаж" Click="TimelineAiRequired_Click" Padding="12,8" />
+                                <MenuItem Header="Не использовать в ИИ-монтаже" Click="TimelineAiExcluded_Click" Padding="12,8" />
+                                <MenuItem Header="Заметка для ИИ…" Click="TimelineAiNote_Click" Padding="12,8" />
                             </ContextMenu>
                         </controls:TimelineControl.ContextMenu>
                     </controls:TimelineControl>

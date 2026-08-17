@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 using KadrStudio.Application.Jobs;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
@@ -13,6 +14,7 @@ public sealed partial class FfmpegRenderEngine(
     IBackgroundJobScheduler scheduler) : IRenderEngine
 {
     private readonly string _ffmpegPath = ResolveExecutable(ffmpegPath);
+    private readonly string _ffprobePath = ResolveSiblingExecutable(ffmpegPath, "ffprobe.exe");
 
     public async Task<string> RenderAsync(
         RenderPlan plan,
@@ -46,8 +48,21 @@ public sealed partial class FfmpegRenderEngine(
                 try
                 {
                     progress?.Report(new RenderProgress(0, TimelineTime.Zero, "Starting"));
-                    await ExecuteAsync(command, plan.Duration, progress, token).ConfigureAwait(false);
-                    VerifyOutput(temporary);
+                    try
+                    {
+                        await ExecuteAsync(command, plan.Duration, progress, token).ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (
+                        temporaryOptions.UseHardwareEncoding &&
+                        HardwareEncodingFallback.IsUnavailable(exception))
+                    {
+                        TryDelete(temporary);
+                        progress?.Report(new RenderProgress(0, TimelineTime.Zero, "NVENC unavailable — CPU fallback"));
+                        var cpuCommand = commandBuilder.Build(
+                            plan, temporaryOptions with { UseHardwareEncoding = false });
+                        await ExecuteAsync(cpuCommand, plan.Duration, progress, token).ConfigureAwait(false);
+                    }
+                    await VerifyOutputAsync(temporary, temporaryOptions, plan, token).ConfigureAwait(false);
                     File.Move(temporary, fullOutput, overwrite: true);
                     progress?.Report(new RenderProgress(1, plan.Duration, "Completed"));
                     return fullOutput;
@@ -119,10 +134,63 @@ public sealed partial class FfmpegRenderEngine(
         return fullPath;
     }
 
-    private static void VerifyOutput(string path)
+    private static string ResolveSiblingExecutable(string ffmpegPath, string fileName)
+    {
+        var sibling = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(ffmpegPath))!, fileName);
+        if (!File.Exists(sibling)) throw new FileNotFoundException("FFprobe was not found.", sibling);
+        return sibling;
+    }
+
+    private async Task VerifyOutputAsync(
+        string path,
+        RenderOutputOptions options,
+        RenderPlan plan,
+        CancellationToken token)
     {
         if (!File.Exists(path) || new FileInfo(path).Length < 512)
             throw new InvalidDataException("FFmpeg did not create a valid output file.");
+        if (options.Purpose is RenderPurpose.FrameServer or RenderPurpose.AudioServer) return;
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = _ffprobePath,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true
+        };
+        foreach (var argument in new[]
+        {
+            "-v", "error", "-show_entries", "stream=codec_type:format=duration", "-of", "json", path
+        }) startInfo.ArgumentList.Add(argument);
+        using var process = new Process { StartInfo = startInfo };
+        if (!process.Start()) throw new InvalidOperationException("FFprobe did not start.");
+        using var registration = token.Register(() => TryKill(process));
+        var outputTask = process.StandardOutput.ReadToEndAsync(token);
+        var errorTask = process.StandardError.ReadToEndAsync(token);
+        await process.WaitForExitAsync(token).ConfigureAwait(false);
+        var output = await outputTask.ConfigureAwait(false);
+        var error = await errorTask.ConfigureAwait(false);
+        if (process.ExitCode != 0)
+            throw new InvalidDataException($"Готовый файл не прошёл FFprobe-проверку: {error}");
+
+        using var document = JsonDocument.Parse(output);
+        var streams = document.RootElement.GetProperty("streams")
+            .EnumerateArray()
+            .Select(item => item.GetProperty("codec_type").GetString())
+            .ToArray();
+        if (options.IncludeVideo && !streams.Contains("video", StringComparer.OrdinalIgnoreCase))
+            throw new InvalidDataException("В экспортированном файле отсутствует видеопоток.");
+        if (options.IncludeAudio && !streams.Contains("audio", StringComparer.OrdinalIgnoreCase))
+            throw new InvalidDataException("В экспортированном файле отсутствует аудиопоток.");
+        if (options.Purpose == RenderPurpose.StillFrame) return;
+        var durationText = document.RootElement.GetProperty("format").GetProperty("duration").GetString();
+        if (!double.TryParse(durationText, NumberStyles.Float, CultureInfo.InvariantCulture, out var duration))
+            throw new InvalidDataException("FFprobe не вернул длительность экспортированного файла.");
+        var tolerance = Math.Max(0.25, 2d * plan.FrameRate.Denominator / plan.FrameRate.Numerator);
+        if (Math.Abs(duration - plan.Duration.TotalSeconds) > tolerance)
+            throw new InvalidDataException(
+                $"Длительность экспорта {duration:0.###} с не совпадает с таймлайном {plan.Duration.TotalSeconds:0.###} с.");
     }
 
     private static void TryKill(Process process)
@@ -137,4 +205,19 @@ public sealed partial class FfmpegRenderEngine(
 
     [GeneratedRegex(@"time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", RegexOptions.CultureInvariant)]
     private static partial Regex TimePattern();
+}
+
+public static class HardwareEncodingFallback
+{
+    private static readonly string[] Markers =
+    [
+        "nvenc", "cuda", "no capable devices", "cannot load", "unknown encoder",
+        "device setup failed", "operation not permitted"
+    ];
+
+    public static bool IsUnavailable(Exception exception)
+    {
+        var message = exception.ToString();
+        return Markers.Any(marker => message.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    }
 }

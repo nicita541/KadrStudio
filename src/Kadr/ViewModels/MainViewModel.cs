@@ -6,6 +6,7 @@ using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Media;
+using KadrStudio.Application.Storage;
 using KadrStudio.Infrastructure.Media;
 using KadrStudio.Application.Caching;
 using KadrStudio.Infrastructure.Caching;
@@ -30,6 +31,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private readonly List<TimelineClip> _subscribedClips = new();
     private readonly List<TextOverlay> _subscribedTextOverlays = new();
     private CancellationTokenSource? _autosaveCancellation;
+    private string _pendingAutosaveReason = "Изменение проекта";
     private EditorProject _project;
     private ICollectionView _mediaView = null!;
     private TimelineClip? _selectedClip;
@@ -206,6 +208,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public Task<bool> HasAutosaveAsync(CancellationToken cancellationToken = default)
         => _projectService.HasAutosaveAsync(cancellationToken);
+
+    public Task<IReadOnlyList<RecoveryProjectInfo>> ListAutosavesAsync(CancellationToken cancellationToken = default)
+        => _projectService.ListAutosavesAsync(cancellationToken);
 
     public ProjectAutomationSnapshot CaptureAutomationSnapshot()
         => ProposalFactory.Capture(_editorSession.State);
@@ -847,7 +852,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    public async Task RecoverAutosaveAsync(CancellationToken cancellationToken = default)
+    public async Task RecoverAutosaveAsync(
+        RecoveryProjectInfo? recovery = null,
+        CancellationToken cancellationToken = default)
     {
         if (!await _projectService.HasAutosaveAsync(cancellationToken))
         {
@@ -855,7 +862,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         CancelAutosave();
-        var project = await _projectService.OpenAutosaveAsync(cancellationToken);
+        var project = recovery is null
+            ? await _projectService.OpenAutosaveAsync(cancellationToken)
+            : await _projectService.OpenAutosaveVersionAsync(
+                recovery.ProjectId, recovery.RecoveryId, cancellationToken);
         _editTransactionActive = false;
         SelectedClip = null;
         SelectedAsset = null;
@@ -874,6 +884,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CancelAutosave();
         await _projectService.DeleteAutosaveAsync(cancellationToken);
     }
+
+    public Task DiscardAutosaveAsync(RecoveryProjectInfo recovery, CancellationToken cancellationToken = default)
+        => _projectService.DeleteAutosaveVersionAsync(
+            recovery.ProjectId, recovery.RecoveryId, cancellationToken);
 
     public void MarkChanged()
     {
@@ -900,6 +914,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         await TimelineMediaCacheService.DisposeAsync();
         await _renderCoordinator.DisposeAsync();
         await _artifactStore.DisposeAsync();
+        _projectService.Dispose();
         OllamaVideoAnalysisService.Dispose();
         DetachProject(Project);
     }
@@ -934,7 +949,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         var result = _editorSession.Execute(new EditTransaction(description, command));
         if (!result.Changed) return false;
-        RestoreFromCoreState(result.State, selectedClipId);
+        RestoreFromCoreState(result.State, selectedClipId, description);
         StatusText = description;
         return true;
     }
@@ -1079,7 +1094,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             video ? new KadrStudio.Core.Domain.VideoParameters() : null,
             video ? null : new KadrStudio.Core.Domain.AudioParameters());
 
-    private void RestoreFromCoreState(KadrStudio.Core.Domain.ProjectState state, Guid? selectedClipId = null)
+    private void RestoreFromCoreState(
+        KadrStudio.Core.Domain.ProjectState state,
+        Guid? selectedClipId = null,
+        string? autosaveReason = null)
     {
         var filePath = Project.FilePath;
         var derivedMedia = Project.Media.ToDictionary(
@@ -1108,7 +1126,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             _suppressDirtyTracking = false;
         }
 
-        ScheduleAutosave();
+        ScheduleAutosave(autosaveReason);
         NotifyHistoryChanged();
     }
 
@@ -1275,8 +1293,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private void ScheduleAutosave()
+    private void ScheduleAutosave(string? reason = null)
     {
+        if (!string.IsNullOrWhiteSpace(reason)) _pendingAutosaveReason = reason.Trim();
         _autosaveCancellation?.Cancel();
         _autosaveCancellation?.Dispose();
         _autosaveCancellation = new CancellationTokenSource();
@@ -1295,7 +1314,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(1.5), cancellationToken);
-            await _projectService.SaveAutosaveAsync(Project, cancellationToken);
+            await _projectService.SaveAutosaveVersionAsync(Project, _pendingAutosaveReason, cancellationToken);
         }
         catch (OperationCanceledException)
         {

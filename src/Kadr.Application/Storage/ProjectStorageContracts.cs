@@ -36,12 +36,19 @@ public interface IProjectStore
 public interface IRecoveryStore
 {
     Task SaveAsync(ProjectState project, string reason, CancellationToken cancellationToken = default);
-    Task<ProjectState?> LoadAsync(Guid projectId, CancellationToken cancellationToken = default);
+    Task<ProjectState?> LoadAsync(
+        Guid projectId,
+        Guid? recoveryId = null,
+        CancellationToken cancellationToken = default);
     Task<IReadOnlyList<RecoveryProjectInfo>> ListAsync(CancellationToken cancellationToken = default);
-    Task DeleteAsync(Guid projectId, CancellationToken cancellationToken = default);
+    Task DeleteAsync(
+        Guid projectId,
+        Guid? recoveryId = null,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed record RecoveryProjectInfo(
+    Guid RecoveryId,
     Guid ProjectId,
     string Name,
     long Revision,

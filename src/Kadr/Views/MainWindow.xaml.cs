@@ -113,30 +113,22 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (await _viewModel.HasAutosaveAsync())
+        var recoveries = await _viewModel.ListAutosavesAsync();
+        if (recoveries.Count > 0)
         {
-            var result = MessageBox.Show(
-                this,
-                "Найден несохранённый проект с прошлого запуска. Восстановить его?",
-                "Восстановление проекта",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Question);
-            if (result == MessageBoxResult.Yes)
+            var recoveryWindow = new RecoveryWindow(recoveries) { Owner = this };
+            if (recoveryWindow.ShowDialog() == true && recoveryWindow.SelectedRecovery is { } selectedRecovery)
             {
                 try
                 {
-                    await _viewModel.RecoverAutosaveAsync();
+                    await _viewModel.RecoverAutosaveAsync(selectedRecovery);
                     ResetPreviewState();
                 }
                 catch (Exception exception)
                 {
-                    await _viewModel.DiscardAutosaveAsync();
+                    await _viewModel.DiscardAutosaveAsync(selectedRecovery);
                     ShowError("Не удалось восстановить проект", exception);
                 }
-            }
-            else
-            {
-                await _viewModel.DiscardAutosaveAsync();
             }
         }
     }

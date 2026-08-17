@@ -8,6 +8,17 @@ namespace KadrStudio.Core.Tests;
 public sealed class RenderPlanTests
 {
     [Fact]
+    public void Hardware_fallback_only_classifies_encoder_or_device_failures()
+    {
+        Assert.True(HardwareEncodingFallback.IsUnavailable(
+            new InvalidOperationException("Unknown encoder 'h264_nvenc'")));
+        Assert.True(HardwareEncodingFallback.IsUnavailable(
+            new InvalidOperationException("No capable devices found for CUDA")));
+        Assert.False(HardwareEncodingFallback.IsUnavailable(
+            new InvalidOperationException("Source file was not found")));
+    }
+
+    [Fact]
     public void Builder_separates_video_audio_and_text_tracks()
     {
         var project = CreateProject();

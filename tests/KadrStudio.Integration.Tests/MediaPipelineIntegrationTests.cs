@@ -1,4 +1,5 @@
 using KadrStudio.Application.Rendering;
+using KadrStudio.Adapters;
 using KadrStudio.Models;
 using KadrStudio.Playback;
 using KadrStudio.Services;
@@ -81,6 +82,43 @@ public sealed class MediaPipelineIntegrationTests
             Assert.Contains("video", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("audio", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
             Assert.True(new FileInfo(output).Length > 10_000);
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task Nvenc_startup_failure_is_retried_with_cpu_and_publishes_valid_output()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var source = Path.Combine(root, "fallback-source.mp4");
+            var output = Path.Combine(root, "fallback-result.mp4");
+            var create = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=s=160x90:r=24:d=1",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=1",
+                "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", source
+            ]);
+            Assert.Equal(0, create.ExitCode);
+            var project = CreateAvProject(source, root);
+            await using var scheduler = new BackgroundJobScheduler();
+            var engine = new FfmpegRenderEngine(
+                locator.FfmpegPath, new FailingNvencCommandBuilder(), scheduler);
+
+            await engine.RenderAsync(new RenderPlanBuilder().Build(new EditorProjectMapper().ToCore(project)),
+                new RenderOutputOptions(
+                    RenderPurpose.Export, output, 160, 90, VideoQuality: 30, UseHardwareEncoding: true));
+
+            var probe = await new ProcessRunner().RunAsync(locator.FfprobePath,
+                ["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", output]);
+            Assert.Equal(0, probe.ExitCode);
+            Assert.Contains("video", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("audio", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
         }
         finally { DeleteRoot(root); }
     }
@@ -277,4 +315,22 @@ public sealed class MediaPipelineIntegrationTests
     }
 
     private static void DeleteRoot(string root) { try { Directory.Delete(root, recursive: true); } catch { } }
+
+    private sealed class FailingNvencCommandBuilder : IRenderCommandBuilder
+    {
+        private readonly FfmpegRenderCommandBuilder _inner = new();
+
+        public ExternalRenderCommand Build(RenderPlan plan, RenderOutputOptions options)
+        {
+            var command = _inner.Build(plan, options);
+            return options.UseHardwareEncoding
+                ? command with
+                {
+                    Arguments = command.Arguments
+                        .Select(argument => argument == "h264_nvenc" ? "h264_nvenc_missing" : argument)
+                        .ToImmutableArray()
+                }
+                : command;
+        }
+    }
 }

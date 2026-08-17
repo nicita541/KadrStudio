@@ -119,6 +119,66 @@ public sealed class SqliteProjectStoreTests
     }
 
     [Fact]
+    public async Task Recovery_keeps_twenty_versions_and_restores_the_selected_revision()
+    {
+        using var directory = new TemporaryDirectory();
+        var recovery = new SqliteRecoveryStore(directory.Path);
+        var original = CreateProject();
+        for (var revision = 1; revision <= 25; revision++)
+        {
+            await recovery.SaveAsync(original with
+            {
+                Revision = revision,
+                Name = $"Revision {revision}",
+                UpdatedAt = original.UpdatedAt.AddSeconds(revision)
+            }, $"edit {revision}");
+        }
+
+        var versions = await recovery.ListAsync();
+
+        Assert.Equal(SqliteRecoveryStore.MaximumVersionsPerProject, versions.Count);
+        Assert.Equal(Enumerable.Range(6, 20).Select(value => (long)value),
+            versions.OrderBy(item => item.Revision).Select(item => item.Revision));
+        var selected = versions.Single(item => item.Revision == 12);
+        var restored = await recovery.LoadAsync(selected.ProjectId, selected.RecoveryId);
+        Assert.NotNull(restored);
+        Assert.Equal("Revision 12", restored.Name);
+        await recovery.DeleteAsync(selected.ProjectId, selected.RecoveryId);
+        Assert.DoesNotContain(await recovery.ListAsync(), item => item.RecoveryId == selected.RecoveryId);
+    }
+
+    [Fact]
+    public async Task Recovery_with_modified_snapshot_is_rejected_by_checksum()
+    {
+        using var directory = new TemporaryDirectory();
+        var recovery = new SqliteRecoveryStore(directory.Path);
+        var project = CreateProject();
+        await recovery.SaveAsync(project, "before corruption");
+        var path = Path.Combine(directory.Path, $"{project.Id:N}.recovery.kadr");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE recovery_entries SET snapshot_json=snapshot_json || ' ';";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => recovery.LoadAsync(project.Id));
+    }
+
+    [Fact]
+    public void Project_write_lease_prevents_parallel_writer_and_is_released_cleanly()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "locked.kadr");
+        using (ProjectFileLease.Acquire(path))
+            Assert.Throws<ProjectFileLockedException>(() => ProjectFileLease.Acquire(path));
+
+        using var reopened = ProjectFileLease.Acquire(path);
+        Assert.Equal(Path.GetFullPath(path), reopened.ProjectPath);
+    }
+
+    [Fact]
     public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v3()
     {
         using var directory = new TemporaryDirectory();

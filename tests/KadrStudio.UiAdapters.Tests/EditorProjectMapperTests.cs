@@ -226,4 +226,29 @@ public sealed class EditorProjectMapperTests
             try { Directory.Delete(root, recursive: true); } catch { }
         }
     }
+
+    [Fact]
+    public async Task Project_service_rejects_second_writer_until_first_editor_releases_lease()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "lease-adapter-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var path = Path.Combine(root, "shared.kadr");
+            using var first = new ProjectService(Path.Combine(root, "recovery-1"));
+            await first.SaveAsync(EditorProject.CreateNew(), path);
+            using var second = new ProjectService(Path.Combine(root, "recovery-2"));
+
+            await Assert.ThrowsAsync<KadrStudio.Infrastructure.Storage.ProjectFileLockedException>(
+                () => second.OpenAsync(path));
+
+            first.Dispose();
+            var reopened = await second.OpenAsync(path);
+            Assert.Equal(path, reopened.FilePath);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
 }

@@ -31,12 +31,10 @@
             <ColumnDefinition Width="300" MinWidth="210" MaxWidth="440" />
             <ColumnDefinition Width="6" />
             <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="0" />
-            <ColumnDefinition Width="0" />
         </Grid.ColumnDefinitions>
 
         <!-- Компактная IDE-панель -->
-        <Border Grid.Row="0" Grid.ColumnSpan="6" Background="#17181D" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+        <Border Grid.Row="0" Grid.ColumnSpan="4" Background="#17181D" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
             <Grid Margin="8,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
@@ -73,6 +71,16 @@
                                 <Separator Margin="4,2" />
                                 <MenuItem Header="Разрезать" InputGestureText="S" Click="Split_Click" />
                                 <MenuItem Header="Удалить клип" InputGestureText="Delete" Click="DeleteClip_Click" />
+                                <Separator Margin="4,2" />
+                                <MenuItem Header="Кэш медиа">
+                                    <MenuItem Header="Перенести…" Click="MoveMediaCache_Click" />
+                                    <MenuItem Header="Очистить…" Click="ClearMediaCache_Click" />
+                                    <Separator Margin="4,2" />
+                                    <MenuItem Header="Лимит 2 ГБ" Tag="2" Click="SetMediaCacheLimit_Click" />
+                                    <MenuItem Header="Лимит 8 ГБ" Tag="8" Click="SetMediaCacheLimit_Click" />
+                                    <MenuItem Header="Лимит 16 ГБ" Tag="16" Click="SetMediaCacheLimit_Click" />
+                                    <MenuItem Header="Лимит 32 ГБ" Tag="32" Click="SetMediaCacheLimit_Click" />
+                                </MenuItem>
                             </ContextMenu>
                         </Button.ContextMenu>
                     </Button>
@@ -113,7 +121,7 @@
                         Padding="9,0">
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock Text="&#xE8A5;" FontFamily="Segoe MDL2 Assets" Foreground="{StaticResource AccentBrush}" Margin="0,0,7,0" />
-                        <TextBox Text="{Binding Project.Name, UpdateSourceTrigger=LostFocus}"
+                        <TextBox Text="{Binding ProjectName, UpdateSourceTrigger=LostFocus}"
                                  Width="160"
                                  MaxLength="80"
                                  Padding="0"
@@ -581,31 +589,33 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
+                    <StackPanel x:Name="TextPropertiesPanel">
                     <TextBlock Text="Содержимое" Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
-                    <TextBox Text="{Binding SelectedItem.Text, ElementName=TextOverlayList, UpdateSourceTrigger=PropertyChanged}"
+                    <TextBox Text="{Binding Text, UpdateSourceTrigger=PropertyChanged}"
                              AcceptsReturn="True" TextWrapping="Wrap" Height="58"
-                             GotKeyboardFocus="TextOverlayEdit_Begin" LostKeyboardFocus="TextOverlayEdit_End" Margin="0,4,0,9" />
+                             LostKeyboardFocus="TextOverlayEdit_End" Margin="0,4,0,9" />
                     <Grid Margin="0,0,0,9">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                        <StackPanel><TextBlock Text="Начало, сек." FontSize="9" Foreground="{StaticResource MutedTextBrush}"/><TextBox Text="{Binding SelectedItem.Start, ElementName=TextOverlayList, UpdateSourceTrigger=LostFocus, StringFormat=0.00}" GotKeyboardFocus="TextOverlayEdit_Begin" LostKeyboardFocus="TextOverlayEdit_End"/></StackPanel>
-                        <StackPanel Grid.Column="2"><TextBlock Text="Длительность, сек." FontSize="9" Foreground="{StaticResource MutedTextBrush}"/><TextBox Text="{Binding SelectedItem.Duration, ElementName=TextOverlayList, UpdateSourceTrigger=LostFocus, StringFormat=0.00}" GotKeyboardFocus="TextOverlayEdit_Begin" LostKeyboardFocus="TextOverlayEdit_End"/></StackPanel>
+                        <StackPanel><TextBlock Text="Начало, сек." FontSize="9" Foreground="{StaticResource MutedTextBrush}"/><TextBox Text="{Binding Start, UpdateSourceTrigger=LostFocus, StringFormat=0.00}" LostKeyboardFocus="TextOverlayEdit_End"/></StackPanel>
+                        <StackPanel Grid.Column="2"><TextBlock Text="Длительность, сек." FontSize="9" Foreground="{StaticResource MutedTextBrush}"/><TextBox Text="{Binding Duration, UpdateSourceTrigger=LostFocus, StringFormat=0.00}" LostKeyboardFocus="TextOverlayEdit_End"/></StackPanel>
                     </Grid>
                     <Grid Margin="0,0,0,10">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="90"/></Grid.ColumnDefinitions>
-                        <ComboBox SelectedValue="{Binding SelectedItem.FontFamily, ElementName=TextOverlayList}" SelectedValuePath="Content">
+                        <ComboBox SelectedValue="{Binding FontFamily}" SelectedValuePath="Content" DropDownClosed="TextOverlayCombo_Closed">
                             <ComboBoxItem Content="Segoe UI"/><ComboBoxItem Content="Arial"/><ComboBoxItem Content="Impact"/><ComboBoxItem Content="Times New Roman"/>
                         </ComboBox>
-                        <TextBox Grid.Column="2" Text="{Binding SelectedItem.FontSize, ElementName=TextOverlayList, UpdateSourceTrigger=LostFocus, StringFormat=0}" ToolTip="Размер шрифта" GotKeyboardFocus="TextOverlayEdit_Begin" LostKeyboardFocus="TextOverlayEdit_End" />
+                        <TextBox Grid.Column="2" Text="{Binding FontSize, UpdateSourceTrigger=LostFocus, StringFormat=0}" ToolTip="Размер шрифта" LostKeyboardFocus="TextOverlayEdit_End" />
                     </Grid>
                     <TextBlock Text="Положение по горизонтали" FontSize="9" Foreground="{StaticResource MutedTextBrush}" />
-                    <Slider Minimum="0" Maximum="1" Value="{Binding SelectedItem.X, ElementName=TextOverlayList}" PreviewMouseLeftButtonDown="TextOverlayEdit_Begin" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
+                    <Slider Minimum="0" Maximum="1" Value="{Binding X}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
                     <TextBlock Text="Положение по вертикали" FontSize="9" Foreground="{StaticResource MutedTextBrush}" Margin="0,5,0,0" />
-                    <Slider Minimum="0" Maximum="1" Value="{Binding SelectedItem.Y, ElementName=TextOverlayList}" PreviewMouseLeftButtonDown="TextOverlayEdit_Begin" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
+                    <Slider Minimum="0" Maximum="1" Value="{Binding Y}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
                     <TextBlock Text="Поворот" FontSize="9" Foreground="{StaticResource MutedTextBrush}" Margin="0,5,0,0" />
-                    <Slider Minimum="-180" Maximum="180" Value="{Binding SelectedItem.Rotation, ElementName=TextOverlayList}" PreviewMouseLeftButtonDown="TextOverlayEdit_Begin" PreviewMouseLeftButtonUp="TextOverlayEdit_End" Margin="0,0,0,10" />
-                    <ComboBox SelectedValue="{Binding SelectedItem.Color, ElementName=TextOverlayList}" SelectedValuePath="Tag" Margin="0,0,0,10">
+                    <Slider Minimum="-180" Maximum="180" Value="{Binding Rotation}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" Margin="0,0,0,10" />
+                    <ComboBox SelectedValue="{Binding Color}" SelectedValuePath="Tag" DropDownClosed="TextOverlayCombo_Closed" Margin="0,0,0,10">
                         <ComboBoxItem Content="Белый" Tag="#FFFFFF"/><ComboBoxItem Content="Жёлтый" Tag="#FFE66D"/><ComboBoxItem Content="Голубой" Tag="#7DD3FC"/><ComboBoxItem Content="Розовый" Tag="#F9A8D4"/><ComboBoxItem Content="Зелёный" Tag="#86EFAC"/>
                     </ComboBox>
+                    </StackPanel>
                     <Button Style="{StaticResource ButtonBase}" Click="DeleteTextOverlay_Click" Content="Удалить выбранный текст" Foreground="#FFBBC2" BorderBrush="#70404A" Padding="8,7" />
                 </StackPanel>
             </ScrollViewer>
@@ -781,104 +791,8 @@
 
         </Grid>
 
-        <GridSplitter Grid.Row="1"
-                      Grid.Column="4"
-                      Visibility="Collapsed"
-                      Style="{StaticResource PaneSplitter}"
-                      HorizontalAlignment="Stretch"
-                      VerticalAlignment="Stretch"
-                      ResizeDirection="Columns"
-                      ResizeBehavior="PreviousAndNext"
-                      Cursor="SizeWE"
-                      ToolTip="Изменить ширину панели свойств" />
-
-        <!-- Инспектор -->
-        <Border Grid.Row="1" Grid.Column="5" Visibility="Collapsed" Background="{StaticResource PanelBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1,0,0,0">
-            <Grid Margin="16">
-                <StackPanel>
-                    <TextBlock Text="Клип" FontSize="18" FontWeight="SemiBold" Margin="0,3,0,18" />
-                    <TextBlock Text="Выберите клип на таймлайне, чтобы изменить его параметры."
-                               Foreground="{StaticResource MutedTextBrush}"
-                               TextWrapping="Wrap"
-                               Margin="0,10">
-                        <TextBlock.Style>
-                            <Style TargetType="TextBlock">
-                                <Setter Property="Visibility" Value="Visible" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding HasSelectedClip}" Value="True">
-                                        <Setter Property="Visibility" Value="Collapsed" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </TextBlock.Style>
-                    </TextBlock>
-
-                    <StackPanel Visibility="{Binding HasSelectedClip, Converter={StaticResource BoolToVisibility}}">
-                        <TextBlock Text="{Binding SelectedClipName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding SelectedClipName}" />
-                        <TextBlock Text="{Binding SelectedClipTrackLabel}"
-                                   Foreground="{StaticResource AccentBrush}"
-                                   FontSize="10"
-                                   Margin="0,4,0,16" />
-
-                        <Expander Header="Точные время и обрезка"
-                                  IsExpanded="False"
-                                  Foreground="{StaticResource TextBrush}"
-                                  Margin="0,0,0,16">
-                            <StackPanel Margin="0,10,0,0">
-                                <TextBlock Text="Позиция клипа, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="11" Margin="0,0,0,5" />
-                                <TextBox Text="{Binding SelectedClip.Start, UpdateSourceTrigger=LostFocus, StringFormat=0.00}"
-                                         GotKeyboardFocus="InspectorEdit_Begin"
-                                         LostKeyboardFocus="InspectorEdit_End"
-                                         ToolTip="Где клип начинается на таймлайне"
-                                         Margin="0,0,0,10" />
-
-                                <TextBlock Text="Начало внутри исходника, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="11" Margin="0,0,0,5" />
-                                <TextBox Text="{Binding SelectedClip.SourceStart, UpdateSourceTrigger=LostFocus, StringFormat=0.00}"
-                                         GotKeyboardFocus="InspectorEdit_Begin"
-                                         LostKeyboardFocus="InspectorEdit_End"
-                                         ToolTip="С какой секунды исходного файла начинается клип"
-                                         Margin="0,0,0,10" />
-
-                                <TextBlock Text="Длительность клипа, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="11" Margin="0,0,0,5" />
-                                <TextBox Text="{Binding SelectedClip.Duration, UpdateSourceTrigger=LostFocus, StringFormat=0.00}"
-                                         GotKeyboardFocus="InspectorEdit_Begin"
-                                         LostKeyboardFocus="InspectorEdit_End" />
-                            </StackPanel>
-                        </Expander>
-
-                        <Grid Margin="0,0,0,6">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="Громкость" Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
-                            <TextBlock Grid.Column="1" Text="{Binding SelectedClip.Volume, StringFormat={}{0:P0}}" FontSize="11" />
-                        </Grid>
-                        <Slider Minimum="0" Maximum="2" Value="{Binding SelectedClip.Volume, UpdateSourceTrigger=PropertyChanged}"
-                                PreviewMouseLeftButtonDown="InspectorEdit_Begin" PreviewMouseLeftButtonUp="InspectorEdit_End" Margin="0,0,0,11" />
-                        <CheckBox Content="Отключить звук" IsChecked="{Binding SelectedClip.IsMuted}" Foreground="{StaticResource TextBrush}"
-                                  PreviewMouseLeftButtonDown="InspectorEdit_Begin"
-                                  Checked="InspectorToggle_Changed" Unchecked="InspectorToggle_Changed" Margin="0,0,0,20" />
-
-                        <Button Style="{StaticResource ButtonBase}" Click="Split_Click" Margin="0,0,0,9">
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                                <TextBlock Text="&#xE8C6;" FontFamily="Segoe MDL2 Assets" Margin="0,0,8,0" />
-                                <TextBlock Text="Разрезать в позиции курсора" />
-                            </StackPanel>
-                        </Button>
-                        <Button Style="{StaticResource ButtonBase}" Click="DeleteClip_Click" Foreground="#FFBBC2" BorderBrush="#70404A">
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                                <TextBlock Text="&#xE74D;" FontFamily="Segoe MDL2 Assets" Margin="0,0,8,0" />
-                                <TextBlock Text="Удалить клип" />
-                            </StackPanel>
-                        </Button>
-                    </StackPanel>
-                </StackPanel>
-            </Grid>
-        </Border>
-
         <GridSplitter Grid.Row="2"
-                      Grid.ColumnSpan="6"
+                      Grid.ColumnSpan="4"
                       Style="{StaticResource PaneSplitter}"
                       HorizontalAlignment="Stretch"
                       VerticalAlignment="Stretch"
@@ -888,7 +802,7 @@
                       ToolTip="Изменить высоту предпросмотра и таймлайна" />
 
         <!-- Таймлайн -->
-        <Border Grid.Row="3" Grid.ColumnSpan="6" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="3" Grid.ColumnSpan="4" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -988,7 +902,7 @@
         </Border>
 
         <!-- Строка состояния -->
-        <Border Grid.Row="4" Grid.ColumnSpan="6" Background="#111217" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="4" Grid.ColumnSpan="4" Background="#111217" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
             <Grid Margin="10,0">
                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
                 <TextBlock Text="Локальная обработка • исходники не загружаются в интернет" Foreground="#686A74" FontSize="10" HorizontalAlignment="Right" />
@@ -996,7 +910,7 @@
         </Border>
 
         <!-- Блокировка интерфейса во время длительной операции -->
-        <Border Grid.Row="1" Grid.RowSpan="3" Grid.ColumnSpan="6"
+        <Border Grid.Row="1" Grid.RowSpan="3" Grid.ColumnSpan="4"
                 Background="#66000000"
                 Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}"
                 Panel.ZIndex="100">

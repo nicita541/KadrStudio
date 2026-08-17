@@ -246,8 +246,8 @@ public sealed class MediaHostIntegrationTests
         finally { DeleteRoot(root); }
     }
 
-    [Fact(Timeout = 180_000)]
-    public async Task Repeated_seek_keeps_one_host_bounded_workers_and_no_orphan_ffmpeg()
+    [Fact(Timeout = 600_000)]
+    public async Task One_thousand_seeks_keep_one_host_bounded_workers_and_no_orphan_ffmpeg()
     {
         var root = CreateRoot();
         var ffmpegBefore = System.Diagnostics.Process.GetProcessesByName("ffmpeg")
@@ -274,7 +274,7 @@ public sealed class MediaHostIntegrationTests
                 hostPid = client.HostProcessId;
                 Assert.True(hostPid > 0);
 
-                for (var index = 0; index < 200; index++)
+                for (var index = 0; index < 1_000; index++)
                 {
                     var seconds = (index * 37 % 95) / 24d;
                     var pending = NextFrame(client);

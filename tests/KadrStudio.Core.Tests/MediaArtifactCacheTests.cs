@@ -86,6 +86,22 @@ public sealed class MediaArtifactCacheTests
 
         Assert.Equal(Path.GetFullPath(destination), store.Options.Root);
         Assert.Equal(new byte[] { 1, 2, 3 }, (await store.TryGetAsync(key))!.Value.ToArray());
+        Assert.False(Directory.Exists(original));
+    }
+
+    [Fact]
+    public async Task Artifact_store_applies_new_lru_budget_immediately()
+    {
+        using var directory = new TemporaryCacheDirectory();
+        await using var store = new DiskMediaArtifactCache(new ArtifactStoreOptions(
+            directory.Path, 16 * 1024 * 1024, 1024 * 1024));
+        for (var index = 0; index < 8; index++)
+            await store.PutAsync(Key(Guid.NewGuid(), index), new byte[256 * 1024]);
+
+        await store.SetDiskBudgetAsync(1024 * 1024);
+
+        Assert.Equal(1024 * 1024, store.Options.DiskBudgetBytes);
+        Assert.True((await store.GetSnapshotAsync()).DiskBytes <= 1024 * 1024);
     }
 
     [Fact]

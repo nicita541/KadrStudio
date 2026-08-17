@@ -20,31 +20,31 @@
                 <TextBlock Text="Громкость" />
                 <TextBlock Grid.Column="1" Text="{Binding Volume, StringFormat={}{0:P0}}" />
             </Grid>
-            <Slider Minimum="0" Maximum="2" Value="{Binding Volume}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,0,0,14" />
+            <Slider Minimum="0" Maximum="2" Value="{Binding Volume}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,0,0,14" />
 
             <Grid Margin="0,0,0,6">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                 <TextBlock Text="Баланс L / R" />
                 <TextBlock Grid.Column="1" Text="{Binding Pan, StringFormat={}{0:+0.00;-0.00;0.00}}" />
             </Grid>
-            <Slider Minimum="-1" Maximum="1" Value="{Binding Pan}" TickFrequency="0.1" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" />
+            <Slider Minimum="-1" Maximum="1" Value="{Binding Pan}" TickFrequency="0.1" PreviewMouseLeftButtonUp="Edit_End" />
             <Grid Margin="0,3,0,15"><TextBlock Text="Левое ухо" Foreground="#6EE7B7"/><TextBlock Text="Правое ухо" HorizontalAlignment="Right" Foreground="#93C5FD"/></Grid>
 
             <CheckBox Content="Отключить звук" IsChecked="{Binding IsMuted}" Checked="Toggle_Changed" Unchecked="Toggle_Changed" Margin="0,0,0,18" />
 
             <TextBlock Text="Плавное появление, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
-            <Slider Minimum="0" Maximum="10" Value="{Binding FadeIn}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,12" />
+            <Slider Minimum="0" Maximum="10" Value="{Binding FadeIn}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,12" />
             <TextBlock Text="Плавное затухание, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="11" />
-            <Slider Minimum="0" Maximum="10" Value="{Binding FadeOut}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,18" />
+            <Slider Minimum="0" Maximum="10" Value="{Binding FadeOut}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,18" />
 
             <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,0,0,16" />
             <TextBlock Text="Эквалайзер" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12" />
             <TextBlock Text="Низкие частоты" />
-            <Slider Minimum="-20" Maximum="20" Value="{Binding Bass}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,10" />
+            <Slider Minimum="-20" Maximum="20" Value="{Binding Bass}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,10" />
             <TextBlock Text="Средние частоты" />
-            <Slider Minimum="-20" Maximum="20" Value="{Binding Mid}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,10" />
+            <Slider Minimum="-20" Maximum="20" Value="{Binding Mid}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,10" />
             <TextBlock Text="Высокие частоты" />
-            <Slider Minimum="-20" Maximum="20" Value="{Binding Treble}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,18" />
+            <Slider Minimum="-20" Maximum="20" Value="{Binding Treble}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,4,0,18" />
 
             <Button Style="{StaticResource ButtonBase}" Click="Reset_Click" Content="Сбросить настройки звука" Padding="12,8" />
             <TextBlock Text="Настройки применяются к выбранному аудиоэлементу и учитываются при экспорте."

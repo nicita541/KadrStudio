@@ -8,41 +8,49 @@ using System.Collections.Immutable;
 
 namespace KadrStudio.UiAdapters.Tests;
 
-public sealed class EditorProjectMapperTests
+public sealed class ProjectViewMapperTests
 {
     [Fact]
-    public void Mutable_ui_project_roundtrips_through_immutable_core()
+    public void Immutable_project_is_projected_for_wpf_without_losing_clip_data()
     {
         var sourceId = Guid.NewGuid();
         var link = Guid.NewGuid();
-        var project = EditorProject.CreateNew();
-        project.Name = "Mapper";
-        project.Media.Add(new MediaAsset
+        var core = KadrStudio.Core.Domain.ProjectState.CreateNew("Mapper", CoreFrameRate.Fps23976);
+        var visualTrack = core.Tracks.Single(item => item.Kind == CoreTrackKind.Visual && item.Index == 0);
+        var audioTrack = core.Tracks.Single(item => item.Kind == CoreTrackKind.Audio && item.Index == 0);
+        var textTrack = core.Tracks.Single(item => item.Kind == CoreTrackKind.Text);
+        var source = new KadrStudio.Core.Domain.MediaSource(
+            sourceId, "F:\\media\\episode.mkv", "episode.mkv", KadrStudio.Core.Domain.MediaKind.Video,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(120), true, 1920, 1080,
+            CoreFrameRate.Fps23976, "hevc", "aac");
+        core = core with
         {
-            Id = sourceId, Path = "F:\\media\\episode.mkv", Name = "episode.mkv",
-            Kind = MediaKind.Video, Duration = 120, HasAudio = true, Width = 1920,
-            Height = 1080, FrameRate = 23.976, VideoCodec = "hevc", AudioCodec = "aac"
-        });
-        project.Clips.Add(new TimelineClip
-        {
-            AssetId = sourceId, Track = UiTrackKind.Visual, TrackIndex = 0,
-            Start = 3, SourceStart = 5, Duration = 20, LinkGroupId = link, Brightness = 0.1
-        });
-        project.Clips.Add(new TimelineClip
-        {
-            AssetId = sourceId, Track = UiTrackKind.Audio, TrackIndex = 0,
-            Start = 3, SourceStart = 5, Duration = 20, LinkGroupId = link, Volume = 0.8, Pan = -0.2
-        });
-        project.TextOverlays.Add(new TextOverlay { Text = "Line 1\nLine 2", Start = 4, Duration = 3 });
+            Revision = 7,
+            Sources = core.Sources.Add(sourceId, source),
+            MediaClips =
+            [
+                new(Guid.NewGuid(), sourceId, visualTrack.Id,
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(3),
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(20), link,
+                    new KadrStudio.Core.Domain.VideoParameters(Brightness: 0.1)),
+                new(Guid.NewGuid(), sourceId, audioTrack.Id,
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(3),
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(20), link, Audio:
+                    new KadrStudio.Core.Domain.AudioParameters(Volume: 0.8, Pan: -0.2))
+            ],
+            TextClips =
+            [
+                new(Guid.NewGuid(), textTrack.Id,
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(4),
+                    KadrStudio.Core.Domain.TimelineTime.FromSeconds(3),
+                    "Line 1\nLine 2", new KadrStudio.Core.Domain.TextStyle())
+            ]
+        };
 
-        var mapper = new EditorProjectMapper();
-        var core = mapper.ToCore(project, revision: 7);
-        var restored = mapper.ToUi(core, "F:\\project.kadr");
+        var restored = new ProjectViewMapper().ToUi(core, "F:\\project.kadr");
 
-        Assert.Equal(7, core.Revision);
-        Assert.Equal(2, core.Tracks.Count(item => item.Kind == CoreTrackKind.Visual));
-        Assert.Equal(2, core.Tracks.Count(item => item.Kind == CoreTrackKind.Audio));
-        Assert.Single(core.Tracks.Where(item => item.Kind == CoreTrackKind.Text));
         Assert.Equal(2, restored.Clips.Count);
         Assert.Single(restored.TextOverlays);
         Assert.Equal("Line 1\nLine 2", restored.TextOverlays[0].Text);
@@ -56,11 +64,10 @@ public sealed class EditorProjectMapperTests
     [InlineData(60000, 1001)]
     public void Adapter_preserves_exact_fractional_sequence_timebase(int numerator, int denominator)
     {
-        var project = EditorProject.CreateNew();
-        project.FrameRateValue = new CoreFrameRate(numerator, denominator);
-        var mapper = new EditorProjectMapper();
+        var project = KadrStudio.Core.Domain.ProjectState.CreateNew(
+            "fractional", new CoreFrameRate(numerator, denominator));
 
-        var restored = mapper.ToUi(mapper.ToCore(project));
+        var restored = new ProjectViewMapper().ToUi(project);
 
         Assert.Equal(new CoreFrameRate(numerator, denominator), restored.FrameRateValue);
     }
@@ -80,12 +87,14 @@ public sealed class EditorProjectMapperTests
                 new(Guid.NewGuid(), CoreTrackKind.Text, 0, "Subtitles", IsVisible: false)
             ]
         };
-        var mapper = new EditorProjectMapper();
+        var restored = new ProjectViewMapper().ToUi(project);
 
-        var restored = mapper.ToCore(mapper.ToUi(project));
-
-        Assert.Equal(project.Tracks.ToArray(), restored.Tracks.ToArray());
+        Assert.Equal(project.Tracks.Length, restored.Tracks.Count);
         Assert.Equal(id, restored.Tracks[0].Id);
+        Assert.Equal("Main picture", restored.Tracks[0].Name);
+        Assert.True(restored.Tracks[0].IsMuted);
+        Assert.True(restored.Tracks[0].IsLocked);
+        Assert.False(restored.Tracks[0].IsVisible);
     }
 
     [Fact]
@@ -119,16 +128,13 @@ public sealed class EditorProjectMapperTests
             MediaClips = [first, second],
             Transitions = [transition]
         };
-        var mapper = new EditorProjectMapper();
+        var restored = new ProjectViewMapper().ToUi(project);
 
-        var restored = mapper.ToCore(mapper.ToUi(project));
-
-        Assert.Equal(transition, Assert.Single(restored.Transitions));
-        Assert.Equal(first.Video, restored.FindMediaClip(first.Id)!.Video);
-        var restoredSource = restored.Sources[source.Id];
-        Assert.Equal("verified", restoredSource.VerifiedFingerprint);
-        Assert.True(restoredSource.IsVariableFrameRate);
-        Assert.True(source.Streams.SequenceEqual(restoredSource.Streams));
+        Assert.Equal(first.Video!.PositionX, restored.FindClip(first.Id)!.PositionX);
+        var restoredSource = restored.FindAsset(source.Id)!;
+        Assert.Equal("verified", restoredSource.ProbeResult!.Fingerprint.VerifiedHash);
+        Assert.True(restoredSource.ProbeResult.IsVariableFrameRate);
+        Assert.True(source.Streams.SequenceEqual(restoredSource.ProbeResult.Streams));
     }
 
     [Fact]
@@ -138,27 +144,32 @@ public sealed class EditorProjectMapperTests
         Directory.CreateDirectory(root);
         try
         {
-            var project = EditorProject.CreateNew();
-            project.Name = "SQLite UI";
+            var project = KadrStudio.Core.Domain.ProjectState.CreateNew("SQLite UI");
             var sourceId = Guid.NewGuid();
-            project.Media.Add(new MediaAsset
+            var source = new KadrStudio.Core.Domain.MediaSource(
+                sourceId, "F:\\media\\input.mkv", "input.mkv", KadrStudio.Core.Domain.MediaKind.Video,
+                KadrStudio.Core.Domain.TimelineTime.FromSeconds(10), true);
+            var visualTrack = project.Tracks.Single(item => item.Kind == CoreTrackKind.Visual && item.Index == 0);
+            project = project with
             {
-                Id = sourceId, Path = "F:\\media\\input.mkv", Name = "input.mkv",
-                Kind = MediaKind.Video, Duration = 10, HasAudio = true
-            });
-            project.Clips.Add(new TimelineClip
-            {
-                AssetId = sourceId, Track = UiTrackKind.Visual, Start = 0, Duration = 5
-            });
+                Sources = project.Sources.Add(sourceId, source),
+                MediaClips =
+                [
+                    new(Guid.NewGuid(), sourceId, visualTrack.Id,
+                        KadrStudio.Core.Domain.TimelineTime.Zero,
+                        KadrStudio.Core.Domain.TimelineTime.Zero,
+                        KadrStudio.Core.Domain.TimelineTime.FromSeconds(5),
+                        Video: new KadrStudio.Core.Domain.VideoParameters())
+                ]
+            };
             var path = Path.Combine(root, "ui.kadr");
-            var service = new ProjectService();
+            using var service = new ProjectService();
 
             await service.SaveAsync(project, path);
             var opened = await service.OpenAsync(path);
 
             Assert.Equal("SQLite UI", opened.Name);
-            Assert.Single(opened.Clips);
-            Assert.Equal(path, opened.FilePath);
+            Assert.Single(opened.MediaClips);
             var header = new byte[16];
             await using var stream = File.OpenRead(path);
             Assert.Equal(header.Length, await stream.ReadAsync(header));
@@ -178,21 +189,20 @@ public sealed class EditorProjectMapperTests
         try
         {
             var path = Path.Combine(root, "history.kadr");
-            var project = EditorProject.CreateNew();
-            project.Name = "Before";
-            var projectService = new ProjectService();
-            await projectService.SaveAsync(project, path);
+            var before = KadrStudio.Core.Domain.ProjectState.CreateNew("Before");
+            using var projectService = new ProjectService();
+            await projectService.SaveAsync(before, path);
             var history = new ProjectHistoryService(Path.Combine(root, "local"));
 
-            var entry = await history.CreateCheckpointAsync(project, "before rename");
-            project.Name = "After";
-            await projectService.SaveAsync(project, path);
-            var restored = await history.RestoreCheckpointAsync(entry, path);
+            var entry = await history.CreateCheckpointAsync(before, path, "before rename");
+            var after = before with { Name = "After", Revision = before.Revision + 1 };
+            await projectService.SaveAsync(after, path);
+            var restored = await history.RestoreCheckpointAsync(entry);
 
             Assert.Equal("Before", restored.Name);
-            Assert.Single(await history.GetCheckpointsAsync(project));
+            Assert.Single(await history.GetCheckpointsAsync(after, path));
             await history.DeleteCheckpointAsync(entry);
-            Assert.Empty(await history.GetCheckpointsAsync(project));
+            Assert.Empty(await history.GetCheckpointsAsync(after, path));
         }
         finally
         {
@@ -207,12 +217,13 @@ public sealed class EditorProjectMapperTests
         Directory.CreateDirectory(root);
         try
         {
-            var service = new ProjectService(root);
-            var project = EditorProject.CreateNew();
-            project.Name = "Revision 1";
+            using var service = new ProjectService(root);
+            var project = KadrStudio.Core.Domain.ProjectState.CreateNew("Revision 1");
             var first = service.SaveAutosaveAsync(project);
-            project.Name = "Revision 2";
-            var second = service.SaveAutosaveAsync(project);
+            var second = service.SaveAutosaveAsync(project with
+            {
+                Name = "Revision 2", Revision = 1, UpdatedAt = project.UpdatedAt.AddSeconds(1)
+            });
 
             await Task.WhenAll(first, second);
             var restored = await service.OpenAutosaveAsync();
@@ -236,7 +247,7 @@ public sealed class EditorProjectMapperTests
         {
             var path = Path.Combine(root, "shared.kadr");
             using var first = new ProjectService(Path.Combine(root, "recovery-1"));
-            await first.SaveAsync(EditorProject.CreateNew(), path);
+            await first.SaveAsync(KadrStudio.Core.Domain.ProjectState.CreateNew(), path);
             using var second = new ProjectService(Path.Combine(root, "recovery-2"));
 
             await Assert.ThrowsAsync<KadrStudio.Infrastructure.Storage.ProjectFileLockedException>(
@@ -244,7 +255,32 @@ public sealed class EditorProjectMapperTests
 
             first.Dispose();
             var reopened = await second.OpenAsync(path);
-            Assert.Equal(path, reopened.FilePath);
+            Assert.NotEqual(Guid.Empty, reopened.Id);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Workspace_cache_settings_survive_restart_and_corruption_falls_back_safely()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "settings-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var path = Path.Combine(root, "settings.json");
+            var cacheRoot = Path.Combine(root, "cache");
+            var service = new WorkspaceSettingsService(path);
+            await service.SaveAsync(new WorkspaceSettings(cacheRoot, 2L * 1024 * 1024 * 1024));
+
+            var restored = new WorkspaceSettingsService(path).Load();
+
+            Assert.Equal(Path.GetFullPath(cacheRoot), restored.ArtifactRoot);
+            Assert.Equal(2L * 1024 * 1024 * 1024, restored.ArtifactDiskBudgetBytes);
+            await File.WriteAllTextAsync(path, "{not-json");
+            Assert.Equal(WorkspaceSettings.Default, new WorkspaceSettingsService(path).Load());
         }
         finally
         {

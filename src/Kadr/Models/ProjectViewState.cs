@@ -5,7 +5,11 @@ using KadrStudio.ViewModels;
 
 namespace KadrStudio.Models;
 
-public sealed class EditorProject : ObservableObject
+/// <summary>
+/// Read-only-in-practice WPF projection rebuilt from an immutable ProjectState.
+/// It is never persisted, rendered, or used as an edit source.
+/// </summary>
+public sealed class ProjectViewState : ObservableObject
 {
     private string _name = "Новый проект";
     private int _canvasWidth = 1920;
@@ -15,7 +19,6 @@ public sealed class EditorProject : ObservableObject
     private double? _inPoint;
     private double? _outPoint;
 
-    public int FormatVersion { get; set; } = 1;
     public Guid Id { get; set; } = Guid.NewGuid();
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.Now;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.Now;
@@ -83,19 +86,6 @@ public sealed class EditorProject : ObservableObject
     [JsonIgnore]
     public string? FilePath { get; set; }
 
-    /// <summary>
-    /// Immutable v3 state retained only while the legacy WPF projection is being
-    /// removed. It prevents fields not yet editable by old panels from being lost.
-    /// </summary>
-    [JsonIgnore]
-    public ProjectState? MigrationSnapshot { get; set; }
-
-    [JsonIgnore]
-    public long VideoRevision { get; private set; }
-
-    [JsonIgnore]
-    public long AudioRevision { get; private set; }
-
     [JsonIgnore]
     public double Duration => Math.Max(
         Clips.Count == 0 ? 0 : Clips.Max(clip => clip.End),
@@ -134,37 +124,6 @@ public sealed class EditorProject : ObservableObject
         .ThenBy(clip => clip.Id)
         .ToList();
 
-    public void ReflowVisualTrack(IEnumerable<TimelineClip>? orderedClips = null)
-    {
-        var ordered = orderedClips?.ToList() ?? GetVisualClips().ToList();
-        var position = 0.0;
-        foreach (var clip in ordered)
-        {
-            clip.Start = position;
-            position += clip.Duration;
-        }
-
-        OnPropertyChanged(nameof(Duration));
-    }
-
-    public void InvalidatePreview(TrackKind track)
-    {
-        if (track == TrackKind.Visual)
-        {
-            VideoRevision++;
-        }
-        else
-        {
-            AudioRevision++;
-        }
-    }
-
-    public void InvalidateAllPreview()
-    {
-        InvalidatePreview(TrackKind.Visual);
-        InvalidatePreview(TrackKind.Audio);
-    }
-
     private int RequiredTrackCount(TrackKind kind)
     {
         var highestOccupied = Clips
@@ -175,14 +134,4 @@ public sealed class EditorProject : ObservableObject
         return Math.Max(2, highestOccupied + 2);
     }
 
-    public static EditorProject CreateNew()
-    {
-        var project = new EditorProject();
-        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Visual, Index = 0, Name = "V1" });
-        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Visual, Index = 1, Name = "V2" });
-        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Audio, Index = 0, Name = "A1" });
-        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Audio, Index = 1, Name = "A2" });
-        project.Tracks.Add(new EditorTrack { Kind = KadrStudio.Core.Domain.TrackKind.Text, Index = 0, Name = "T1" });
-        return project;
-    }
 }

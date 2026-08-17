@@ -4,7 +4,6 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using KadrStudio.Application.Preview;
 using KadrStudio.Core.Domain;
-using KadrStudio.Models;
 using KadrStudio.Services;
 using KadrStudio.Application.Caching;
 
@@ -19,7 +18,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
     private readonly PreviewProxyStore _proxies;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private WriteableBitmap? _bitmap;
-    private EditorProject? _project;
+    private ProjectState? _project;
     private long _videoGeneration;
     private long _audioGeneration;
     private long _overlayGeneration;
@@ -51,7 +50,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
     public PreviewState State => _engine.State;
     public TimelineTime Position => _engine.Position;
 
-    public void SetProject(EditorProject project, bool halfQuality)
+    public void SetProject(ProjectState project, bool halfQuality)
     {
         var identityChanged = _project is null || _project.Id != project.Id;
         var qualityChanged = _halfQuality != halfQuality;
@@ -78,10 +77,14 @@ public sealed class PreviewPresenter : IAsyncDisposable
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var hasVideo = _project.GetVisualClips().Any(clip =>
-                _project.FindAsset(clip.AssetId) is { IsMissing: false } asset && File.Exists(asset.Path));
-            var hasAudio = _project.GetAudioClips().Any(clip =>
-                _project.FindAsset(clip.AssetId) is { IsMissing: false, HasAudio: true } asset && File.Exists(asset.Path));
+            var hasVideo = _project.MediaClips.Any(clip =>
+                _project.FindTrack(clip.TrackId)?.Kind == TrackKind.Visual &&
+                _project.Sources.TryGetValue(clip.SourceId, out var source) &&
+                source.OnlineState == MediaOnlineState.Online && File.Exists(source.Path));
+            var hasAudio = _project.MediaClips.Any(clip =>
+                _project.FindTrack(clip.TrackId)?.Kind == TrackKind.Audio &&
+                _project.Sources.TryGetValue(clip.SourceId, out var source) && source.HasAudio &&
+                source.OnlineState == MediaOnlineState.Online && File.Exists(source.Path));
             if (!hasVideo && !hasAudio)
             {
                 await _engine.StopAsync(cancellationToken).ConfigureAwait(false);
@@ -95,11 +98,12 @@ public sealed class PreviewPresenter : IAsyncDisposable
                 _proxies.Queue(_project);
                 plan = _proxies.UseAvailable(plan);
             }
-            var position = TimelineTime.FromSeconds(Math.Clamp(timelineSeconds, 0, Math.Max(0, _project.Duration)));
+            var position = TimelineTime.FromSeconds(Math.Clamp(
+                timelineSeconds, 0, Math.Max(0, _project.Duration.TotalSeconds)));
             var size = PreviewSizing.Resolve(_project, _halfQuality);
             if (!_prepared)
             {
-                var request = new PreviewRequest(position, _project.FrameRateValue, size.Width, size.Height,
+                var request = new PreviewRequest(position, _project.FrameRate, size.Width, size.Height,
                     _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
                 await _engine.PrepareAsync(plan, request, cancellationToken).ConfigureAwait(false);
                 RememberSignatures(plan);
@@ -113,7 +117,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
                 if (videoChanged) _videoGeneration++;
                 if (audioChanged) _audioGeneration++;
                 if (overlayChanged) _overlayGeneration++;
-                var request = new PreviewRequest(position, _project.FrameRateValue, size.Width, size.Height,
+                var request = new PreviewRequest(position, _project.FrameRate, size.Width, size.Height,
                     _halfQuality, new PreviewGeneration(_videoGeneration, _audioGeneration, _overlayGeneration));
                 if (videoChanged || audioChanged)
                 {
@@ -126,7 +130,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
                     _overlaySignature = plan.OverlaySignature;
                 }
 
-                var frameDuration = 1d / Math.Max(1, _project.FrameRateValue.FramesPerSecond);
+                var frameDuration = 1d / Math.Max(1, _project.FrameRate.FramesPerSecond);
                 if (forceSeek && Math.Abs(position.TotalSeconds - _engine.Position.TotalSeconds) > frameDuration / 2)
                     await _engine.SeekAsync(position, cancellationToken).ConfigureAwait(false);
             }
@@ -182,7 +186,7 @@ public sealed class PreviewPresenter : IAsyncDisposable
 
     private void Proxies_ProxyReady(object? sender, Guid sourceId)
     {
-        if (_disposed || _project?.Media.All(asset => asset.Id != sourceId) != false) return;
+        if (_disposed || _project?.Sources.ContainsKey(sourceId) != true) return;
         _videoSignature = null;
         _ = ActivateReadyProxyAsync();
     }

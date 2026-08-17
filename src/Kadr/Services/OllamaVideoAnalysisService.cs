@@ -6,6 +6,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using KadrStudio.Models;
+using CoreMediaClip = KadrStudio.Core.Domain.MediaClip;
+using CoreProjectState = KadrStudio.Core.Domain.ProjectState;
 
 namespace KadrStudio.Services;
 
@@ -154,10 +156,10 @@ public sealed class OllamaVideoAnalysisService : IDisposable
     }
 
     public async Task<EditCommandPlan> PlanEditsAsync(
-        EditorProject project,
+        CoreProjectState project,
         string prompt,
         string model,
-        TimelineClip? selectedClip,
+        CoreMediaClip? selectedClip,
         CancellationToken cancellationToken = default)
     {
         if (EditingCommandPlanner.TryCreateDeterministic(project, prompt, selectedClip, out var deterministic))
@@ -167,27 +169,41 @@ public sealed class OllamaVideoAnalysisService : IDisposable
 
         await EnsureServerAsync(cancellationToken);
         var context = new StringBuilder();
-        context.AppendLine($"Длительность проекта: {Format(project.Duration)} секунд.");
+        context.AppendLine($"Длительность проекта: {Format(project.Duration.TotalSeconds)} секунд.");
         if (selectedClip is not null)
         {
-            var asset = project.FindAsset(selectedClip.AssetId);
+            project.Sources.TryGetValue(selectedClip.SourceId, out var asset);
+            var track = project.FindTrack(selectedClip.TrackId);
             context.AppendLine(
-                $"Выбранный клип: {asset?.Name}, дорожка {selectedClip.Track}{selectedClip.TrackIndex + 1}, " +
-                $"{Format(selectedClip.Start)}–{Format(selectedClip.End)} сек.");
+                $"Выбранный клип: {asset?.Name}, дорожка {track?.Name}, " +
+                $"{Format(selectedClip.Start.TotalSeconds)}–{Format(selectedClip.End.TotalSeconds)} сек.");
         }
         context.AppendLine("Смысловые метки:");
         foreach (var marker in project.Markers
-                     .Where(marker => marker.Kind is MarkerKind.Opening or MarkerKind.Ending or MarkerKind.PostCredits or MarkerKind.Preview or MarkerKind.Recap or MarkerKind.Note)
+                     .Where(marker => marker.Kind is
+                         KadrStudio.Core.Domain.MarkerKind.Opening or
+                         KadrStudio.Core.Domain.MarkerKind.Ending or
+                         KadrStudio.Core.Domain.MarkerKind.PostCredits or
+                         KadrStudio.Core.Domain.MarkerKind.Preview or
+                         KadrStudio.Core.Domain.MarkerKind.Recap or
+                         KadrStudio.Core.Domain.MarkerKind.Note)
                      .OrderBy(marker => marker.Start)
                      .Take(60))
         {
-            context.AppendLine($"- {marker.Kind}: {Format(marker.Start)}–{Format(marker.End)}; {marker.Title}");
+            context.AppendLine(
+                $"- {marker.Kind}: {Format(marker.Start.TotalSeconds)}–{Format(marker.End.TotalSeconds)}; {marker.Title}");
         }
         context.AppendLine("Клипы:");
-        foreach (var clip in project.Clips.OrderBy(clip => clip.Track).ThenBy(clip => clip.TrackIndex).ThenBy(clip => clip.Start).Take(100))
+        foreach (var clip in project.MediaClips
+                     .OrderBy(clip => project.FindTrack(clip.TrackId)?.Kind)
+                     .ThenBy(clip => project.FindTrack(clip.TrackId)?.Index)
+                     .ThenBy(clip => clip.Start)
+                     .Take(100))
         {
+            var track = project.FindTrack(clip.TrackId);
+            project.Sources.TryGetValue(clip.SourceId, out var source);
             context.AppendLine(
-                $"- {clip.Track}{clip.TrackIndex + 1}: {Format(clip.Start)}–{Format(clip.End)}; {project.FindAsset(clip.AssetId)?.Name}");
+                $"- {track?.Name}: {Format(clip.Start.TotalSeconds)}–{Format(clip.End.TotalSeconds)}; {source?.Name}");
         }
 
         using var response = await _httpClient.PostAsJsonAsync(
@@ -242,8 +258,8 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 }
                 TryGetNumber(commandElement, "start", out var start);
                 TryGetNumber(commandElement, "end", out var end);
-                start = Math.Clamp(start, 0, project.Duration);
-                end = Math.Clamp(end, 0, project.Duration);
+                start = Math.Clamp(start, 0, project.Duration.TotalSeconds);
+                end = Math.Clamp(end, 0, project.Duration.TotalSeconds);
                 if (type == EditCommandType.DeleteRange && end <= start + 0.05)
                 {
                     continue;

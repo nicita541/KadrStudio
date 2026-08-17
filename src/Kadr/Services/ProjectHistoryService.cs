@@ -1,6 +1,5 @@
-using KadrStudio.Adapters;
 using KadrStudio.Infrastructure.Storage;
-using KadrStudio.Models;
+using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Services;
 
@@ -11,7 +10,6 @@ namespace KadrStudio.Services;
 public sealed class ProjectHistoryService
 {
     private readonly SqliteProjectStore _store = new();
-    private readonly EditorProjectMapper _mapper = new();
     private readonly string _historyRoot;
     private readonly SemaphoreSlim _operationGate = new(1, 1);
 
@@ -24,15 +22,15 @@ public sealed class ProjectHistoryService
     }
 
     public async Task<ProjectHistoryEntry> CreateCheckpointAsync(
-        EditorProject project,
+        ProjectState project,
+        string? projectFilePath,
         string message,
-        string? existingSnapshot = null,
+        ProjectState? existingSnapshot = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(project);
-        var checkpointProject = existingSnapshot is null ? project : ProjectJson.Deserialize(existingSnapshot);
-        var core = _mapper.ToCore(checkpointProject);
-        var path = GetHistoryPath(project);
+        var core = existingSnapshot ?? project;
+        var path = GetHistoryPath(project, projectFilePath);
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
@@ -48,11 +46,12 @@ public sealed class ProjectHistoryService
     }
 
     public async Task<IReadOnlyList<ProjectHistoryEntry>> GetCheckpointsAsync(
-        EditorProject project,
+        ProjectState project,
+        string? projectFilePath,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(project);
-        var path = GetHistoryPath(project);
+        var path = GetHistoryPath(project, projectFilePath);
         if (!File.Exists(path)) return [];
         await _operationGate.WaitAsync(cancellationToken);
         try
@@ -67,9 +66,8 @@ public sealed class ProjectHistoryService
         }
     }
 
-    public async Task<EditorProject> RestoreCheckpointAsync(
+    public async Task<ProjectState> RestoreCheckpointAsync(
         ProjectHistoryEntry entry,
-        string? projectFilePath,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
@@ -77,8 +75,7 @@ public sealed class ProjectHistoryService
         await _operationGate.WaitAsync(cancellationToken);
         try
         {
-            var core = await _store.RestoreCheckpointAsync(path, entry.Id, cancellationToken);
-            return _mapper.ToUi(core, projectFilePath);
+            return await _store.RestoreCheckpointAsync(path, entry.Id, cancellationToken);
         }
         finally
         {
@@ -103,10 +100,10 @@ public sealed class ProjectHistoryService
         }
     }
 
-    private string GetHistoryPath(EditorProject project)
-        => string.IsNullOrWhiteSpace(project.FilePath)
+    private string GetHistoryPath(ProjectState project, string? projectFilePath)
+        => string.IsNullOrWhiteSpace(projectFilePath)
             ? Path.Combine(_historyRoot, $"{project.Id:N}.history.kadr")
-            : Path.GetFullPath(project.FilePath);
+            : Path.GetFullPath(projectFilePath);
 
     private static ProjectHistoryEntry ToEntry(
         Guid id,

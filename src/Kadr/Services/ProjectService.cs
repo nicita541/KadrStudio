@@ -1,23 +1,17 @@
-using System.Collections.Concurrent;
-using KadrStudio.Adapters;
 using KadrStudio.Infrastructure.Storage;
-using KadrStudio.Models;
 using KadrStudio.Application.Storage;
 using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Services;
 
 /// <summary>
-/// WPF persistence adapter. Project files and crash recovery always use the
-/// validated SQLite core. JSON remains private to the in-memory legacy UI undo
-/// bridge until all controls emit core edit commands directly.
+/// Serializes validated immutable project snapshots and owns the cross-process
+/// write lease. WPF projections never enter persistence.
 /// </summary>
 public sealed class ProjectService : IDisposable
 {
     private readonly SqliteProjectStore _projectStore;
     private readonly SqliteRecoveryStore _recoveryStore;
-    private readonly EditorProjectMapper _mapper = new();
-    private readonly ConcurrentDictionary<Guid, long> _revisions = [];
     private readonly SemaphoreSlim _storageGate = new(1, 1);
     private Guid? _pendingRecoveryId;
     private ProjectFileLease? _projectLease;
@@ -29,17 +23,14 @@ public sealed class ProjectService : IDisposable
         _recoveryStore = new SqliteRecoveryStore(recoveryRoot);
     }
 
-    public async Task SaveAsync(EditorProject project, string path, CancellationToken cancellationToken = default)
+    public async Task SaveAsync(ProjectState project, string path, CancellationToken cancellationToken = default)
     {
         var fullPath = Path.GetFullPath(path);
         await _storageGate.WaitAsync(cancellationToken);
         try
         {
             EnsureLease(fullPath);
-            project.UpdatedAt = DateTimeOffset.UtcNow;
-            var core = _mapper.ToCore(project, NextRevision(project.Id));
-            await _projectStore.SaveAsync(fullPath, core, cancellationToken);
-            project.FilePath = fullPath;
+            await _projectStore.SaveAsync(fullPath, project, cancellationToken);
             await _recoveryStore.DeleteAsync(project.Id, cancellationToken: cancellationToken);
             if (_pendingRecoveryId == project.Id) _pendingRecoveryId = null;
         }
@@ -49,7 +40,7 @@ public sealed class ProjectService : IDisposable
         }
     }
 
-    public async Task<EditorProject> OpenAsync(string path, CancellationToken cancellationToken = default)
+    public async Task<ProjectState> OpenAsync(string path, CancellationToken cancellationToken = default)
     {
         var fullPath = Path.GetFullPath(path);
         await _storageGate.WaitAsync(cancellationToken);
@@ -67,8 +58,7 @@ public sealed class ProjectService : IDisposable
                 throw;
             }
             ReplaceLease(lease);
-            _revisions[core.Id] = core.Revision;
-            return _mapper.ToUi(core, fullPath);
+            return core;
         }
         finally
         {
@@ -76,20 +66,18 @@ public sealed class ProjectService : IDisposable
         }
     }
 
-    public Task SaveAutosaveAsync(EditorProject project, CancellationToken cancellationToken = default)
+    public Task SaveAutosaveAsync(ProjectState project, CancellationToken cancellationToken = default)
         => SaveAutosaveVersionAsync(project, "Automatic recovery after editing", cancellationToken);
 
     public async Task SaveAutosaveVersionAsync(
-        EditorProject project,
+        ProjectState project,
         string reason,
         CancellationToken cancellationToken = default)
     {
         await _storageGate.WaitAsync(cancellationToken);
         try
         {
-            project.UpdatedAt = DateTimeOffset.UtcNow;
-            var core = _mapper.ToCore(project, NextRevision(project.Id));
-            await _recoveryStore.SaveAsync(core, reason, cancellationToken);
+            await _recoveryStore.SaveAsync(project, reason, cancellationToken);
             _pendingRecoveryId = project.Id;
         }
         finally
@@ -132,10 +120,10 @@ public sealed class ProjectService : IDisposable
         finally { _storageGate.Release(); }
     }
 
-    public Task<EditorProject> OpenAutosaveAsync(CancellationToken cancellationToken = default)
+    public Task<ProjectState> OpenAutosaveAsync(CancellationToken cancellationToken = default)
         => OpenAutosaveVersionAsync(null, null, cancellationToken);
 
-    public async Task<EditorProject> OpenAutosaveVersionAsync(
+    public async Task<ProjectState> OpenAutosaveVersionAsync(
         Guid? projectId,
         Guid? recoveryId,
         CancellationToken cancellationToken = default)
@@ -152,9 +140,8 @@ public sealed class ProjectService : IDisposable
             }
             var core = await _recoveryStore.LoadAsync(id.Value, recoveryId, cancellationToken)
                 ?? throw new FileNotFoundException("The recovery project no longer exists.");
-            _revisions[core.Id] = core.Revision;
             _pendingRecoveryId = core.Id;
-            return _mapper.ToUi(core);
+            return core;
         }
         finally
         {
@@ -194,18 +181,6 @@ public sealed class ProjectService : IDisposable
             _storageGate.Release();
         }
     }
-
-    public string CreateSnapshot(EditorProject project) => ProjectJson.Serialize(project);
-
-    public EditorProject RestoreSnapshot(string snapshot, string? filePath)
-    {
-        var project = ProjectJson.Deserialize(snapshot);
-        project.FilePath = filePath;
-        return project;
-    }
-
-    private long NextRevision(Guid projectId)
-        => _revisions.AddOrUpdate(projectId, 1, static (_, revision) => checked(revision + 1));
 
     private void EnsureLease(string fullPath)
     {

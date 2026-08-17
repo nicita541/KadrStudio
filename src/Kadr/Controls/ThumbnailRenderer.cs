@@ -3,68 +3,134 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using KadrStudio.Core.Domain;
 using KadrStudio.Models;
 
 namespace KadrStudio.Controls;
 
-public sealed class ThumbnailRenderer(Dispatcher dispatcher, Action invalidate, int cacheLimit = 256)
+/// <summary>
+/// Renders and requests only thumbnail tiles intersecting the current viewport.
+/// Extraction is delegated to the workspace boundary and never blocks WPF.
+/// </summary>
+public sealed class ThumbnailRenderer(Dispatcher dispatcher, Action invalidate, int cacheLimit = 256) : IDisposable
 {
-    private readonly ConcurrentDictionary<string, ImageSource> _cache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<string> _lru = new();
+    private readonly ConcurrentDictionary<string, ImageSource> _imageCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _pendingImages = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<string> _imageLru = new();
+    private readonly ConcurrentDictionary<ThumbnailRequestKey, string> _resolved = new();
+    private readonly ConcurrentDictionary<ThumbnailRequestKey, byte> _pendingRequests = new();
+    private readonly ConcurrentDictionary<ThumbnailRequestKey, DateTimeOffset> _failedUntil = new();
+    private readonly ConcurrentQueue<ThumbnailRequestKey> _requestLru = new();
+    private CancellationTokenSource _viewportCancellation = new();
+
+    public Func<Guid, TimelineTime, CancellationToken, Task<string?>>? Request { get; set; }
+
+    public void BeginViewportGeneration()
+    {
+        var previous = Interlocked.Exchange(ref _viewportCancellation, new CancellationTokenSource());
+        previous.Cancel();
+        previous.Dispose();
+    }
 
     public void Draw(DrawingContext context, TimelineClip clip, MediaAsset asset, Rect clipRectangle, Rect visibleRectangle)
     {
-        if (asset.TimelineFramePaths.Count == 0 || visibleRectangle.IsEmpty) return;
+        if (visibleRectangle.IsEmpty || Request is null) return;
         context.PushClip(new RectangleGeometry(visibleRectangle));
         context.PushOpacity(0.88);
-        foreach (var tile in BuildTiles(asset.TimelineFramePaths.Count, clip, asset.Duration, clipRectangle, visibleRectangle))
+        foreach (var tile in BuildTiles(clip, asset.Duration, clipRectangle, visibleRectangle))
         {
-            var path = asset.TimelineFramePaths[tile.FrameIndex];
-            if (TryGet(path) is { } image) context.DrawImage(image, tile.Bounds);
+            var time = TimelineTime.FromSeconds(tile.SourceTimeSeconds);
+            var key = new ThumbnailRequestKey(asset.Id, time.Ticks);
+            if (_resolved.TryGetValue(key, out var path))
+            {
+                _requestLru.Enqueue(key);
+                if (TryGetImage(path) is { } image) context.DrawImage(image, tile.Bounds);
+            }
+            else
+            {
+                QueueRequest(key, time);
+            }
         }
         context.Pop();
         context.Pop();
     }
 
     public static IReadOnlyList<ThumbnailTile> BuildTiles(
-        int frameCount,
         TimelineClip clip,
         double sourceDuration,
         Rect clipRectangle,
         Rect visibleRectangle,
         double tileWidth = 82)
     {
-        if (frameCount <= 0 || clipRectangle.IsEmpty || visibleRectangle.IsEmpty) return [];
+        if (clipRectangle.IsEmpty || visibleRectangle.IsEmpty || tileWidth <= 0) return [];
         var result = new List<ThumbnailTile>();
         var first = clipRectangle.Left + Math.Floor((visibleRectangle.Left - clipRectangle.Left) / tileWidth) * tileWidth;
         for (var left = first; left < visibleRectangle.Right; left += tileWidth)
         {
-            var width = Math.Min(tileWidth, clipRectangle.Right - left);
-            if (width <= 0) continue;
-            var center = Math.Min(clipRectangle.Right, left + tileWidth / 2);
+            var boundedLeft = Math.Max(left, clipRectangle.Left);
+            var right = Math.Min(left + tileWidth, clipRectangle.Right);
+            if (right <= boundedLeft) continue;
+            var center = Math.Clamp(left + tileWidth / 2, clipRectangle.Left, clipRectangle.Right);
             var localRatio = Math.Clamp((center - clipRectangle.Left) / clipRectangle.Width, 0, 1);
-            var sourceTime = clip.SourceStart + localRatio * clip.Duration;
-            var sourceRatio = sourceDuration <= 0 ? 0 : Math.Clamp(sourceTime / sourceDuration, 0, 1);
-            var index = Math.Clamp((int)Math.Round(sourceRatio * (frameCount - 1)), 0, frameCount - 1);
-            result.Add(new ThumbnailTile(new Rect(left, clipRectangle.Top, width, clipRectangle.Height), index));
+            var sourceTime = Math.Clamp(clip.SourceStart + localRatio * clip.Duration, 0, Math.Max(0, sourceDuration));
+            result.Add(new ThumbnailTile(
+                new Rect(boundedLeft, clipRectangle.Top, right - boundedLeft, clipRectangle.Height),
+                sourceTime));
         }
         return result;
     }
 
-    private ImageSource? TryGet(string path)
+    private void QueueRequest(ThumbnailRequestKey key, TimelineTime time)
+    {
+        if (Request is null || _pendingRequests.ContainsKey(key)) return;
+        if (_failedUntil.TryGetValue(key, out var retryAt) && retryAt > DateTimeOffset.UtcNow) return;
+        if (!_pendingRequests.TryAdd(key, 0)) return;
+        var token = _viewportCancellation.Token;
+        _ = ResolveAsync(key, time, token);
+    }
+
+    private async Task ResolveAsync(ThumbnailRequestKey key, TimelineTime time, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var request = Request;
+            if (request is null) return;
+            var path = await request(key.SourceId, time, cancellationToken).ConfigureAwait(false);
+            if (cancellationToken.IsCancellationRequested) return;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                _failedUntil[key] = DateTimeOffset.UtcNow.AddSeconds(5);
+                return;
+            }
+            _resolved[key] = path;
+            _requestLru.Enqueue(key);
+            TrimRequests();
+            _ = dispatcher.BeginInvoke(invalidate, DispatcherPriority.Render);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch
+        {
+            _failedUntil[key] = DateTimeOffset.UtcNow.AddSeconds(5);
+        }
+        finally
+        {
+            _pendingRequests.TryRemove(key, out _);
+        }
+    }
+
+    private ImageSource? TryGetImage(string path)
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return null;
-        if (_cache.TryGetValue(path, out var cached))
+        if (_imageCache.TryGetValue(path, out var cached))
         {
-            _lru.Enqueue(path);
+            _imageLru.Enqueue(path);
             return cached;
         }
-        if (_pending.TryAdd(path, 0)) _ = LoadAsync(path);
+        if (_pendingImages.TryAdd(path, 0)) _ = LoadImageAsync(path);
         return null;
     }
 
-    private async Task LoadAsync(string path)
+    private async Task LoadImageAsync(string path)
     {
         try
         {
@@ -76,19 +142,39 @@ public sealed class ThumbnailRenderer(Dispatcher dispatcher, Action invalidate, 
             image.StreamSource = stream;
             image.EndInit();
             image.Freeze();
-            _cache[path] = image;
-            _lru.Enqueue(path);
-            Trim();
+            _imageCache[path] = image;
+            _imageLru.Enqueue(path);
+            TrimImages();
             _ = dispatcher.BeginInvoke(invalidate, DispatcherPriority.Render);
         }
         catch { }
-        finally { _pending.TryRemove(path, out _); }
+        finally { _pendingImages.TryRemove(path, out _); }
     }
 
-    private void Trim()
+    private void TrimImages()
     {
-        while (_cache.Count > cacheLimit && _lru.TryDequeue(out var oldest)) _cache.TryRemove(oldest, out _);
+        while (_imageCache.Count > cacheLimit && _imageLru.TryDequeue(out var oldest))
+            _imageCache.TryRemove(oldest, out _);
+    }
+
+    private void TrimRequests()
+    {
+        var limit = Math.Max(64, cacheLimit * 2);
+        while (_resolved.Count > limit && _requestLru.TryDequeue(out var oldest))
+        {
+            if (_resolved.TryRemove(oldest, out var path)) _imageCache.TryRemove(path, out _);
+            _failedUntil.TryRemove(oldest, out _);
+        }
+    }
+
+    public void Dispose()
+    {
+        var cancellation = Interlocked.Exchange(ref _viewportCancellation, new CancellationTokenSource());
+        cancellation.Cancel();
+        cancellation.Dispose();
+        _viewportCancellation.Dispose();
     }
 }
 
-public readonly record struct ThumbnailTile(Rect Bounds, int FrameIndex);
+public readonly record struct ThumbnailTile(Rect Bounds, double SourceTimeSeconds);
+internal readonly record struct ThumbnailRequestKey(Guid SourceId, long SourceTicks);

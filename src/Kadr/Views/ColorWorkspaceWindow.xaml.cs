@@ -20,12 +20,7 @@ public partial class ColorWorkspaceWindow : Window
 
     public void FollowSelection()
     {
-        var selected = _viewModel.SelectedClip;
-        _editingClip = selected?.Track == TrackKind.Visual
-            ? selected
-            : selected?.LinkGroupId is Guid groupId
-                ? _viewModel.Project.Clips.FirstOrDefault(clip => clip.Track == TrackKind.Visual && clip.LinkGroupId == groupId)
-                : null;
+        _editingClip = _viewModel.CreateSelectedClipDraft(TrackKind.Visual);
         WorkspaceRoot.DataContext = _editingClip;
         SelectedClipNameTextBlock.Text = _editingClip is null
             ? "Выберите видеоклип или связанный звук на таймлайне"
@@ -34,23 +29,23 @@ public partial class ColorWorkspaceWindow : Window
         SelectedClipNameTextBlock.IsEnabled = true;
     }
 
-    private void Edit_Begin(object sender, RoutedEventArgs e)
-    {
-        if (_editingClip is not null) _viewModel.BeginEdit();
-    }
-
     private void Edit_End(object sender, RoutedEventArgs e)
-        => _viewModel.CommitEdit("Цветокоррекция изменена");
+        => CommitDraft("Цветокоррекция изменена");
 
     private void Reset_Click(object sender, RoutedEventArgs e)
     {
         if (_editingClip is null) return;
-        _viewModel.BeginEdit();
         _editingClip.Brightness = 0;
         _editingClip.Contrast = 1;
         _editingClip.Saturation = 1;
         _editingClip.Temperature = 0;
-        _viewModel.CommitEdit("Цветокоррекция сброшена");
+        CommitDraft("Цветокоррекция сброшена");
+    }
+
+    private void CommitDraft(string description)
+    {
+        if (_editingClip is null) return;
+        _viewModel.CommitClipDraft(_editingClip, description);
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)

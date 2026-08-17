@@ -9,7 +9,7 @@ namespace KadrStudio.Controls;
 /// </summary>
 public sealed class TimelineReadModel
 {
-    private TimelineReadModel(EditorProject source)
+    private TimelineReadModel(ProjectViewState source)
     {
         FrameRateValue = source.FrameRateValue;
         InPoint = source.InPoint;
@@ -44,7 +44,6 @@ public sealed class TimelineReadModel
             AudioCodec = item.AudioCodec,
             FileSizeBytes = item.FileSizeBytes,
             ThumbnailPath = item.ThumbnailPath,
-            TimelineFramePaths = item.TimelineFramePaths.ToArray(),
             Waveform = item.Waveform,
             IsMissing = item.IsMissing
         }).ToArray();
@@ -73,7 +72,7 @@ public sealed class TimelineReadModel
             .ThenBy(item => item.Id)
             .ToArray();
 
-    public static TimelineReadModel From(EditorProject source)
+    public static TimelineReadModel From(ProjectViewState source)
         => new(source ?? throw new ArgumentNullException(nameof(source)));
 
     private int RequiredTrackCount(Models.TrackKind kind)

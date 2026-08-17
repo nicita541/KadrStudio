@@ -9,7 +9,6 @@ public sealed class MediaAsset : ObservableObject
 {
     private string _path = string.Empty;
     private string? _thumbnailPath;
-    private IReadOnlyList<string> _timelineFramePaths = Array.Empty<string>();
     private WaveformPyramid _waveform = WaveformPyramid.Empty;
     private bool _isMissing;
 
@@ -39,13 +38,6 @@ public sealed class MediaAsset : ObservableObject
     {
         get => _thumbnailPath;
         set => SetProperty(ref _thumbnailPath, value);
-    }
-
-    [JsonIgnore]
-    public IReadOnlyList<string> TimelineFramePaths
-    {
-        get => _timelineFramePaths;
-        set => SetProperty(ref _timelineFramePaths, value ?? Array.Empty<string>());
     }
 
     [JsonIgnore]

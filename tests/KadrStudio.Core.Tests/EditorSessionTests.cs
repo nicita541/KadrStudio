@@ -126,6 +126,30 @@ public sealed class EditorSessionTests
     }
 
     [Fact]
+    public void Track_properties_are_command_driven_undoable_and_invalidate_only_their_pipeline()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+        var updated = fixture.AudioTrack with
+        {
+            Name = "Dialogue",
+            IsMuted = true,
+            IsLocked = true,
+            IsVisible = false
+        };
+
+        var result = session.Execute(new EditTransaction(
+            "audio track properties", new UpdateTrackCommand(updated)));
+
+        Assert.Equal(updated, session.State.FindTrack(updated.Id));
+        Assert.True(result.Changes.InvalidatesAudio);
+        Assert.False(result.Changes.InvalidatesVideo);
+        Assert.False(result.Changes.InvalidatesOverlay);
+        Assert.True(session.Undo());
+        Assert.Equal(fixture.AudioTrack, session.State.FindTrack(updated.Id));
+    }
+
+    [Fact]
     public void Text_edit_invalidates_overlay_without_restarting_media_pipelines()
     {
         var fixture = CreateLinkedProject();
@@ -248,6 +272,31 @@ public sealed class EditorSessionTests
 
         Assert.Equal(fixture.Project, session.State);
         Assert.False(session.CanUndo);
+        Assert.False(session.CanRedo);
+    }
+
+    [Fact]
+    public void Five_hundred_edits_undo_and_redo_keep_a_single_valid_project_history()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+        for (var index = 0; index < 500; index++)
+        {
+            var current = session.State.FindMediaClip(fixture.AudioClip.Id)!;
+            var changed = current with
+            {
+                Audio = current.Audio! with { Volume = (index + 1) / 501d }
+            };
+            var result = session.Execute(new EditTransaction(
+                $"gain {index}", new UpsertMediaClipCommand(changed)));
+            Assert.True(result.Changes.InvalidatesAudio);
+            Assert.False(result.Changes.InvalidatesVideo);
+        }
+
+        for (var index = 0; index < 500; index++) Assert.True(session.Undo());
+        Assert.Equal(fixture.Project, session.State);
+        for (var index = 0; index < 500; index++) Assert.True(session.Redo());
+        Assert.Equal(500, session.State.Revision - fixture.Project.Revision);
         Assert.False(session.CanRedo);
     }
 

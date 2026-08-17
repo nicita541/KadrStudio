@@ -62,11 +62,18 @@ public sealed class TimelineControl : FrameworkElement
     public event EventHandler<TimelineEditRequestedEventArgs>? EditRequested;
     public event EventHandler<AssetDroppedEventArgs>? AssetDropped;
 
-    public EditorProject? Project
+    public Func<Guid, TimelineTime, CancellationToken, Task<string?>>? ThumbnailRequest
+    {
+        get => _thumbnailRenderer.Request;
+        set => _thumbnailRenderer.Request = value;
+    }
+
+    public ProjectViewState? Project
     {
         set
         {
             _document = value is null ? null : TimelineReadModel.From(value);
+            _thumbnailRenderer.BeginViewportGeneration();
             InvalidateMeasure();
             InvalidateVisual();
         }
@@ -131,8 +138,28 @@ public sealed class TimelineControl : FrameworkElement
         }
     }
 
-    public double HorizontalViewportOffset { get; set; }
-    public double HorizontalViewportWidth { get; set; }
+    private double _horizontalViewportOffset;
+    private double _horizontalViewportWidth;
+    public double HorizontalViewportOffset
+    {
+        get => _horizontalViewportOffset;
+        set
+        {
+            if (Math.Abs(_horizontalViewportOffset - value) < 0.1) return;
+            _horizontalViewportOffset = value;
+            _thumbnailRenderer.BeginViewportGeneration();
+        }
+    }
+    public double HorizontalViewportWidth
+    {
+        get => _horizontalViewportWidth;
+        set
+        {
+            if (Math.Abs(_horizontalViewportWidth - value) < 0.1) return;
+            _horizontalViewportWidth = value;
+            _thumbnailRenderer.BeginViewportGeneration();
+        }
+    }
     public double VerticalViewportOffset { get; set; }
     public double VerticalViewportHeight { get; set; }
     private TimelineViewport Viewport => new(PixelsPerSecond, HorizontalViewportOffset, HorizontalViewportWidth, LeftGutterWidth);
@@ -732,7 +759,7 @@ public sealed class TimelineControl : FrameworkElement
 
     private void DrawVideoFrames(DrawingContext context, TimelineClip clip, MediaAsset? asset, Rect rectangle)
     {
-        if (asset is null || asset.TimelineFramePaths.Count == 0)
+        if (asset is null)
         {
             return;
         }
@@ -740,6 +767,12 @@ public sealed class TimelineControl : FrameworkElement
         var visible = GetVisibleContentRectangle(rectangle, 1);
         if (visible.IsEmpty) return;
         _thumbnailRenderer.Draw(context, clip, asset, rectangle, visible);
+    }
+
+    protected override void OnVisualParentChanged(DependencyObject oldParent)
+    {
+        base.OnVisualParentChanged(oldParent);
+        if (VisualParent is null) _thumbnailRenderer.BeginViewportGeneration();
     }
 
     private void DrawClipAnalysisOverlays(DrawingContext context, TimelineClip clip, Rect rectangle, double dpi)

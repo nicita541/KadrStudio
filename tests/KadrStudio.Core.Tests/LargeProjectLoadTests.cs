@@ -12,7 +12,7 @@ public sealed class LargeProjectLoadTests
     private static readonly TimelineTime FourHours = TimelineTime.FromSeconds(4 * 60 * 60);
 
     [Fact]
-    public async Task Four_hour_project_with_thousands_of_clips_survives_full_pipeline()
+    public async Task Four_hour_eighteen_track_project_with_ten_thousand_clips_survives_full_pipeline()
     {
         var project = CreateLargeProject();
         var stopwatch = Stopwatch.StartNew();
@@ -26,8 +26,8 @@ public sealed class LargeProjectLoadTests
         var plan = new RenderPlanBuilder().Build(project);
         var renderPlanElapsed = stopwatch.Elapsed;
         Assert.Equal(FourHours, project.Duration);
-        Assert.Equal(1_920, plan.VisualLayers.Length);
-        Assert.Equal(1_920, plan.AudioLayers.Length);
+        Assert.Equal(5_000, plan.VisualLayers.Length);
+        Assert.Equal(5_000, plan.AudioLayers.Length);
         Assert.Equal(240, plan.TextLayers.Length);
         Assert.True(renderPlanElapsed < TimeSpan.FromSeconds(5), $"Render plan took {renderPlanElapsed}.");
 
@@ -63,15 +63,16 @@ public sealed class LargeProjectLoadTests
         var source = new MediaSource(
             Guid.NewGuid(), "F:\\media\\four-hours.mkv", "four-hours.mkv", MediaKind.Video,
             FourHours, true, 3840, 2160, FrameRate.Fps23976, "hevc", "aac", 32_000_000_000, 123, "load-test");
-        var mediaClips = ImmutableArray.CreateBuilder<MediaClip>(3_840);
-        var oneMinute = TimelineTime.FromSeconds(60);
+        const int clipsPerTrack = 625;
+        var mediaClips = ImmutableArray.CreateBuilder<MediaClip>(10_000);
+        var clipDuration = new TimelineTime(FourHours.Ticks / clipsPerTrack);
         foreach (var track in tracks.Where(item => item.Kind is TrackKind.Visual or TrackKind.Audio))
         {
-            for (var minute = 0; minute < 240; minute++)
+            for (var clipIndex = 0; clipIndex < clipsPerTrack; clipIndex++)
             {
-                var position = TimelineTime.FromSeconds(minute * 60);
+                var position = new TimelineTime(clipDuration.Ticks * clipIndex);
                 mediaClips.Add(new MediaClip(
-                    Guid.NewGuid(), source.Id, track.Id, position, position, oneMinute,
+                    Guid.NewGuid(), source.Id, track.Id, position, position, clipDuration,
                     Video: track.Kind == TrackKind.Visual ? new VideoParameters() : null,
                     Audio: track.Kind == TrackKind.Audio ? new AudioParameters() : null));
             }

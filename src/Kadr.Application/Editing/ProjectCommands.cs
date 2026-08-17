@@ -5,13 +5,14 @@ using KadrStudio.Application.Media;
 
 namespace KadrStudio.Application.Editing;
 
-/// <summary>
-/// Adapter command for UI migrations: the mutable view is mapped back to a full
-/// immutable candidate and the editor session validates it before committing.
-/// </summary>
-public sealed record ReplaceProjectStateCommand(ProjectState Candidate, string Description) : IEditCommand
+public sealed record RestoreProjectCommand(ProjectState Snapshot, string Description) : IEditCommand
 {
-    public ProjectState Apply(ProjectState project) => Candidate;
+    public ProjectState Apply(ProjectState project)
+    {
+        if (Snapshot.Id != project.Id)
+            throw new EditRejectedException("Нельзя восстановить снимок другого проекта.");
+        return Snapshot;
+    }
 }
 
 public sealed record EditBatchCommand(string Description, IReadOnlyList<IEditCommand> Commands) : IEditCommand
@@ -81,11 +82,59 @@ public sealed record AddTrackCommand(TimelineTrack Track) : IEditCommand
         => project with { Tracks = project.Tracks.Add(Track) };
 }
 
+public sealed record UpdateTrackCommand(TimelineTrack Track) : IEditCommand
+{
+    public string Description => "Изменить дорожку";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var current = project.FindTrack(Track.Id)
+            ?? throw new EditRejectedException($"Дорожка {Track.Id} не найдена.");
+        if (current.Kind != Track.Kind || current.Index != Track.Index)
+            throw new EditRejectedException("Тип и индекс дорожки нельзя изменить через свойства дорожки.");
+        var normalized = Track with
+        {
+            Name = string.IsNullOrWhiteSpace(Track.Name) ? current.Name : Track.Name.Trim()
+        };
+        return project with
+        {
+            Tracks = project.Tracks
+                .Select(item => item.Id == normalized.Id ? normalized : item)
+                .ToImmutableArray()
+        };
+    }
+}
+
 public sealed record AddMediaClipsCommand(IReadOnlyList<MediaClip> Clips) : IEditCommand
 {
     public string Description => "Добавить клипы";
     public ProjectState Apply(ProjectState project)
         => project with { MediaClips = project.MediaClips.AddRange(Clips) };
+}
+
+public sealed record UpsertMediaClipCommand(MediaClip Clip) : IEditCommand
+{
+    public string Description => "Изменить клип";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var current = RequireClip(project, Clip.Id);
+        if (current.SourceId != Clip.SourceId)
+            throw new EditRejectedException("Команда изменения клипа не может заменить его исходник.");
+        if (project.FindTrack(Clip.TrackId) is null)
+            throw new EditRejectedException("Дорожка изменяемого клипа не найдена.");
+        var geometryChanged = current.TrackId != Clip.TrackId || current.Start != Clip.Start ||
+                              current.SourceIn != Clip.SourceIn || current.Duration != Clip.Duration;
+        return project with
+        {
+            MediaClips = project.MediaClips
+                .Select(item => item.Id == Clip.Id ? Clip : item)
+                .ToImmutableArray(),
+            Transitions = geometryChanged
+                ? RemoveTransitionsForClips(project.Transitions, new HashSet<Guid> { Clip.Id })
+                : project.Transitions
+        };
+    }
 }
 
 public sealed record EnsureTrackAndAddMediaClipsCommand(

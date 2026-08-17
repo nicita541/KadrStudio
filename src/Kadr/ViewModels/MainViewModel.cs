@@ -1,5 +1,4 @@
 using System.Collections.ObjectModel;
-using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows.Data;
 using KadrStudio.Adapters;
@@ -17,22 +16,18 @@ namespace KadrStudio.ViewModels;
 
 public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 {
-    private readonly FfmpegLocator _ffmpegLocator = new();
-    private readonly ProcessRunner _processRunner = new();
     private readonly TimelineRenderCoordinator _renderCoordinator;
     private readonly KadrStudio.Infrastructure.Jobs.BackgroundJobScheduler _automationScheduler;
-    private readonly ProjectService _projectService = new();
-    private readonly EditorProjectMapper _projectMapper = new();
+    private readonly ProjectService _projectService;
+    private readonly ProjectViewMapper _projectMapper = new();
     private readonly AutomationProposalApplier _automationProposalApplier = new();
     private readonly AutomationProposalValidator _automationProposalValidator = new();
     private readonly IMediaRegistry _mediaRegistry;
     private readonly IArtifactStore _artifactStore;
     private EditorSession _editorSession;
-    private readonly List<TimelineClip> _subscribedClips = new();
-    private readonly List<TextOverlay> _subscribedTextOverlays = new();
     private CancellationTokenSource? _autosaveCancellation;
     private string _pendingAutosaveReason = "Изменение проекта";
-    private EditorProject _project;
+    private ProjectViewState _project;
     private ICollectionView _mediaView = null!;
     private TimelineClip? _selectedClip;
     private MediaAsset? _selectedAsset;
@@ -41,7 +36,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool _isBusy;
     private bool _isDirty;
     private double _playhead;
-    private bool _editTransactionActive;
     private KadrStudio.Core.Domain.ProjectState? _editReviewSnapshot;
     private string? _editReviewReason;
     private Guid? _editReviewSelectedClipId;
@@ -51,24 +45,29 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private long _timelinePresentationRevision;
     private int _disposeState;
 
-    public MainViewModel()
+    public MainViewModel() : this(EditorWorkspaceCompositionRoot.Create())
     {
-        _project = EditorProject.CreateNew();
-        _editorSession = new EditorSession(_projectMapper.ToCore(_project));
-        _artifactStore = new DiskMediaArtifactCache(new ArtifactStoreOptions(
-            ThumbnailService.DefaultArtifactRoot(), 8L * 1024 * 1024 * 1024));
-        MediaProbeService = new MediaProbeService(_ffmpegLocator, _processRunner);
-        _mediaRegistry = new MediaRegistry(MediaProbeService);
-        ThumbnailService = new ThumbnailService(_ffmpegLocator, _processRunner, _artifactStore);
-        _renderCoordinator = new TimelineRenderCoordinator(_ffmpegLocator);
-        TimelineMediaCacheService = new TimelineMediaCacheService(
-            _ffmpegLocator, _processRunner, artifacts: _artifactStore);
-        ExportService = new ExportService(_ffmpegLocator, _processRunner, _renderCoordinator);
-        ProjectHistoryService = new ProjectHistoryService();
-        AutoSubtitleService = new AutoSubtitleService(_ffmpegLocator, _processRunner);
-        VideoAnalysisService = new VideoAnalysisService(_ffmpegLocator, _processRunner);
-        OllamaVideoAnalysisService = new OllamaVideoAnalysisService(_ffmpegLocator, _processRunner);
-        _automationScheduler = new KadrStudio.Infrastructure.Jobs.BackgroundJobScheduler();
+    }
+
+    public MainViewModel(EditorWorkspaceServices services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        var initialState = KadrStudio.Core.Domain.ProjectState.CreateNew();
+        _project = _projectMapper.ToUi(initialState);
+        _editorSession = new EditorSession(initialState);
+        _projectService = services.ProjectService;
+        _artifactStore = services.ArtifactStore;
+        _mediaRegistry = services.MediaRegistry;
+        MediaProbeService = services.MediaProbeService;
+        ThumbnailService = services.ThumbnailService;
+        _renderCoordinator = services.RenderCoordinator;
+        TimelineMediaCacheService = services.TimelineMediaCacheService;
+        ExportService = services.ExportService;
+        ProjectHistoryService = services.ProjectHistoryService;
+        AutoSubtitleService = services.AutoSubtitleService;
+        VideoAnalysisService = services.VideoAnalysisService;
+        OllamaVideoAnalysisService = services.OllamaVideoAnalysisService;
+        _automationScheduler = services.AutomationScheduler;
         AutomationOrchestrator = new AutomationOrchestrator(
             _automationScheduler, VideoAnalysisService, OllamaVideoAnalysisService, AutoSubtitleService);
         AttachProject(_project);
@@ -86,9 +85,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public OllamaVideoAnalysisService OllamaVideoAnalysisService { get; }
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public IArtifactStore ArtifactStore => _artifactStore;
+    public KadrStudio.Core.Domain.ProjectState CoreState => _editorSession.State;
     public long TimelinePresentationRevision => _timelinePresentationRevision;
 
-    public EditorProject Project
+    public ProjectViewState Project
     {
         get => _project;
         private set
@@ -98,18 +98,30 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
 
-            DetachProject(_project);
             _project = value;
             AttachProject(_project);
             BuildMediaView();
             OnPropertyChanged();
+            OnPropertyChanged(nameof(ProjectName));
             OnPropertyChanged(nameof(ProjectTitle));
             OnPropertyChanged(nameof(TimelineDurationLabel));
             OnPropertyChanged(nameof(CanExport));
+            OnPropertyChanged(nameof(CoreState));
         }
     }
 
     public ICollectionView MediaView => _mediaView;
+
+    public string ProjectName
+    {
+        get => _editorSession.State.Name;
+        set
+        {
+            var normalized = string.IsNullOrWhiteSpace(value) ? "Новый проект" : value.Trim();
+            if (string.Equals(_editorSession.State.Name, normalized, StringComparison.Ordinal)) return;
+            ExecuteCoreCommand("Проект переименован", new RenameProjectCommand(normalized));
+        }
+    }
 
     public TimelineClip? SelectedClip
     {
@@ -185,7 +197,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    public string ProjectTitle => $"{Project.Name}{(IsDirty ? " •" : string.Empty)}";
+    public string ProjectTitle => $"{ProjectName}{(IsDirty ? " •" : string.Empty)}";
 
     public double Playhead
     {
@@ -231,10 +243,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 _editorSession.State,
                 string.Join("; ", validation.Errors.Select(item => item.Message)));
         }
-        var checkpointSnapshot = _projectService.CreateSnapshot(Project);
         if (proposal.CreateCheckpoint)
             await ProjectHistoryService.CreateCheckpointAsync(
-                Project, $"Before: {proposal.Title}", checkpointSnapshot, cancellationToken);
+                _editorSession.State, Project.FilePath, $"Before: {proposal.Title}",
+                _editorSession.State, cancellationToken);
         var result = _automationProposalApplier.Apply(_editorSession, proposal);
         if (!result.Applied) return result;
         _suppressDirtyTracking = true;
@@ -349,6 +361,23 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
+    public bool RegisterImportedMedia(MediaAsset asset)
+    {
+        ArgumentNullException.ThrowIfNull(asset);
+        if (_editorSession.State.Sources.ContainsKey(asset.Id)) return false;
+        var result = _editorSession.Execute(new EditTransaction(
+            "Импорт медиа", new AddSourcesCommand([_projectMapper.ToCoreSource(asset)])));
+        if (!result.Changed) return false;
+        RestoreFromCoreState(result.State, autosaveReason: "Импорт медиа");
+        var restored = Project.FindAsset(asset.Id);
+        if (restored is not null)
+        {
+            restored.ThumbnailPath = asset.ThumbnailPath;
+            restored.ProbeResult = asset.ProbeResult;
+        }
+        return true;
+    }
+
     public void AddAssetToTimeline(
         Guid assetId,
         double? requestedStart = null,
@@ -402,7 +431,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public void RefreshMediaOnlineState()
     {
-        var online = _editorSession.State.Sources.ToDictionary(pair => pair.Key, pair => File.Exists(pair.Value.Path));
+        var refreshed = _mediaRegistry.RefreshOnlineState(_editorSession.State);
+        var online = refreshed.Sources.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.OnlineState == KadrStudio.Core.Domain.MediaOnlineState.Online);
         ExecuteCoreCommand("Media availability refreshed", new RefreshMediaOnlineStateCommand(online));
     }
 
@@ -472,13 +504,46 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         return changed;
     }
 
-    public void NormalizeSelectedClip()
+    public TimelineClip? CreateSelectedClipDraft(TrackKind requestedTrack)
     {
-        var clip = SelectedClip;
-        if (clip is null)
+        var selected = SelectedClip;
+        if (selected is null) return null;
+        var clip = selected.Track == requestedTrack
+            ? selected
+            : selected.LinkGroupId is Guid groupId
+                ? Project.Clips.FirstOrDefault(item => item.Track == requestedTrack && item.LinkGroupId == groupId)
+                : null;
+        return clip?.Clone();
+    }
+
+    public bool CommitClipDraft(TimelineClip draft, string status)
+    {
+        ArgumentNullException.ThrowIfNull(draft);
+        var current = _editorSession.State.FindMediaClip(draft.Id);
+        if (current is null) return false;
+        NormalizeClipDraft(draft);
+        var video = current.Video is null ? null : new KadrStudio.Core.Domain.VideoParameters(
+            draft.Brightness, draft.Contrast, draft.Saturation, draft.Temperature,
+            draft.PositionX, draft.PositionY, draft.ScaleX, draft.ScaleY, draft.Rotation,
+            draft.CropLeft, draft.CropTop, draft.CropRight, draft.CropBottom, draft.Opacity);
+        var audio = current.Audio is null ? null : new KadrStudio.Core.Domain.AudioParameters(
+            draft.Volume, draft.IsMuted, draft.Pan,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(draft.FadeIn),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(draft.FadeOut),
+            draft.Bass, draft.Mid, draft.Treble);
+        var updated = current with
         {
-            return;
-        }
+            Start = KadrStudio.Core.Domain.TimelineTime.FromSeconds(draft.Start),
+            SourceIn = KadrStudio.Core.Domain.TimelineTime.FromSeconds(draft.SourceStart),
+            Duration = KadrStudio.Core.Domain.TimelineTime.FromSeconds(draft.Duration),
+            Video = video,
+            Audio = audio
+        };
+        return ExecuteCoreCommand(status, new UpsertMediaClipCommand(updated), draft.Id);
+    }
+
+    private void NormalizeClipDraft(TimelineClip clip)
+    {
 
         var asset = Project.FindAsset(clip.AssetId);
         if (asset is null)
@@ -591,9 +656,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         await ProjectHistoryService.CreateCheckpointAsync(
-            Project,
+            _editorSession.State,
+            Project.FilePath,
             $"До ИИ: {_editReviewReason ?? "команда монтажа"}",
-            _projectService.CreateSnapshot(_projectMapper.ToUi(_editReviewSnapshot, Project.FilePath)),
+            _editReviewSnapshot,
             cancellationToken);
         _editReviewSnapshot = null;
         _editReviewReason = null;
@@ -618,7 +684,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
-        _editTransactionActive = false;
         CancelAutosave();
         _suppressDirtyTracking = true;
         try
@@ -648,13 +713,14 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         string message,
         CancellationToken cancellationToken = default)
     {
-        var entry = await ProjectHistoryService.CreateCheckpointAsync(Project, message, cancellationToken: cancellationToken);
+        var entry = await ProjectHistoryService.CreateCheckpointAsync(
+            _editorSession.State, Project.FilePath, message, cancellationToken: cancellationToken);
         StatusText = $"Создана контрольная точка: {entry.Message}";
         return entry;
     }
 
     public Task<IReadOnlyList<ProjectHistoryEntry>> GetHistoryCheckpointsAsync(CancellationToken cancellationToken = default)
-        => ProjectHistoryService.GetCheckpointsAsync(Project, cancellationToken);
+        => ProjectHistoryService.GetCheckpointsAsync(_editorSession.State, Project.FilePath, cancellationToken);
 
     public async Task RestoreHistoryCheckpointAsync(
         ProjectHistoryEntry entry,
@@ -669,16 +735,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             throw new InvalidOperationException("Сначала примите или верните черновик ИИ.");
         }
 
-        var currentSnapshot = _projectService.CreateSnapshot(Project);
         await ProjectHistoryService.CreateCheckpointAsync(
-            Project, $"Авто: перед откатом к «{entry.Message}»", currentSnapshot, cancellationToken);
+            _editorSession.State, Project.FilePath,
+            $"Авто: перед откатом к «{entry.Message}»", _editorSession.State, cancellationToken);
 
         var filePath = Project.FilePath;
-        var restored = await ProjectHistoryService.RestoreCheckpointAsync(entry, filePath, cancellationToken);
-        var restoredCore = _projectMapper.ToCore(restored, _editorSession.State.Revision);
+        var restoredCore = await ProjectHistoryService.RestoreCheckpointAsync(entry, cancellationToken);
         _editorSession.Execute(new EditTransaction(
             $"Restore checkpoint: {entry.Message}",
-            new ReplaceProjectStateCommand(restoredCore, $"Restore checkpoint: {entry.Message}")));
+            new RestoreProjectCommand(restoredCore, $"Restore checkpoint: {entry.Message}")));
         _suppressDirtyTracking = true;
         try
         {
@@ -743,29 +808,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         return maximum;
     }
 
-    public void BeginEdit() => _editTransactionActive = true;
-
-    public void CommitEdit(string status = "Изменения сохранены в проекте")
-    {
-        if (!_editTransactionActive)
-        {
-            return;
-        }
-
-        var candidate = _projectMapper.ToCore(Project, _editorSession.State.Revision);
-        if (candidate != _editorSession.State)
-        {
-            _editorSession.Execute(new EditTransaction(
-                status,
-                new ReplaceProjectStateCommand(candidate, status)));
-            MarkChanged();
-            StatusText = status;
-        }
-
-        _editTransactionActive = false;
-        NotifyHistoryChanged();
-    }
-
     public void Undo()
     {
         if (!_editorSession.Undo())
@@ -792,15 +834,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         CancelAutosave();
         await _projectService.DeleteAutosaveAsync(cancellationToken);
-        _editTransactionActive = false;
         _editReviewSnapshot = null;
         _editReviewReason = null;
         _editReviewSelectedClipId = null;
         SelectedClip = null;
         SelectedAsset = null;
         Playhead = 0;
-        Project = EditorProject.CreateNew();
-        _editorSession = new EditorSession(_projectMapper.ToCore(Project));
+        var state = KadrStudio.Core.Domain.ProjectState.CreateNew();
+        _editorSession = new EditorSession(state);
+        Project = _projectMapper.ToUi(state);
         IsDirty = false;
         StatusText = "Создан новый проект";
         NotifyHistoryChanged();
@@ -814,15 +856,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             CancelAutosave();
             await _projectService.DeleteAutosaveAsync(cancellationToken);
             var project = await _projectService.OpenAsync(path, cancellationToken);
-            _editTransactionActive = false;
             _editReviewSnapshot = null;
             _editReviewReason = null;
             _editReviewSelectedClipId = null;
             SelectedClip = null;
             SelectedAsset = null;
             Playhead = 0;
-            Project = project;
-            var refreshed = _mediaRegistry.RefreshOnlineState(_projectMapper.ToCore(Project));
+            var refreshed = _mediaRegistry.RefreshOnlineState(project);
             _editorSession = new EditorSession(refreshed);
             Project = _projectMapper.ToUi(refreshed, path);
             IsDirty = false;
@@ -841,8 +881,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             CancelAutosave();
-            await _projectService.SaveAsync(Project, path, cancellationToken);
-            TimelineMediaCacheService.ConfigureProject(Project);
+            await _projectService.SaveAsync(_editorSession.State, path, cancellationToken);
+            Project.FilePath = Path.GetFullPath(path);
             IsDirty = false;
             StatusText = $"Проект сохранён: {Path.GetFileName(path)}";
         }
@@ -866,14 +906,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ? await _projectService.OpenAutosaveAsync(cancellationToken)
             : await _projectService.OpenAutosaveVersionAsync(
                 recovery.ProjectId, recovery.RecoveryId, cancellationToken);
-        _editTransactionActive = false;
         SelectedClip = null;
         SelectedAsset = null;
         Playhead = 0;
-        Project = project;
-        var refreshed = _mediaRegistry.RefreshOnlineState(_projectMapper.ToCore(Project));
+        var refreshed = _mediaRegistry.RefreshOnlineState(project);
         _editorSession = new EditorSession(refreshed);
-        Project = _projectMapper.ToUi(refreshed, project.FilePath);
+        Project = _projectMapper.ToUi(refreshed);
         IsDirty = true;
         StatusText = "Несохранённый проект восстановлен";
         NotifyHistoryChanged();
@@ -889,7 +927,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         => _projectService.DeleteAutosaveVersionAsync(
             recovery.ProjectId, recovery.RecoveryId, cancellationToken);
 
-    public void MarkChanged()
+    private void MarkChanged()
     {
         if (_suppressDirtyTracking)
         {
@@ -897,7 +935,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
 
         IsDirty = true;
-        Project.UpdatedAt = DateTimeOffset.Now;
         OnPropertyChanged(nameof(TimelineDurationLabel));
         OnPropertyChanged(nameof(CanExport));
         ScheduleAutosave();
@@ -916,7 +953,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         await _artifactStore.DisposeAsync();
         _projectService.Dispose();
         OllamaVideoAnalysisService.Dispose();
-        DetachProject(Project);
     }
 
     private void BuildMediaView()
@@ -932,17 +968,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return asset.Name.Contains(SearchText, StringComparison.CurrentCultureIgnoreCase);
         };
         OnPropertyChanged(nameof(MediaView));
-    }
-
-    private void CaptureUndoPoint()
-    {
-        BeginEdit();
-        NotifyHistoryChanged();
-    }
-
-    private void CommitChange(string status)
-    {
-        CommitEdit(status);
     }
 
     private bool ExecuteCoreCommand(string description, IEditCommand command, Guid? selectedClipId = null)
@@ -1103,13 +1128,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         var derivedMedia = Project.Media.ToDictionary(
             asset => asset.Id,
             asset => new DerivedMediaState(
-                asset.ThumbnailPath, asset.TimelineFramePaths, asset.Waveform));
+                asset.ThumbnailPath, asset.Waveform));
         var restored = _projectMapper.ToUi(state, filePath);
         foreach (var asset in restored.Media)
         {
             if (!derivedMedia.TryGetValue(asset.Id, out var derived)) continue;
             asset.ThumbnailPath = derived.ThumbnailPath;
-            asset.TimelineFramePaths = derived.TimelineFrames;
             asset.Waveform = derived.Waveform;
         }
         _suppressDirtyTracking = true;
@@ -1132,23 +1156,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private sealed record DerivedMediaState(
         string? ThumbnailPath,
-        IReadOnlyList<string> TimelineFrames,
         KadrStudio.Application.Caching.WaveformPyramid Waveform);
 
-    private void AttachProject(EditorProject project)
+    private void AttachProject(ProjectViewState project)
     {
-        TimelineMediaCacheService.ConfigureProject(project);
-        project.PropertyChanged += OnProjectPropertyChanged;
-        project.Clips.CollectionChanged += OnClipsCollectionChanged;
-        project.TextOverlays.CollectionChanged += OnTextOverlaysCollectionChanged;
-        foreach (var clip in project.Clips)
-        {
-            SubscribeClip(clip);
-        }
-        foreach (var overlay in project.TextOverlays)
-        {
-            SubscribeTextOverlay(overlay);
-        }
         foreach (var asset in project.Media)
         {
             _ = PrepareTimelineMediaAsync(asset);
@@ -1159,11 +1170,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         try
         {
-            await TimelineMediaCacheService.PrepareAsync(asset);
+            if (!_editorSession.State.Sources.TryGetValue(asset.Id, out var source)) return;
+            var derived = await TimelineMediaCacheService.PrepareAsync(source);
+            var current = Project.FindAsset(asset.Id);
+            if (current is null) return;
+            current.Waveform = derived.Waveform;
         }
-        catch
+        catch (Exception exception)
         {
-            // Монтаж остаётся доступным, даже если FFmpeg не смог построить визуальный кэш дорожки.
+            StatusText = $"Визуальный кэш недоступен: {exception.Message}";
         }
         finally
         {
@@ -1172,126 +1187,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    private void DetachProject(EditorProject project)
-    {
-        project.PropertyChanged -= OnProjectPropertyChanged;
-        project.Clips.CollectionChanged -= OnClipsCollectionChanged;
-        project.TextOverlays.CollectionChanged -= OnTextOverlaysCollectionChanged;
-        foreach (var clip in _subscribedClips.ToList())
-        {
-            clip.PropertyChanged -= OnClipPropertyChanged;
-        }
-        _subscribedClips.Clear();
-        foreach (var overlay in _subscribedTextOverlays.ToList())
-        {
-            overlay.PropertyChanged -= OnTextOverlayPropertyChanged;
-        }
-        _subscribedTextOverlays.Clear();
-    }
-
-    private void SubscribeClip(TimelineClip clip)
-    {
-        if (_subscribedClips.Contains(clip))
-        {
-            return;
-        }
-
-        _subscribedClips.Add(clip);
-        clip.PropertyChanged += OnClipPropertyChanged;
-    }
-
-    private void OnClipsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        var visualChanged = false;
-        var audioChanged = false;
-        if (e.OldItems is not null)
-        {
-            foreach (TimelineClip clip in e.OldItems)
-            {
-                visualChanged |= clip.Track == TrackKind.Visual;
-                audioChanged |= clip.Track == TrackKind.Audio;
-                clip.PropertyChanged -= OnClipPropertyChanged;
-                _subscribedClips.Remove(clip);
-            }
-        }
-
-        if (e.NewItems is not null)
-        {
-            foreach (TimelineClip clip in e.NewItems)
-            {
-                visualChanged |= clip.Track == TrackKind.Visual;
-                audioChanged |= clip.Track == TrackKind.Audio;
-                SubscribeClip(clip);
-            }
-        }
-
-        if (visualChanged) Project.InvalidatePreview(TrackKind.Visual);
-        if (audioChanged) Project.InvalidatePreview(TrackKind.Audio);
-
-        OnPropertyChanged(nameof(TimelineDurationLabel));
-        OnPropertyChanged(nameof(CanExport));
-    }
-
-    private void OnClipPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (sender is TimelineClip clip) Project.InvalidatePreview(clip.Track);
-        OnPropertyChanged(nameof(TimelineDurationLabel));
-        if (ReferenceEquals(sender, SelectedClip))
-        {
-            OnPropertyChanged(nameof(SelectedClip));
-            OnPropertyChanged(nameof(SelectedClipTrackLabel));
-        }
-
-        MarkChanged();
-    }
-
-    private void SubscribeTextOverlay(TextOverlay overlay)
-    {
-        if (_subscribedTextOverlays.Contains(overlay))
-        {
-            return;
-        }
-        _subscribedTextOverlays.Add(overlay);
-        overlay.PropertyChanged += OnTextOverlayPropertyChanged;
-    }
-
-    private void OnTextOverlaysCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (e.OldItems is not null)
-        {
-            foreach (TextOverlay overlay in e.OldItems)
-            {
-                overlay.PropertyChanged -= OnTextOverlayPropertyChanged;
-                _subscribedTextOverlays.Remove(overlay);
-            }
-        }
-        if (e.NewItems is not null)
-        {
-            foreach (TextOverlay overlay in e.NewItems)
-            {
-                SubscribeTextOverlay(overlay);
-            }
-        }
-        OnPropertyChanged(nameof(TimelineDurationLabel));
-        MarkChanged();
-    }
-
-    private void OnTextOverlayPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        OnPropertyChanged(nameof(TimelineDurationLabel));
-        MarkChanged();
-    }
-
-    private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName is nameof(EditorProject.CanvasWidth) or nameof(EditorProject.CanvasHeight) or nameof(EditorProject.FrameRate))
-            Project.InvalidatePreview(TrackKind.Visual);
-        if (e.PropertyName == nameof(EditorProject.Name))
-        {
-            OnPropertyChanged(nameof(ProjectTitle));
-            MarkChanged();
-        }
-    }
+    public Task<string?> GetTimelineThumbnailAsync(
+        Guid sourceId,
+        KadrStudio.Core.Domain.TimelineTime sourceTime,
+        CancellationToken cancellationToken)
+        => _editorSession.State.Sources.TryGetValue(sourceId, out var source)
+            ? TimelineMediaCacheService.GetThumbnailAsync(source, sourceTime, cancellationToken)
+            : Task.FromResult<string?>(null);
 
     private void ScheduleAutosave(string? reason = null)
     {
@@ -1314,14 +1216,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(1.5), cancellationToken);
-            await _projectService.SaveAutosaveVersionAsync(Project, _pendingAutosaveReason, cancellationToken);
+            await _projectService.SaveAutosaveVersionAsync(
+                _editorSession.State, _pendingAutosaveReason, cancellationToken);
         }
         catch (OperationCanceledException)
         {
         }
-        catch
+        catch (Exception exception)
         {
-            // Автосохранение не должно прерывать монтаж. Ручное сохранение сообщит об ошибке явно.
+            StatusText = $"Автосохранение не выполнено: {exception.Message}";
         }
     }
 

@@ -1,15 +1,15 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
-using KadrStudio.Models;
+using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Services;
 
 public static partial class EditingCommandPlanner
 {
     public static bool TryCreateDeterministic(
-        EditorProject project,
+        ProjectState project,
         string prompt,
-        TimelineClip? selectedClip,
+        MediaClip? selectedClip,
         out EditCommandPlan plan)
     {
         plan = new EditCommandPlan(string.Empty, Array.Empty<EditCommand>());
@@ -32,15 +32,19 @@ public static partial class EditingCommandPlanner
                 var marker = markers[0];
                 plan = new EditCommandPlan(
                     $"Удалить «{marker.Title}» ({FormatTime(marker.Start)}–{FormatTime(marker.End)}) и сдвинуть последующий монтаж влево.",
-                    [new EditCommand(EditCommandType.DeleteRange, marker.Start, marker.End, marker.Title)]);
+                    [new EditCommand(
+                        EditCommandType.DeleteRange,
+                        marker.Start.TotalSeconds,
+                        marker.End.TotalSeconds,
+                        marker.Title)]);
                 return true;
             }
         }
 
         if (deleteIntent && TryParseRange(query, out var rangeStart, out var rangeEnd))
         {
-            rangeStart = Math.Clamp(rangeStart, 0, project.Duration);
-            rangeEnd = Math.Clamp(rangeEnd, rangeStart, project.Duration);
+            rangeStart = Math.Clamp(rangeStart, 0, project.Duration.TotalSeconds);
+            rangeEnd = Math.Clamp(rangeEnd, rangeStart, project.Duration.TotalSeconds);
             plan = new EditCommandPlan(
                 $"Удалить диапазон {FormatTime(rangeStart)}–{FormatTime(rangeEnd)} на всех дорожках.",
                 [new EditCommand(EditCommandType.DeleteRange, rangeStart, rangeEnd, "Диапазон из запроса")]);
@@ -52,7 +56,10 @@ public static partial class EditingCommandPlanner
             var splitTime = TryParseSingleTime(query, out var parsedTime)
                 ? parsedTime
                 : selectedClip is not null
-                    ? Math.Clamp(selectedClip.Start + selectedClip.Duration / 2, selectedClip.Start, selectedClip.End)
+                    ? Math.Clamp(
+                        selectedClip.Start.TotalSeconds + selectedClip.Duration.TotalSeconds / 2,
+                        selectedClip.Start.TotalSeconds,
+                        selectedClip.End.TotalSeconds)
                     : 0;
             if (splitTime > 0)
             {
@@ -67,7 +74,11 @@ public static partial class EditingCommandPlanner
         {
             plan = new EditCommandPlan(
                 "Удалить выбранный клип.",
-                [new EditCommand(EditCommandType.DeleteSelected, selectedClip.Start, selectedClip.End, "Выбранный клип")]);
+                [new EditCommand(
+                    EditCommandType.DeleteSelected,
+                    selectedClip.Start.TotalSeconds,
+                    selectedClip.End.TotalSeconds,
+                    "Выбранный клип")]);
             return true;
         }
 
@@ -126,6 +137,8 @@ public static partial class EditingCommandPlanner
         seconds = values.Length == 2 ? values[0] * 60 + values[1] : values[0] * 3600 + values[1] * 60 + values[2];
         return true;
     }
+
+    private static string FormatTime(TimelineTime time) => FormatTime(time.TotalSeconds);
 
     private static string FormatTime(double seconds)
         => TimeSpan.FromSeconds(Math.Max(0, seconds)).ToString(seconds >= 3600 ? @"h\:mm\:ss\.f" : @"m\:ss\.f");

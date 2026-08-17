@@ -199,22 +199,36 @@ public sealed class DiskMediaArtifactCache : IArtifactStore
     {
         var destination = Path.GetFullPath(newRoot);
         if (destination.Equals(_root, StringComparison.OrdinalIgnoreCase)) return;
+        if (IsInside(destination, _root) || IsInside(_root, destination))
+            throw new IOException("Artifact cache cannot be moved into itself or one of its parent directories.");
         Directory.CreateDirectory(destination);
         await _diskGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            foreach (var source in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+            var original = _root;
+            foreach (var source in Directory.EnumerateFiles(original, "*", SearchOption.AllDirectories))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var relative = Path.GetRelativePath(_root, source);
+                var relative = Path.GetRelativePath(original, source);
                 var target = Path.Combine(destination, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                 File.Copy(source, target, overwrite: true);
+                if (new FileInfo(source).Length != new FileInfo(target).Length)
+                    throw new IOException($"Artifact cache copy verification failed for {relative}.");
             }
+            Directory.Delete(original, recursive: true);
             _root = destination;
             _options = _options with { Root = destination };
         }
         finally { _diskGate.Release(); }
+    }
+
+    public async Task SetDiskBudgetAsync(long diskBudgetBytes, CancellationToken cancellationToken = default)
+    {
+        if (diskBudgetBytes < 1024 * 1024)
+            throw new ArgumentOutOfRangeException(nameof(diskBudgetBytes));
+        _options = _options with { DiskBudgetBytes = diskBudgetBytes };
+        await TrimAsync(diskBudgetBytes, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task ClearAsync(CancellationToken cancellationToken = default)
@@ -330,6 +344,17 @@ public sealed class DiskMediaArtifactCache : IArtifactStore
         if (!fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Cache path escaped the configured root.");
         return fullPath;
+    }
+
+    private static bool IsInside(string candidate, string parent)
+    {
+        var fullCandidate = Path.GetFullPath(candidate)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var fullParent = Path.GetFullPath(parent)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return fullCandidate.StartsWith(
+            fullParent + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private IEnumerable<FileInfo> EnumerateArtifacts()

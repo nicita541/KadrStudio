@@ -13,13 +13,13 @@
             <TextBlock x:Name="SelectedClipNameTextBlock" Text="Выберите видеоклип" Foreground="{StaticResource AccentBrush}" TextWrapping="Wrap" Margin="0,5,0,20" />
 
             <TextBlock Text="Яркость" />
-            <Slider Minimum="-1" Maximum="1" Value="{Binding Brightness}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
+            <Slider Minimum="-1" Maximum="1" Value="{Binding Brightness}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
             <TextBlock Text="Контраст" />
-            <Slider Minimum="0" Maximum="3" Value="{Binding Contrast}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
+            <Slider Minimum="0" Maximum="3" Value="{Binding Contrast}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
             <TextBlock Text="Насыщенность" />
-            <Slider Minimum="0" Maximum="3" Value="{Binding Saturation}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
+            <Slider Minimum="0" Maximum="3" Value="{Binding Saturation}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,16" />
             <Grid Margin="0,0,0,5"><TextBlock Text="Температура"/><TextBlock Text="холоднее" HorizontalAlignment="Center" Foreground="#93C5FD" FontSize="10"/><TextBlock Text="теплее" HorizontalAlignment="Right" Foreground="#FBBF24" FontSize="10"/></Grid>
-            <Slider Minimum="-1" Maximum="1" Value="{Binding Temperature}" PreviewMouseLeftButtonDown="Edit_Begin" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,22" />
+            <Slider Minimum="-1" Maximum="1" Value="{Binding Temperature}" PreviewMouseLeftButtonUp="Edit_End" Margin="0,5,0,22" />
 
             <Button Style="{StaticResource ButtonBase}" Click="Reset_Click" Content="Сбросить цветокоррекцию" Padding="12,8" />
             <TextBlock Text="Коррекция применяется к выбранному видеоклипу при экспорте."

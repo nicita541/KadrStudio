@@ -27,6 +27,8 @@
     <ProjectReference Include="..\Kadr.Application\KadrStudio.Application.csproj" />
     <ProjectReference Include="..\Kadr.Core\KadrStudio.Core.csproj" />
     <ProjectReference Include="..\Kadr.Infrastructure\KadrStudio.Infrastructure.csproj" />
+    <ProjectReference Include="..\Kadr.MediaHost\KadrStudio.MediaHost.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
@@ -52,13 +54,7 @@
     </Content>
   </ItemGroup>
 
-  <Target Name="BuildMediaHost" BeforeTargets="Build">
-    <MSBuild Projects="..\Kadr.MediaHost\KadrStudio.MediaHost.csproj"
-             Targets="Build"
-             Properties="Configuration=$(Configuration);RuntimeIdentifier=win-x64" />
-  </Target>
-
-  <Target Name="CopyMediaHost" AfterTargets="Build" DependsOnTargets="BuildMediaHost">
+  <Target Name="CopyMediaHost" AfterTargets="Build">
     <ItemGroup>
       <MediaHostFiles Include="..\Kadr.MediaHost\bin\$(Configuration)\net10.0-windows\win-x64\Kadr.MediaHost.*" />
     </ItemGroup>

@@ -1,6 +1,4 @@
 using KadrStudio.Application.Rendering;
-using KadrStudio.Adapters;
-using KadrStudio.Models;
 using KadrStudio.Playback;
 using KadrStudio.Services;
 using KadrStudio.Application.Media;
@@ -8,8 +6,6 @@ using KadrStudio.Core.Domain;
 using KadrStudio.Infrastructure.Jobs;
 using KadrStudio.Infrastructure.Rendering;
 using System.Collections.Immutable;
-using UiMediaKind = KadrStudio.Models.MediaKind;
-using UiTrackKind = KadrStudio.Models.TrackKind;
 using Xunit;
 
 namespace KadrStudio.Integration.Tests;
@@ -73,7 +69,8 @@ public sealed class MediaPipelineIntegrationTests
             Assert.Equal(0, create.ExitCode);
 
             await using var coordinator = new TimelineRenderCoordinator(locator);
-            await coordinator.RenderAsync(coordinator.CreatePlan(CreateAvProject(source, root)),
+            await coordinator.RenderAsync(coordinator.CreatePlan(
+                    CreateAvProject(source)),
                 new RenderOutputOptions(RenderPurpose.Export, output, 320, 180, VideoQuality: 24));
 
             var probe = await new ProcessRunner().RunAsync(locator.FfprobePath,
@@ -105,12 +102,12 @@ public sealed class MediaPipelineIntegrationTests
                 "-c:a", "aac", source
             ]);
             Assert.Equal(0, create.ExitCode);
-            var project = CreateAvProject(source, root);
+            var project = CreateAvProject(source);
             await using var scheduler = new BackgroundJobScheduler();
             var engine = new FfmpegRenderEngine(
                 locator.FfmpegPath, new FailingNvencCommandBuilder(), scheduler);
 
-            await engine.RenderAsync(new RenderPlanBuilder().Build(new EditorProjectMapper().ToCore(project)),
+            await engine.RenderAsync(new RenderPlanBuilder().Build(project),
                 new RenderOutputOptions(
                     RenderPurpose.Export, output, 160, 90, VideoQuality: 30, UseHardwareEncoding: true));
 
@@ -141,13 +138,13 @@ public sealed class MediaPipelineIntegrationTests
                 "-c:a", "aac", source
             ]);
             Assert.Equal(0, create.ExitCode);
-            var project = CreateAvProject(source, root);
+            var coreProject = CreateAvProject(source);
             await using var coordinator = new TimelineRenderCoordinator(locator);
-            var originalPlan = coordinator.CreatePlan(project);
+            var originalPlan = coordinator.CreatePlan(coreProject);
             string proxyPath;
             await using (var proxies = new PreviewProxyStore(locator))
             {
-                await proxies.PrepareAsync(project);
+                await proxies.PrepareAsync(coreProject);
                 var proxied = proxies.UseAvailable(originalPlan);
                 proxyPath = proxied.VisualLayers.Single().SourcePath;
                 Assert.NotEqual(source, proxyPath);
@@ -164,7 +161,7 @@ public sealed class MediaPipelineIntegrationTests
             await File.WriteAllBytesAsync(proxyPath, [1, 2, 3, 4]);
             await using (var reopened = new PreviewProxyStore(locator))
             {
-                await reopened.PrepareAsync(project);
+                await reopened.PrepareAsync(coreProject);
                 Assert.True(new FileInfo(reopened.UseAvailable(originalPlan).VisualLayers.Single().SourcePath).Length > 1024);
             }
         }
@@ -190,14 +187,68 @@ public sealed class MediaPipelineIntegrationTests
             var asset = await new MediaProbeService(locator, new ProcessRunner()).ProbeAsync(source);
             await using var timelineCache = new TimelineMediaCacheService(
                 locator, new ProcessRunner(), Path.Combine(root, "timeline-cache"));
-            await timelineCache.PrepareAsync(asset);
+            var sourceInfo = new MediaSource(
+                asset.Id, asset.Path, asset.Name, KadrStudio.Core.Domain.MediaKind.Audio,
+                TimelineTime.FromSeconds(asset.Duration), true,
+                AudioCodec: asset.AudioCodec,
+                FileSize: asset.FileSizeBytes,
+                Fingerprint: asset.ProbeResult!.Fingerprint.FastHash,
+                FastFingerprint: asset.ProbeResult.Fingerprint.FastHash,
+                VerifiedFingerprint: asset.ProbeResult.Fingerprint.VerifiedHash ?? string.Empty,
+                Streams: asset.ProbeResult.Streams);
+            var derived = await timelineCache.PrepareAsync(sourceInfo);
 
-            Assert.False(asset.Waveform.IsEmpty);
-            var basePeaks = asset.Waveform.Levels[0].Peaks;
+            Assert.False(derived.Waveform.IsEmpty);
+            var basePeaks = derived.Waveform.Levels[0].Peaks;
             Assert.Contains(basePeaks, peak => peak == default);
             Assert.Contains(basePeaks, peak => peak.MaximumLeft > 0.7f && peak.MaximumRight == 0);
             Assert.Contains(basePeaks, peak => peak.MaximumRight > 0.3f);
-            Assert.Equal(800, asset.Waveform.ReadColumns(0, 1, 800).Length);
+            Assert.Equal(800, derived.Waveform.ReadColumns(0, 1, 800).Length);
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task Timeline_thumbnails_are_materialized_on_demand_at_distinct_frame_times()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var path = Path.Combine(root, "moving.mp4");
+            var create = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                "testsrc2=s=320x180:r=30:d=2", "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p", path
+            ]);
+            Assert.Equal(0, create.ExitCode);
+            var probed = await new MediaProbeService(locator, new ProcessRunner()).ProbeAsync(path);
+            var source = new MediaSource(
+                probed.Id, probed.Path, probed.Name, KadrStudio.Core.Domain.MediaKind.Video,
+                TimelineTime.FromSeconds(probed.Duration), false,
+                probed.Width, probed.Height, probed.ProbeResult!.FrameRate,
+                probed.VideoCodec, FileSize: probed.FileSizeBytes,
+                Fingerprint: probed.ProbeResult.Fingerprint.FastHash,
+                FastFingerprint: probed.ProbeResult.Fingerprint.FastHash,
+                VerifiedFingerprint: probed.ProbeResult.Fingerprint.VerifiedHash ?? string.Empty,
+                Streams: probed.ProbeResult.Streams);
+            await using var cache = new TimelineMediaCacheService(
+                locator, new ProcessRunner(), Path.Combine(root, "artifacts"));
+
+            var early = await cache.GetThumbnailAsync(source, TimelineTime.FromSeconds(0.2));
+            var late = await cache.GetThumbnailAsync(source, TimelineTime.FromSeconds(1.6));
+            var earlyCached = await cache.GetThumbnailAsync(source, TimelineTime.FromSeconds(0.2));
+
+            Assert.NotNull(early);
+            Assert.NotNull(late);
+            Assert.True(File.Exists(early));
+            Assert.True(File.Exists(late));
+            Assert.NotEqual(early, late);
+            Assert.Equal(early, earlyCached);
+            Assert.True(new FileInfo(early!).Length > 100);
+            Assert.True(new FileInfo(late!).Length > 100);
         }
         finally { DeleteRoot(root); }
     }
@@ -235,22 +286,31 @@ public sealed class MediaPipelineIntegrationTests
         finally { DeleteRoot(root); }
     }
 
-    private static EditorProject CreateAvProject(string source, string root)
+    private static ProjectState CreateAvProject(string source)
     {
         var id = Guid.NewGuid();
-        var project = EditorProject.CreateNew();
-        project.FilePath = Path.Combine(root, "proxy-test.kadr");
-        project.FrameRate = 24;
-        project.Media.Add(new MediaAsset
+        var project = ProjectState.CreateNew("AV integration", new FrameRate(24)) with
         {
-            Id = id, Path = source, Name = "source-av.mp4", Kind = UiMediaKind.Video,
-            Duration = 2, Width = 320, Height = 180, FrameRate = 24, HasAudio = true,
-            FileSizeBytes = new FileInfo(source).Length
-        });
+            Sequence = new SequenceSettings(320, 240, new FrameRate(24), 48_000)
+        };
+        var mediaSource = new MediaSource(
+            id, source, "source-av.mp4", KadrStudio.Core.Domain.MediaKind.Video,
+            TimelineTime.FromSeconds(2), true, 320, 180, new FrameRate(24), "h264", "aac",
+            new FileInfo(source).Length, Fingerprint: $"av-{new FileInfo(source).Length:x}");
+        var visual = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var audio = project.Tracks.Single(item => item.Kind == TrackKind.Audio && item.Index == 0);
         var link = Guid.NewGuid();
-        project.Clips.Add(new TimelineClip { AssetId = id, Track = UiTrackKind.Visual, Duration = 2, LinkGroupId = link });
-        project.Clips.Add(new TimelineClip { AssetId = id, Track = UiTrackKind.Audio, Duration = 2, LinkGroupId = link });
-        return project;
+        return project with
+        {
+            Sources = project.Sources.Add(id, mediaSource),
+            MediaClips =
+            [
+                new(Guid.NewGuid(), id, visual.Id, TimelineTime.Zero, TimelineTime.Zero,
+                    TimelineTime.FromSeconds(2), link, Video: new VideoParameters()),
+                new(Guid.NewGuid(), id, audio.Id, TimelineTime.Zero, TimelineTime.Zero,
+                    TimelineTime.FromSeconds(2), link, Audio: new AudioParameters())
+            ]
+        };
     }
 
     private static async Task CreateColorSourceAsync(

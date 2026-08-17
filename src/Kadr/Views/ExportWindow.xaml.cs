@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
 using KadrStudio.Models;
+using KadrStudio.Core.Domain;
 using KadrStudio.Services;
 using Microsoft.Win32;
 
@@ -10,13 +11,13 @@ namespace KadrStudio.Views;
 
 public partial class ExportWindow : Window
 {
-    private readonly EditorProject _project;
+    private readonly ProjectState _project;
     private readonly ExportService _exportService;
     private CancellationTokenSource? _cancellation;
     private bool _isExporting;
     private string? _completedOutputPath;
 
-    public ExportWindow(EditorProject project, ExportService exportService)
+    public ExportWindow(ProjectState project, ExportService exportService)
     {
         InitializeComponent();
         _project = project;
@@ -182,4 +183,3 @@ public partial class ExportWindow : Window
         return string.IsNullOrWhiteSpace(cleaned) ? "Видео" : cleaned;
     }
 }
-

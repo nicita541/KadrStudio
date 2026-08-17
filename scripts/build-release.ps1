@@ -11,6 +11,18 @@ $releaseRoot = Join-Path $repoRoot 'release'
 $publishPath = Join-Path $releaseRoot 'KadrStudio-win-x64'
 $zipPath = Join-Path $releaseRoot 'KadrStudio-win-x64.zip'
 
+function Assert-PathWithinRepository([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $rootPrefix = $repoRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Путь сборки вышел за пределы репозитория: $fullPath"
+    }
+}
+
+Assert-PathWithinRepository $releaseRoot
+Assert-PathWithinRepository $publishPath
+Assert-PathWithinRepository $zipPath
+
 if (-not (Test-Path -LiteralPath $solutionPath) -or -not (Test-Path -LiteralPath $projectPath)) {
     throw "Не найдены solution или WPF-проект в $repoRoot"
 }
@@ -73,6 +85,20 @@ if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'tools\ffmpeg.exe'))) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'tools\ffprobe.exe'))) {
     throw 'В сборку не попал tools\ffprobe.exe.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'mediahost\Kadr.MediaHost.exe'))) {
+    throw 'В сборку не попал Kadr.MediaHost.exe.'
+}
+
+Write-Host 'Проверка запуска готового приложения…' -ForegroundColor Cyan
+$publishedExe = Join-Path $publishPath 'KadrStudio.exe'
+$smokeProcess = Start-Process -FilePath $publishedExe -ArgumentList '--launch-smoke' -PassThru -WindowStyle Hidden
+if (-not $smokeProcess.WaitForExit(30000)) {
+    Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
+    throw 'Готовое приложение не завершило launch smoke за 30 секунд.'
+}
+if ($smokeProcess.ExitCode -ne 0) {
+    throw "Launch smoke готового приложения завершился с кодом $($smokeProcess.ExitCode)."
 }
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force

@@ -1,18 +1,20 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using KadrStudio.Application.Caching;
+using KadrStudio.Core.Domain;
 using KadrStudio.Infrastructure.Caching;
-using KadrStudio.Models;
 
 namespace KadrStudio.Services;
 
 public sealed class TimelineMediaCacheService : IAsyncDisposable
 {
-    private const double FrameIntervalSeconds = 15;
     private readonly FfmpegLocator _locator;
     private readonly ProcessRunner _processRunner;
     private readonly IArtifactStore _artifacts;
     private readonly bool _ownsArtifacts;
+    private readonly SemaphoreSlim _thumbnailWorkers = new(2, 2);
 
     public TimelineMediaCacheService(
         FfmpegLocator locator,
@@ -27,70 +29,75 @@ public sealed class TimelineMediaCacheService : IAsyncDisposable
             cacheRoot ?? ThumbnailService.DefaultArtifactRoot());
     }
 
-    public void ConfigureProject(EditorProject project)
+    public async Task<TimelineMediaArtifacts> PrepareAsync(
+        MediaSource source,
+        CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(project);
-        // The unified store owns location and budget; project configuration is
-        // retained as an API boundary until callers move to workspace services.
-    }
-
-    public async Task PrepareAsync(MediaAsset asset, CancellationToken cancellationToken = default)
-    {
-        if (asset.Kind == MediaKind.Image)
-        {
-            asset.TimelineFramePaths = [asset.Path];
-            return;
-        }
+        if (source.Kind == MediaKind.Image)
+            return new TimelineMediaArtifacts(WaveformPyramid.Empty);
 
         _locator.EnsureAvailable();
-        var framesTask = asset.Kind == MediaKind.Video
-            ? PrepareFramesAsync(asset, cancellationToken)
-            : Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
-        var waveformTask = asset.HasAudio
-            ? PrepareWaveformAsync(asset, cancellationToken)
-            : Task.FromResult(WaveformPyramid.Empty);
-        await Task.WhenAll(framesTask, waveformTask);
-        asset.TimelineFramePaths = await framesTask;
-        asset.Waveform = await waveformTask;
+        var waveform = source.HasAudio
+            ? await PrepareWaveformAsync(source, cancellationToken)
+            : WaveformPyramid.Empty;
+        return new TimelineMediaArtifacts(waveform);
     }
 
-    private async Task<IReadOnlyList<string>> PrepareFramesAsync(
-        MediaAsset asset, CancellationToken cancellationToken)
+    /// <summary>
+    /// Materializes one exact timeline tile on demand. Callers request only the
+    /// source times currently visible in the viewport; the artifact store keeps
+    /// completed tiles across scroll and application sessions.
+    /// </summary>
+    public async Task<string?> GetThumbnailAsync(
+        MediaSource source,
+        TimelineTime sourceTime,
+        CancellationToken cancellationToken = default)
     {
-        var frameCount = Math.Clamp((int)Math.Ceiling(asset.Duration / FrameIntervalSeconds), 12, 160);
-        var paths = new string?[frameCount];
-        await Parallel.ForEachAsync(Enumerable.Range(0, frameCount),
-            new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken },
-            async (index, token) =>
+        if (source.Kind == MediaKind.Image) return source.Path;
+        if (source.Kind != MediaKind.Video || source.OnlineState != MediaOnlineState.Online || !File.Exists(source.Path))
+            return null;
+
+        _locator.EnsureAvailable();
+        var maximumTicks = Math.Max(0, source.Duration.Ticks - 1);
+        var bounded = new TimelineTime(Math.Clamp(sourceTime.Ticks, 0, maximumTicks));
+        var exact = bounded.SnapToFrame(source.FrameRate ?? FrameRate.Fps30);
+        var key = Key(source, MediaArtifactKind.TimelineThumbnail, 192, exact.Ticks, 3);
+        var cached = await _artifacts.TryGetPayloadPathAsync(key, ".jpg", cancellationToken);
+        if (cached is not null) return cached;
+
+        await _thumbnailWorkers.WaitAsync(cancellationToken);
+        try
+        {
+            // A queued request may have been completed by another viewport while
+            // this request waited for one of the bounded extraction workers.
+            cached = await _artifacts.TryGetPayloadPathAsync(key, ".jpg", cancellationToken);
+            if (cached is not null) return cached;
+
+            var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.jpg");
+            Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
+            try
             {
-                var key = ThumbnailService.Key(asset, MediaArtifactKind.TimelineThumbnail, 0, index, 2);
-                var cached = await _artifacts.TryGetPayloadPathAsync(key, ".jpg", token);
-                if (cached is not null)
-                {
-                    paths[index] = cached;
-                    return;
-                }
-                var position = Math.Min(Math.Max(0, asset.Duration - 0.01), index * FrameIntervalSeconds + FrameIntervalSeconds / 2);
-                var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.jpg");
-                Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
-                try
-                {
-                    var result = await _processRunner.RunAsync(_locator.FfmpegPath,
-                        ["-hide_banner", "-loglevel", "error", "-y", "-hwaccel", "auto", "-ss", Invariant(position),
-                         "-i", asset.Path, "-frames:v", "1", "-vf", "scale=192:108:force_original_aspect_ratio=increase,crop=192:108",
-                         "-q:v", "5", temporary], cancellationToken: token);
-                    if (result.ExitCode == 0 && File.Exists(temporary))
-                        paths[index] = await _artifacts.PutFileAsync(key, temporary, ".jpg", token);
-                }
-                finally { TryDelete(temporary); }
-            });
-        return paths.Where(path => path is not null).Select(path => path!).ToArray();
+                var result = await _processRunner.RunAsync(_locator.FfmpegPath,
+                    ["-hide_banner", "-loglevel", "error", "-y", "-ss", Invariant(exact.TotalSeconds),
+                     "-i", source.Path, "-frames:v", "1",
+                     "-vf", "scale=192:108:force_original_aspect_ratio=increase,crop=192:108",
+                     "-q:v", "5", temporary], cancellationToken: cancellationToken);
+                return result.ExitCode == 0 && File.Exists(temporary)
+                    ? await _artifacts.PutFileAsync(key, temporary, ".jpg", cancellationToken)
+                    : null;
+            }
+            finally { TryDelete(temporary); }
+        }
+        finally
+        {
+            _thumbnailWorkers.Release();
+        }
     }
 
     private async Task<WaveformPyramid> PrepareWaveformAsync(
-        MediaAsset asset, CancellationToken cancellationToken)
+        MediaSource source, CancellationToken cancellationToken)
     {
-        var key = ThumbnailService.Key(asset, MediaArtifactKind.Waveform, 0, 0, 5);
+        var key = Key(source, MediaArtifactKind.Waveform, 0, 0, 5);
         var cached = await _artifacts.TryGetAsync(key, cancellationToken);
         if (cached is not null)
         {
@@ -111,7 +118,7 @@ public sealed class TimelineMediaCacheService : IAsyncDisposable
         };
         foreach (var argument in new[]
         {
-            "-hide_banner", "-loglevel", "error", "-i", asset.Path, "-vn", "-map", "0:a:0",
+            "-hide_banner", "-loglevel", "error", "-i", source.Path, "-vn", "-map", "0:a:0",
             "-ac", "2", "-ar", "48000", "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"
         }) startInfo.ArgumentList.Add(argument);
         using var process = new System.Diagnostics.Process { StartInfo = startInfo };
@@ -150,10 +157,34 @@ public sealed class TimelineMediaCacheService : IAsyncDisposable
     }
 
     private static string Invariant(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+    private static MediaCacheKey Key(
+        MediaSource source,
+        MediaArtifactKind kind,
+        int level,
+        long segment,
+        int formatVersion)
+    {
+        var fingerprint = !string.IsNullOrWhiteSpace(source.VerifiedFingerprint)
+            ? source.VerifiedFingerprint
+            : !string.IsNullOrWhiteSpace(source.FastFingerprint)
+                ? source.FastFingerprint
+                : !string.IsNullOrWhiteSpace(source.Fingerprint)
+                    ? source.Fingerprint
+                    : Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
+                        $"{source.Path}|{source.FileSize}|{source.LastWriteUtcTicks}")));
+        return new MediaCacheKey(source.Id, fingerprint, kind, level, segment, formatVersion);
+    }
     private static void TryKill(System.Diagnostics.Process process)
     {
         try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
     }
     private static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
-    public ValueTask DisposeAsync() => _ownsArtifacts ? _artifacts.DisposeAsync() : ValueTask.CompletedTask;
+    public ValueTask DisposeAsync()
+    {
+        _thumbnailWorkers.Dispose();
+        return _ownsArtifacts ? _artifacts.DisposeAsync() : ValueTask.CompletedTask;
+    }
 }
+
+public sealed record TimelineMediaArtifacts(
+    WaveformPyramid Waveform);

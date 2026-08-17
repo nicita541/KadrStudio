@@ -20,12 +20,7 @@ public partial class AudioWorkspaceWindow : Window
 
     public void FollowSelection()
     {
-        var selected = _viewModel.SelectedClip;
-        _editingClip = selected?.Track == TrackKind.Audio
-            ? selected
-            : selected?.LinkGroupId is Guid groupId
-                ? _viewModel.Project.Clips.FirstOrDefault(clip => clip.Track == TrackKind.Audio && clip.LinkGroupId == groupId)
-                : null;
+        _editingClip = _viewModel.CreateSelectedClipDraft(TrackKind.Audio);
         WorkspaceRoot.DataContext = _editingClip;
         SelectedAudioNameTextBlock.Text = _editingClip is null
             ? "Выберите аудиоклип или связанное видео на таймлайне"
@@ -34,27 +29,20 @@ public partial class AudioWorkspaceWindow : Window
         SelectedAudioNameTextBlock.IsEnabled = true;
     }
 
-    private void Edit_Begin(object sender, RoutedEventArgs e)
-    {
-        if (_editingClip is not null) _viewModel.BeginEdit();
-    }
-
     private void Edit_End(object sender, RoutedEventArgs e)
     {
-        _viewModel.CommitEdit("Настройки звука изменены");
+        CommitDraft("Настройки звука изменены");
     }
 
     private void Toggle_Changed(object sender, RoutedEventArgs e)
     {
         if (!IsLoaded || _editingClip is null) return;
-        _viewModel.BeginEdit();
-        _viewModel.CommitEdit("Звук клипа изменён");
+        CommitDraft("Звук клипа изменён");
     }
 
     private void Reset_Click(object sender, RoutedEventArgs e)
     {
         if (_editingClip is null) return;
-        _viewModel.BeginEdit();
         _editingClip.Volume = 1;
         _editingClip.Pan = 0;
         _editingClip.FadeIn = 0;
@@ -63,7 +51,13 @@ public partial class AudioWorkspaceWindow : Window
         _editingClip.Mid = 0;
         _editingClip.Treble = 0;
         _editingClip.IsMuted = false;
-        _viewModel.CommitEdit("Настройки звука сброшены");
+        CommitDraft("Настройки звука сброшены");
+    }
+
+    private void CommitDraft(string description)
+    {
+        if (_editingClip is null) return;
+        _viewModel.CommitClipDraft(_editingClip, description);
     }
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)

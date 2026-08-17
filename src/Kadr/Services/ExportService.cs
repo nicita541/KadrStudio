@@ -1,4 +1,5 @@
 using KadrStudio.Application.Rendering;
+using KadrStudio.Core.Domain;
 using KadrStudio.Models;
 
 namespace KadrStudio.Services;
@@ -9,7 +10,7 @@ public sealed class ExportService(
     TimelineRenderCoordinator coordinator)
 {
     public async Task ExportAsync(
-        EditorProject project,
+        ProjectState project,
         string outputPath,
         ExportSettings settings,
         IProgress<ExportProgress>? progress = null,
@@ -19,7 +20,8 @@ public sealed class ExportService(
         ArgumentNullException.ThrowIfNull(settings);
         locator.EnsureAvailable();
         _ = processRunner ?? throw new ArgumentNullException(nameof(processRunner));
-        if (project.GetVisualClips().Count == 0)
+        if (!project.MediaClips.Any(clip =>
+                project.FindTrack(clip.TrackId)?.Kind == KadrStudio.Core.Domain.TrackKind.Visual))
             throw new InvalidOperationException("Add at least one video or image to the timeline.");
         ValidateSources(project);
 
@@ -48,12 +50,12 @@ public sealed class ExportService(
             cancellationToken).ConfigureAwait(false);
     }
 
-    private static void ValidateSources(EditorProject project)
+    private static void ValidateSources(ProjectState project)
     {
-        var missing = project.Clips
-            .Select(clip => project.FindAsset(clip.AssetId))
-            .Where(asset => asset is null || !File.Exists(asset.Path))
-            .Select(asset => asset?.Name ?? "Unknown media")
+        var missing = project.MediaClips
+            .Select(clip => project.Sources.GetValueOrDefault(clip.SourceId))
+            .Where(source => source is null || source.OnlineState != MediaOnlineState.Online || !File.Exists(source.Path))
+            .Select(source => source?.Name ?? "Unknown media")
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (missing.Length > 0)

@@ -21,6 +21,7 @@ namespace KadrStudio.Views;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
+    private readonly WorkspaceSettingsService _workspaceSettingsService;
     private readonly RecentProjectsService _recentProjectsService = new();
     private readonly DispatcherTimer _playbackTimer;
     private readonly Stopwatch _playbackClock = new();
@@ -50,7 +51,7 @@ public partial class MainWindow : Window
     private Rect _previewTextResizeStartBounds;
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
-    private TextOverlay? _textPanelEditBefore;
+    private TextOverlay? _textPanelDraft;
 
     public MainWindow() : this(null)
     {
@@ -60,9 +61,11 @@ public partial class MainWindow : Window
     {
         _initialProjectPath = initialProjectPath;
         InitializeComponent();
-        _viewModel = new MainViewModel();
+        var workspace = EditorWorkspaceCompositionRoot.Create();
+        _workspaceSettingsService = workspace.SettingsService;
+        _viewModel = new MainViewModel(workspace);
         _previewPresenter = new PreviewPresenter(PreviewImage, EmptyPreview,
-            new FfmpegLocator(), _viewModel.RenderCoordinator, _viewModel.ArtifactStore);
+            workspace.FfmpegLocator, _viewModel.RenderCoordinator, _viewModel.ArtifactStore);
         _previewPresenter.Failed += (_, exception) =>
             Dispatcher.BeginInvoke(() => _viewModel.StatusText = $"Предпросмотр: {exception.Message}");
         _previewPresenter.AudioMeterUpdated += (_, level) => Dispatcher.BeginInvoke(() =>
@@ -70,7 +73,7 @@ public partial class MainWindow : Window
             AudioLeftMeter.Value = level.LeftPeak;
             AudioRightMeter.Value = level.RightPeak;
         });
-        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+        _previewPresenter.SetProject(_viewModel.CoreState, _useHalfQualityPreview);
         DataContext = _viewModel;
         LocalAiModelComboBox.ItemsSource = _localAiModels;
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
@@ -87,6 +90,7 @@ public partial class MainWindow : Window
         TimelineEditor.PlayheadChanged += TimelineEditor_PlayheadChanged;
         TimelineEditor.EditRequested += TimelineEditor_EditRequested;
         TimelineEditor.AssetDropped += TimelineEditor_AssetDropped;
+        TimelineEditor.ThumbnailRequest = _viewModel.GetTimelineThumbnailAsync;
         UpdateWhisperAvailability();
     }
 
@@ -266,6 +270,88 @@ public partial class MainWindow : Window
         _colorWorkspaceWindow.Show();
     }
 
+    private async void MoveMediaCache_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "Новая папка кэша Kadr Studio",
+            InitialDirectory = _viewModel.ArtifactStore.Options.Root,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            _viewModel.IsBusy = true;
+            _viewModel.StatusText = "Перенос кэша медиа…";
+            await _viewModel.ArtifactStore.MoveAsync(dialog.FolderName);
+            await SaveArtifactSettingsAsync();
+            _viewModel.StatusText = $"Кэш перенесён: {dialog.FolderName}";
+        }
+        catch (Exception exception)
+        {
+            ShowError("Не удалось перенести кэш", exception);
+        }
+        finally
+        {
+            _viewModel.IsBusy = false;
+        }
+    }
+
+    private async void ClearMediaCache_Click(object sender, RoutedEventArgs e)
+    {
+        if (MessageBox.Show(
+                this,
+                "Удалить прокси, эскизы и waveform? Они автоматически перестроятся; исходники и проект не изменятся.",
+                "Очистка кэша",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question) != MessageBoxResult.Yes)
+            return;
+        try
+        {
+            _viewModel.IsBusy = true;
+            await _viewModel.ArtifactStore.ClearAsync();
+            _viewModel.StatusText = "Кэш медиа очищен";
+        }
+        catch (Exception exception)
+        {
+            ShowError("Не удалось очистить кэш", exception);
+        }
+        finally
+        {
+            _viewModel.IsBusy = false;
+        }
+    }
+
+    private async void SetMediaCacheLimit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem { Tag: string gigabytesText } ||
+            !long.TryParse(gigabytesText, out var gigabytes))
+            return;
+        try
+        {
+            var bytes = checked(gigabytes * 1024 * 1024 * 1024);
+            _viewModel.IsBusy = true;
+            await _viewModel.ArtifactStore.SetDiskBudgetAsync(bytes);
+            await SaveArtifactSettingsAsync();
+            _viewModel.StatusText = $"Лимит кэша: {gigabytes} ГБ";
+        }
+        catch (Exception exception)
+        {
+            ShowError("Не удалось изменить лимит кэша", exception);
+        }
+        finally
+        {
+            _viewModel.IsBusy = false;
+        }
+    }
+
+    private Task SaveArtifactSettingsAsync()
+    {
+        var options = _viewModel.ArtifactStore.Options;
+        return _workspaceSettingsService.SaveAsync(new WorkspaceSettings(
+            options.Root, options.DiskBudgetBytes));
+    }
+
     private async Task<bool> SaveProjectInternalAsync(bool forceSaveAs)
     {
         if (_viewModel.HasPendingEditReview)
@@ -301,7 +387,7 @@ public partial class MainWindow : Window
         try
         {
             await _viewModel.SaveProjectAsync(path);
-            _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+            _previewPresenter.SetProject(_viewModel.CoreState, _useHalfQualityPreview);
             _recentProjectsService.Add(path, _viewModel.Project.Name);
             return true;
         }
@@ -326,7 +412,7 @@ public partial class MainWindow : Window
         }
 
         StopPlayback();
-        var exportWindow = new ExportWindow(_viewModel.Project, _viewModel.ExportService)
+        var exportWindow = new ExportWindow(_viewModel.CoreState, _viewModel.ExportService)
         {
             Owner = this
         };
@@ -702,32 +788,37 @@ public partial class MainWindow : Window
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
-    private void TextOverlayEdit_Begin(object sender, RoutedEventArgs e)
-    {
-        _textPanelEditBefore = (TextOverlayList.SelectedItem as TextOverlay)?.Clone();
-    }
-
     private void TextOverlayEdit_End(object sender, RoutedEventArgs e)
     {
-        if (TextOverlayList.SelectedItem is TextOverlay overlay &&
-            (_textPanelEditBefore is null || !TextOverlayPresentationEquals(_textPanelEditBefore, overlay)))
+        if (_textPanelDraft is not null &&
+            TextOverlayList.SelectedItem is TextOverlay stored &&
+            !TextOverlayPresentationEquals(stored, _textPanelDraft))
         {
-            var id = overlay.Id;
-            _viewModel.UpdateTextOverlay(overlay.Clone());
+            var id = _textPanelDraft.Id;
+            _viewModel.UpdateTextOverlay(_textPanelDraft.Clone());
             TextOverlayList.SelectedItem = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == id);
         }
-        _textPanelEditBefore = null;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
+
+    private void TextOverlayCombo_Closed(object? sender, EventArgs e)
+        => TextOverlayEdit_End(sender ?? this, new RoutedEventArgs());
 
     private void TextOverlayList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (TextOverlayList.SelectedItem is TextOverlay overlay)
         {
+            _textPanelDraft = overlay.Clone();
+            TextPropertiesPanel.DataContext = _textPanelDraft;
             TimelineEditor.SelectedTextOverlayId = overlay.Id;
             TimelineEditor.SelectedClipId = null;
             _viewModel.SelectedClip = null;
             SeekTo(overlay.Start);
+        }
+        else
+        {
+            _textPanelDraft = null;
+            TextPropertiesPanel.DataContext = null;
         }
     }
 
@@ -1127,11 +1218,14 @@ public partial class MainWindow : Window
 
         try
         {
+            var selectedCoreClip = _viewModel.SelectedClip is { } selected
+                ? _viewModel.CoreState.FindMediaClip(selected.Id)
+                : null;
             EditCommandPlan plan;
             if (EditingCommandPlanner.TryCreateDeterministic(
-                    _viewModel.Project,
+                    _viewModel.CoreState,
                     prompt,
-                    _viewModel.SelectedClip,
+                    selectedCoreClip,
                     out var deterministic))
             {
                 plan = deterministic;
@@ -1145,10 +1239,10 @@ public partial class MainWindow : Window
                 }
 
                 plan = await _viewModel.OllamaVideoAnalysisService.PlanEditsAsync(
-                    _viewModel.Project,
+                    _viewModel.CoreState,
                     prompt,
                     model.Name,
-                    _viewModel.SelectedClip,
+                    selectedCoreClip,
                     _analysisCancellation.Token);
             }
 
@@ -1351,36 +1445,6 @@ public partial class MainWindow : Window
 
         _viewModel.AddAssetToTimeline(asset.Id);
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
-        UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-    }
-
-    private void InspectorEdit_Begin(object sender, RoutedEventArgs e)
-    {
-        if (_viewModel.SelectedClip is not null)
-        {
-            _viewModel.BeginEdit();
-        }
-    }
-
-    private void InspectorEdit_End(object sender, RoutedEventArgs e)
-    {
-        Dispatcher.InvokeAsync(() =>
-        {
-            _viewModel.NormalizeSelectedClip();
-            _viewModel.CommitEdit("Свойства клипа изменены");
-            TimelineEditor.InvalidateVisual();
-            UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
-        }, DispatcherPriority.Background);
-    }
-
-    private void InspectorToggle_Changed(object sender, RoutedEventArgs e)
-    {
-        if (!IsLoaded || _viewModel.SelectedClip is null)
-        {
-            return;
-        }
-
-        _viewModel.CommitEdit("Звук клипа изменён");
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
     }
 
@@ -1740,6 +1804,7 @@ public partial class MainWindow : Window
         if (stored is null) return null;
         if (_previewEditedOverlay?.Id == stored.Id) return _previewEditedOverlay;
         if (_previewDraggedOverlay?.Id == stored.Id) return _previewDraggedOverlay;
+        if (_textPanelDraft?.Id == stored.Id) return _textPanelDraft;
         return stored;
     }
 
@@ -1912,7 +1977,7 @@ public partial class MainWindow : Window
     {
         if (!IsLoaded) return;
         _useHalfQualityPreview = (PreviewQualityComboBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() != "Original";
-        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+        _previewPresenter.SetProject(_viewModel.CoreState, _useHalfQualityPreview);
         _ = _previewPresenter.InvalidateAsync(video: true, audio: false, overlay: false);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         _viewModel.StatusText = _useHalfQualityPreview
@@ -1961,7 +2026,7 @@ public partial class MainWindow : Window
 
     private void ResetPreviewState()
     {
-        _previewPresenter.SetProject(_viewModel.Project, _useHalfQualityPreview);
+        _previewPresenter.SetProject(_viewModel.CoreState, _useHalfQualityPreview);
         TimelineEditor.Project = _viewModel.Project;
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
         TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
@@ -2077,10 +2142,10 @@ public partial class MainWindow : Window
         _isCloseConfirmationPending = true;
         Dispatcher.BeginInvoke(
             DispatcherPriority.Background,
-            new Action(ConfirmCloseAfterClosingEvent));
+            new Action(() => _ = ConfirmCloseAfterClosingEventAsync()));
     }
 
-    private async void ConfirmCloseAfterClosingEvent()
+    private async Task ConfirmCloseAfterClosingEventAsync()
     {
         try
         {

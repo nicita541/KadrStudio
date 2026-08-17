@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using KadrStudio.Adapters;
 using KadrStudio.Controls;
 using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Models;
@@ -23,7 +24,7 @@ public sealed class TimelineRenderSnapshotTests
                     MathF.Sin(index / 17f) * (index % 257) / 257f,
                     MathF.Cos(index / 29f) * (index % 113) / 113f
                 }).ToArray());
-            var project = EditorProject.CreateNew();
+            var project = new ProjectViewMapper().ToUi(KadrStudio.Core.Domain.ProjectState.CreateNew());
             project.Media.Add(new MediaAsset
             {
                 Id = assetId, Name = "snapshot.mp4", Path = "snapshot.mp4", Kind = MediaKind.Video,

@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using KadrStudio.Core.Domain;
 using KadrStudio.Models;
 using KadrStudio.Application.Media;
@@ -15,132 +14,14 @@ namespace KadrStudio.Adapters;
 /// The only conversion boundary between mutable WPF controls and the immutable
 /// editor core. UI collections never leak into storage, rendering or analysis.
 /// </summary>
-public sealed class EditorProjectMapper
+public sealed class ProjectViewMapper
 {
-    private static readonly Guid TextTrackNamespace = new("3d990ce8-0bda-44b3-b896-0265beec35dc");
-
-    public ProjectState ToCore(EditorProject project, long revision = 0)
-    {
-        ArgumentNullException.ThrowIfNull(project);
-        var visualCount = Math.Max(2, project.VisualTrackCount);
-        var audioCount = Math.Max(2, project.AudioTrackCount);
-        var tracks = ImmutableArray.CreateBuilder<TimelineTrack>(visualCount + audioCount + 1);
-        var trackIds = new Dictionary<(CoreTrackKind Kind, int Index), Guid>();
-        foreach (var track in project.Tracks
-                     .Where(item => item.Index >= 0)
-                     .GroupBy(item => (item.Kind, item.Index))
-                     .Select(group => group.First())
-                     .OrderBy(item => item.Kind).ThenBy(item => item.Index))
-        {
-            var id = track.Id == Guid.Empty
-                ? StableGuid(TextTrackNamespace, project.Id, (int)track.Kind, track.Index)
-                : track.Id;
-            trackIds[(track.Kind, track.Index)] = id;
-            tracks.Add(new TimelineTrack(id, track.Kind, track.Index,
-                string.IsNullOrWhiteSpace(track.Name) ? DefaultTrackName(track.Kind, track.Index) : track.Name,
-                track.IsMuted, track.IsLocked, track.IsVisible));
-        }
-        for (var index = 0; index < visualCount; index++)
-            EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Visual, index);
-        for (var index = 0; index < audioCount; index++)
-            EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Audio, index);
-        EnsureTrack(tracks, trackIds, project.Id, CoreTrackKind.Text, 0);
-        var textTrackId = trackIds[(CoreTrackKind.Text, 0)];
-
-        var sources = project.Media.ToImmutableDictionary(asset => asset.Id, ToCoreSource);
-        var clips = project.Clips.Select(clip =>
-        {
-            var kind = clip.Track == UiTrackKind.Visual ? CoreTrackKind.Visual : CoreTrackKind.Audio;
-            return new MediaClip(
-                clip.Id,
-                clip.AssetId,
-                trackIds[(kind, clip.TrackIndex)],
-                Time(clip.Start),
-                Time(clip.SourceStart),
-                Time(clip.Duration),
-                clip.LinkGroupId,
-                kind == CoreTrackKind.Visual
-                    ? new VideoParameters(
-                        clip.Brightness, clip.Contrast, clip.Saturation, clip.Temperature,
-                        clip.PositionX, clip.PositionY, clip.ScaleX, clip.ScaleY, clip.Rotation,
-                        clip.CropLeft, clip.CropTop, clip.CropRight, clip.CropBottom, clip.Opacity)
-                    : null,
-                kind == CoreTrackKind.Audio
-                    ? new AudioParameters(
-                        clip.Volume, clip.IsMuted, clip.Pan, Time(clip.FadeIn), Time(clip.FadeOut),
-                        clip.Bass, clip.Mid, clip.Treble)
-                    : null);
-        }).ToImmutableArray();
-        var texts = project.TextOverlays.Select(overlay => new TextClip(
-            overlay.Id,
-            textTrackId,
-            Time(overlay.Start),
-            Time(overlay.Duration),
-            overlay.Text,
-            new TextStyle(
-                overlay.FontFamily, overlay.FontSize, overlay.Color, overlay.X, overlay.Y,
-                overlay.Rotation, overlay.BoxWidth, overlay.BoxHeight, overlay.IsSubtitle))).ToImmutableArray();
-        var markers = project.Markers.Select(marker => new KadrStudio.Core.Domain.TimelineMarker(
-            marker.Id,
-            (CoreMarkerKind)(int)marker.Kind,
-            Time(marker.Start),
-            Time(marker.Duration),
-            marker.Title,
-            marker.Description,
-            marker.AssetId == Guid.Empty ? null : marker.AssetId,
-            Time(marker.SourceStart),
-            marker.Confidence,
-            marker.Query)).ToImmutableArray();
-
-        var currentMediaIds = clips.Select(item => item.Id).ToHashSet();
-        var retainedTransitions = project.MigrationSnapshot?.Transitions
-            .Where(item => currentMediaIds.Contains(item.FromClipId) && currentMediaIds.Contains(item.ToClipId))
-            .Where(item => IsTransitionStillValid(item, clips, tracks))
-            .ToImmutableArray() ?? [];
-        var snapshotSources = project.MigrationSnapshot?.Sources ?? ImmutableDictionary<Guid, MediaSource>.Empty;
-        sources = sources.ToImmutableDictionary(
-            pair => pair.Key,
-            pair => snapshotSources.TryGetValue(pair.Key, out var snapshot)
-                ? pair.Value with
-                {
-                    PreviousPath = snapshot.PreviousPath,
-                    OnlineState = snapshot.OnlineState,
-                    FastFingerprint = snapshot.FastFingerprint,
-                    VerifiedFingerprint = snapshot.VerifiedFingerprint,
-                    Streams = snapshot.Streams,
-                    IsVariableFrameRate = snapshot.IsVariableFrameRate,
-                    ProxyPath = snapshot.ProxyPath
-                }
-                : pair.Value);
-
-        return new ProjectState
-        {
-            Id = project.Id,
-            Name = project.Name,
-            CanvasWidth = project.CanvasWidth,
-            CanvasHeight = project.CanvasHeight,
-            FrameRate = project.FrameRateValue,
-            Revision = Math.Max(0, revision),
-            CreatedAt = project.CreatedAt,
-            UpdatedAt = project.UpdatedAt,
-            Tracks = tracks.ToImmutable(),
-            Sources = sources,
-            MediaClips = clips,
-            TextClips = texts,
-            Transitions = retainedTransitions,
-            Markers = markers,
-            InPoint = project.InPoint is null ? null : Time(project.InPoint.Value),
-            OutPoint = project.OutPoint is null ? null : Time(project.OutPoint.Value)
-        };
-    }
-
-    public EditorProject ToUi(ProjectState project, string? filePath = null)
+    public ProjectViewState ToUi(ProjectState project, string? filePath = null)
     {
         ArgumentNullException.ThrowIfNull(project);
         var trackById = project.Tracks.ToDictionary(item => item.Id);
-        var result = new EditorProject
+        var result = new ProjectViewState
         {
-            FormatVersion = 2,
             Id = project.Id,
             Name = project.Name,
             CanvasWidth = project.CanvasWidth,
@@ -149,7 +30,6 @@ public sealed class EditorProjectMapper
             CreatedAt = project.CreatedAt,
             UpdatedAt = project.UpdatedAt,
             FilePath = filePath,
-            MigrationSnapshot = project,
             InPoint = project.InPoint?.TotalSeconds,
             OutPoint = project.OutPoint?.TotalSeconds
         };
@@ -265,26 +145,6 @@ public sealed class EditorProjectMapper
                 overlay.Rotation, overlay.BoxWidth, overlay.BoxHeight, overlay.IsSubtitle));
     }
 
-    private static void EnsureTrack(
-        ICollection<TimelineTrack> tracks,
-        IDictionary<(CoreTrackKind Kind, int Index), Guid> ids,
-        Guid projectId,
-        CoreTrackKind kind,
-        int index)
-    {
-        if (ids.ContainsKey((kind, index))) return;
-        var id = StableGuid(TextTrackNamespace, projectId, (int)kind, index);
-        ids.Add((kind, index), id);
-        tracks.Add(new TimelineTrack(id, kind, index, DefaultTrackName(kind, index)));
-    }
-
-    private static string DefaultTrackName(CoreTrackKind kind, int index) => kind switch
-    {
-        CoreTrackKind.Visual => $"V{index + 1}",
-        CoreTrackKind.Audio => $"A{index + 1}",
-        _ => $"T{index + 1}"
-    };
-
     public MediaSource ToCoreSource(MediaAsset asset)
     {
         if (asset.ProbeResult is { } probe)
@@ -343,32 +203,6 @@ public sealed class EditorProjectMapper
 
     private static TimelineTime Time(double seconds) => TimelineTime.FromSeconds(Math.Max(0, seconds));
 
-    private static bool IsTransitionStillValid(
-        TimelineTransition transition,
-        ImmutableArray<MediaClip> clips,
-        IEnumerable<TimelineTrack> tracks)
-    {
-        var from = clips.FirstOrDefault(item => item.Id == transition.FromClipId);
-        var to = clips.FirstOrDefault(item => item.Id == transition.ToClipId);
-        var track = tracks.FirstOrDefault(item => item.Id == transition.TrackId);
-        return from is not null && to is not null && track is not null &&
-               from.TrackId == track.Id && to.TrackId == track.Id && from.End == to.Start &&
-               transition.Duration > TimelineTime.Zero && transition.Duration <= from.Duration &&
-               transition.Duration <= to.Duration && transition.Start >= from.Start &&
-               transition.End <= to.End && transition.Range.Contains(from.End);
-    }
     private static long SafeLastWriteTicks(string path) { try { return File.GetLastWriteTimeUtc(path).Ticks; } catch { return 0; } }
     private static string BuildFingerprint(MediaAsset asset) => $"{asset.FileSizeBytes:x}-{SafeLastWriteTicks(asset.Path):x}";
-
-    private static Guid StableGuid(Guid namespaceId, Guid projectId, int kind, int index)
-    {
-        Span<byte> bytes = stackalloc byte[16];
-        namespaceId.TryWriteBytes(bytes);
-        Span<byte> project = stackalloc byte[16];
-        projectId.TryWriteBytes(project);
-        for (var offset = 0; offset < 16; offset++) bytes[offset] ^= project[offset];
-        BitConverter.TryWriteBytes(bytes[8..12], kind);
-        BitConverter.TryWriteBytes(bytes[12..16], index);
-        return new Guid(bytes);
-    }
 }

@@ -1,10 +1,10 @@
-using KadrStudio.Models;
+using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Playback;
 
 public static class PreviewSizing
 {
-    public static (int Width, int Height) Resolve(EditorProject project, bool useProxy)
+    public static (int Width, int Height) Resolve(ProjectState project, bool useProxy)
     {
         ArgumentNullException.ThrowIfNull(project);
         if (!useProxy) return (project.CanvasWidth, project.CanvasHeight);

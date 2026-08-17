@@ -1,3 +1,4 @@
+using KadrStudio.Adapters;
 using KadrStudio.Controls;
 using KadrStudio.Models;
 using Xunit;
@@ -9,7 +10,7 @@ public sealed class TimelineReadModelTests
     [Fact]
     public void Snapshot_does_not_retain_mutable_project_clip_text_or_media_collections()
     {
-        var project = EditorProject.CreateNew();
+        var project = new ProjectViewMapper().ToUi(KadrStudio.Core.Domain.ProjectState.CreateNew());
         var sourceId = Guid.NewGuid();
         var clip = new TimelineClip
         {
@@ -23,8 +24,7 @@ public sealed class TimelineReadModelTests
         {
             Id = sourceId,
             Name = "source.mp4",
-            Kind = MediaKind.Video,
-            TimelineFramePaths = ["frame-a.jpg"]
+            Kind = MediaKind.Video
         };
         project.Clips.Add(clip);
         project.TextOverlays.Add(text);
@@ -33,12 +33,12 @@ public sealed class TimelineReadModelTests
         var snapshot = TimelineReadModel.From(project);
         clip.Start = 20;
         text.Text = "after";
-        asset.TimelineFramePaths = ["frame-b.jpg"];
+        asset.Name = "after.mp4";
         project.Clips.Clear();
 
         Assert.Single(snapshot.Clips);
         Assert.Equal(2, snapshot.Clips[0].Start);
         Assert.Equal("before", snapshot.TextOverlays[0].Text);
-        Assert.Equal("frame-a.jpg", Assert.Single(snapshot.Media[0].TimelineFramePaths));
+        Assert.Equal("source.mp4", snapshot.Media[0].Name);
     }
 }

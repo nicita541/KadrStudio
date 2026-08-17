@@ -4,7 +4,7 @@ using System.Diagnostics;
 using KadrStudio.Application.Caching;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Infrastructure.Caching;
-using KadrStudio.Models;
+using KadrStudio.Core.Domain;
 using KadrStudio.Services;
 
 namespace KadrStudio.Playback;
@@ -33,7 +33,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
 
     public event EventHandler<Guid>? ProxyReady;
 
-    public void Configure(EditorProject project)
+    public void Configure(ProjectState project)
     {
         ArgumentNullException.ThrowIfNull(project);
         if (_projectId == project.Id) return;
@@ -54,23 +54,24 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         return plan with { VisualLayers = layers };
     }
 
-    public void Queue(EditorProject project)
+    public void Queue(ProjectState project)
     {
         ThrowIfDisposed();
         Configure(project);
-        foreach (var asset in project.Media.Where(asset =>
-                     asset.Kind == MediaKind.Video && !asset.IsMissing && File.Exists(asset.Path)))
+        foreach (var source in project.Sources.Values.Where(source =>
+                     source.Kind == MediaKind.Video &&
+                     source.OnlineState == MediaOnlineState.Online && File.Exists(source.Path)))
         {
-            _jobs.GetOrAdd(asset.Id, _ =>
+            _jobs.GetOrAdd(source.Id, _ =>
             {
-                var job = BuildOrValidateAsync(asset, project.FrameRateValue, _projectId, _generation.Token);
+                var job = BuildOrValidateAsync(source, project.FrameRate, _projectId, _generation.Token);
                 _allJobs.Add(job);
                 return job;
             });
         }
     }
 
-    public async Task PrepareAsync(EditorProject project, CancellationToken cancellationToken = default)
+    public async Task PrepareAsync(ProjectState project, CancellationToken cancellationToken = default)
     {
         Queue(project);
         var jobs = _jobs.Values.ToArray();
@@ -92,8 +93,8 @@ public sealed class PreviewProxyStore : IAsyncDisposable
     }
 
     private async Task BuildOrValidateAsync(
-        MediaAsset asset,
-        KadrStudio.Core.Domain.FrameRate frameRate,
+        MediaSource source,
+        FrameRate frameRate,
         Guid projectId,
         CancellationToken token)
     {
@@ -102,7 +103,12 @@ public sealed class PreviewProxyStore : IAsyncDisposable
         {
             await _encoderGate.WaitAsync(token).ConfigureAwait(false);
             lockTaken = true;
-            var key = ThumbnailService.Key(asset, MediaArtifactKind.ProxyVideo, 0,
+            var fingerprint = !string.IsNullOrWhiteSpace(source.VerifiedFingerprint)
+                ? source.VerifiedFingerprint
+                : !string.IsNullOrWhiteSpace(source.FastFingerprint)
+                    ? source.FastFingerprint
+                    : source.Fingerprint;
+            var key = new MediaCacheKey(source.Id, fingerprint, MediaArtifactKind.ProxyVideo, 0,
                 ((long)frameRate.Numerator << 32) | (uint)frameRate.Denominator, 2);
             var path = await _artifacts.TryGetPayloadPathAsync(key, ".mp4", token).ConfigureAwait(false);
             if (path is null || !await ProbeVideoAsync(path, token).ConfigureAwait(false))
@@ -114,7 +120,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
                     var result = await _runner.RunAsync(_locator.FfmpegPath,
                     [
                         "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-                        "-i", asset.Path, "-map", "0:v:0", "-an",
+                        "-i", source.Path, "-map", "0:v:0", "-an",
                         "-vf", "scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
                         "-r", $"{frameRate.Numerator}/{frameRate.Denominator}",
                         "-fps_mode", "cfr", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -130,8 +136,8 @@ public sealed class PreviewProxyStore : IAsyncDisposable
             File.SetLastAccessTimeUtc(path, DateTime.UtcNow);
             if (_projectId == projectId)
             {
-                _validated[asset.Id] = path;
-                ProxyReady?.Invoke(this, asset.Id);
+                _validated[source.Id] = path;
+                ProxyReady?.Invoke(this, source.Id);
             }
         }
         catch (OperationCanceledException) { }

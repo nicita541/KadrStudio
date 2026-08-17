@@ -1,10 +1,8 @@
-using KadrStudio.Adapters;
 using KadrStudio.Application.Jobs;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
 using KadrStudio.Infrastructure.Jobs;
 using KadrStudio.Infrastructure.Rendering;
-using KadrStudio.Models;
 
 namespace KadrStudio.Services;
 
@@ -15,12 +13,10 @@ namespace KadrStudio.Services;
 /// </summary>
 public sealed class TimelineRenderCoordinator : IAsyncDisposable
 {
-    private readonly EditorProjectMapper _mapper = new();
     private readonly RenderPlanBuilder _planBuilder = new();
     private readonly BackgroundJobScheduler _scheduler = new();
     private readonly FfmpegRenderEngine _engine;
     private readonly FfmpegRenderCommandBuilder _commandBuilder = new();
-    private long _revision;
 
     public TimelineRenderCoordinator(FfmpegLocator locator)
     {
@@ -28,8 +24,8 @@ public sealed class TimelineRenderCoordinator : IAsyncDisposable
         _engine = new FfmpegRenderEngine(locator.FfmpegPath, _commandBuilder, _scheduler);
     }
 
-    public RenderPlan CreatePlan(EditorProject project, TimeRange? range = null)
-        => _planBuilder.Build(_mapper.ToCore(project, Interlocked.Increment(ref _revision)), range);
+    public RenderPlan CreatePlan(ProjectState project, TimeRange? range = null)
+        => _planBuilder.Build(project, range);
 
     public Task<string> RenderAsync(
         RenderPlan plan,

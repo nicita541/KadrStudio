@@ -73,5 +73,6 @@ public interface IArtifactStore : IMediaArtifactCache
         string extension,
         CancellationToken cancellationToken = default);
     Task MoveAsync(string newRoot, CancellationToken cancellationToken = default);
+    Task SetDiskBudgetAsync(long diskBudgetBytes, CancellationToken cancellationToken = default);
     Task ClearAsync(CancellationToken cancellationToken = default);
 }

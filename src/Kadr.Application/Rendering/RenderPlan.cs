@@ -180,7 +180,8 @@ public sealed record RenderOutputOptions(
     bool UseHardwareEncoding = false,
     bool IncludeVideo = true,
     bool IncludeAudio = true,
-    bool IncludeOverlays = true);
+    bool IncludeOverlays = true,
+    bool TransparentBackground = false);
 
 public sealed record ExternalRenderCommand(
     string ExecutableRole,

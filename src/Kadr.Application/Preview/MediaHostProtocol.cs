@@ -43,7 +43,9 @@ public enum MediaHostPacketType : byte
     Position = 14,
     Failure = 15,
     Ping = 16,
-    Pong = 17
+    Pong = 17,
+    Diagnostics = 18,
+    DiagnosticsResult = 19
 }
 
 public sealed record MediaHostPacket(
@@ -88,6 +90,14 @@ public sealed record MediaHostAudioMeterHeader(
     TimelineTime Position,
     long Generation);
 public sealed record MediaHostFailure(string Pipeline, string Message, bool Recoverable);
+public sealed record MediaHostDiagnostics(
+    int ProcessId,
+    int ActiveVideoWorkers,
+    int ActiveAudioWorkers,
+    int PeakVideoWorkers,
+    int PeakAudioWorkers,
+    long StartedVideoWorkers,
+    long StartedAudioWorkers);
 
 public static class MediaHostPacketIO
 {

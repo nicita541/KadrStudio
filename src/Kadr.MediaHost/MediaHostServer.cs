@@ -105,6 +105,11 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
                     await WriteAsync(MediaHostPacket.Empty(MediaHostPacketType.Pong, packet.CorrelationId), cancellationToken)
                         .ConfigureAwait(false);
                     break;
+                case MediaHostPacketType.Diagnostics:
+                    await WriteAsync(MediaHostPacket.Create(
+                        MediaHostPacketType.DiagnosticsResult, _playback.Diagnostics, packet.CorrelationId),
+                        cancellationToken).ConfigureAwait(false);
+                    break;
                 case MediaHostPacketType.Shutdown:
                     await _playback.StopAsync(cancellationToken).ConfigureAwait(false);
                     await AcknowledgeAsync(packet, cancellationToken).ConfigureAwait(false);

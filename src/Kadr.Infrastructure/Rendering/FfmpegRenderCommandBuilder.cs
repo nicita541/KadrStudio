@@ -83,7 +83,8 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
     {
         var duration = Format(plan.Duration.TotalSeconds);
         var frameRate = FrameRateValue(plan.FrameRate);
-        filters.Add($"color=c=black:s={options.Width}x{options.Height}:r={frameRate}:d={duration},format=rgba[vbase]");
+        var background = options.TransparentBackground ? "black@0" : "black";
+        filters.Add($"color=c={background}:s={options.Width}x{options.Height}:r={frameRate}:d={duration},format=rgba[vbase]");
         var previous = "vbase";
         for (var index = 0; index < plan.VisualLayers.Length; index++)
         {
@@ -152,6 +153,7 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             var label = $"aprepared{index}";
             filters.Add(
                 $"[{inputs.Indexes[layer.ClipId]}:a:0]aresample={plan.AudioSampleRate}," +
+                "aformat=sample_fmts=fltp:channel_layouts=stereo," +
                 $"atrim=0:{Format(duration)},asetpts=PTS-STARTPTS," +
                 $"volume={Format(layer.Parameters.Volume)}," + BuildAudioFilters(layer.Parameters, duration) +
                 BuildAudioTransitionFilters(plan, layer, window) +
@@ -305,7 +307,9 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             switch (transition.Kind)
             {
                 case TransitionKind.CrossDissolve:
-                    filters.Add($"fade=t=in:st={Format(localStart)}:d={Format(duration)}:alpha=1");
+                    var elapsed = (window.Range.Start - transition.TimelineRange.Start).TotalSeconds;
+                    filters.Add("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':" +
+                                $"a='alpha(X,Y)*clip((T+{Format(elapsed)})/{Format(duration)},0,1)'");
                     break;
                 case TransitionKind.DipToBlack:
                 case TransitionKind.DipToWhite:
@@ -327,9 +331,9 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         var slide = plan.VideoTransitions.FirstOrDefault(item =>
             item.Kind == TransitionKind.Slide && item.To.ClipId == layer.ClipId);
         if (slide is null) return "0";
-        var start = RelativeStart(slide.TimelineRange, plan.Range);
         var duration = slide.TimelineRange.Duration.TotalSeconds;
-        return $"{width}*(1-clip((t-{Format(start)})/{Format(duration)},0,1))";
+        var elapsed = (plan.Range.Start - slide.TimelineRange.Start).TotalSeconds;
+        return $"{width}*(1-clip((t+{Format(elapsed)})/{Format(duration)},0,1))";
     }
 
     private static string BuildAudioTransitionFilters(
@@ -340,15 +344,15 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         var filters = new List<string>();
         foreach (var transition in plan.AudioTransitions.Where(item => item.From.ClipId == layer.ClipId))
         {
-            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
-            filters.Add($"afade=t=out:st={Format(localStart)}:" +
-                        $"d={Format(transition.TimelineRange.Duration.TotalSeconds)}:curve=iqsin");
+            var elapsed = (window.Range.Start - transition.TimelineRange.Start).TotalSeconds;
+            var duration = transition.TimelineRange.Duration.TotalSeconds;
+            filters.Add($"volume='cos(clip((t+{Format(elapsed)})/{Format(duration)},0,1)*PI/2)':eval=frame");
         }
         foreach (var transition in plan.AudioTransitions.Where(item => item.To.ClipId == layer.ClipId))
         {
-            var localStart = (transition.TimelineRange.Start - window.Range.Start).TotalSeconds;
-            filters.Add($"afade=t=in:st={Format(localStart)}:" +
-                        $"d={Format(transition.TimelineRange.Duration.TotalSeconds)}:curve=hsin");
+            var elapsed = (window.Range.Start - transition.TimelineRange.Start).TotalSeconds;
+            var duration = transition.TimelineRange.Duration.TotalSeconds;
+            filters.Add($"volume='sin(clip((t+{Format(elapsed)})/{Format(duration)},0,1)*PI/2)':eval=frame");
         }
         return filters.Count == 0 ? string.Empty : string.Join(',', filters) + ',';
     }

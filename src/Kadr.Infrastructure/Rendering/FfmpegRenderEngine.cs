@@ -37,7 +37,7 @@ public sealed partial class FfmpegRenderEngine(
                 "render", plan.GetPipelineSignature(options.IncludeVideo, options.IncludeAudio, options.IncludeOverlays),
                 options.Purpose, options.Width, options.Height,
                 options.VideoQuality, options.UseHardwareEncoding, options.IncludeVideo, options.IncludeAudio,
-                options.IncludeOverlays, fullOutput),
+                options.IncludeOverlays, options.TransparentBackground, fullOutput),
             isExport ? JobLane.Export : JobLane.MediaDecode,
             isExport ? JobPriority.UserInitiated : JobPriority.Realtime,
             async token =>

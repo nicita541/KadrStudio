@@ -1,11 +1,9 @@
-using System.Buffers;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Threading.Channels;
 using KadrStudio.Application.Preview;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
-using KadrStudio.Infrastructure.Rendering;
 using NAudio.Wave;
 
 namespace KadrStudio.MediaHost;
@@ -18,7 +16,6 @@ namespace KadrStudio.MediaHost;
 public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
 {
     private readonly string _ffmpegPath = Path.GetFullPath(ffmpegPath);
-    private readonly FfmpegRenderCommandBuilder _commands = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly StereoPcmMeter _meter = new();
     private readonly Stopwatch _fallbackClock = new();
@@ -26,8 +23,8 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     private PreviewRequest _request;
     private CancellationTokenSource? _videoCancellation;
     private CancellationTokenSource? _audioCancellation;
-    private Process? _videoProcess;
-    private Process? _audioProcess;
+    private VideoWorkerSupervisor? _videoWorkers;
+    private AudioWorkerSupervisor? _audioWorkers;
     private Channel<VideoFrame>? _frames;
     private Task? _videoPump;
     private Task? _presentation;
@@ -44,6 +41,14 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     public TimelineTime Position => State == PreviewState.Playing ? GetClockPosition() : _position;
     public VideoFrame? LastFrame => _lastFrame;
     public long AudioGeneration => _request.Generation.Audio;
+    public MediaHostDiagnostics Diagnostics => new(
+        Environment.ProcessId,
+        _videoWorkers?.ActiveWorkerCount ?? 0,
+        _audioWorkers?.ActiveWorkerCount ?? 0,
+        _videoWorkers?.PeakWorkerCount ?? 0,
+        _audioWorkers?.PeakWorkerCount ?? 0,
+        _videoWorkers?.StartedWorkerCount ?? 0,
+        _audioWorkers?.StartedWorkerCount ?? 0);
     public event EventHandler<PreviewState>? StateChanged;
     public event EventHandler<VideoFrame>? FramePresented;
     public event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
@@ -204,10 +209,7 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         var request = _request;
         _videoCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = _videoCancellation.Token;
-        var command = _commands.Build(plan, new RenderOutputOptions(
-            RenderPurpose.FrameServer, "pipe:1", request.Width, request.Height,
-            IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false));
-        _videoProcess = StartProcess(command);
+        _videoWorkers = new VideoWorkerSupervisor(_ffmpegPath, ReportVideoWorkerFailure);
         if (play)
         {
             _frames = Channel.CreateBounded<VideoFrame>(new BoundedChannelOptions(8)
@@ -216,12 +218,14 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
                 SingleWriter = true,
                 FullMode = BoundedChannelFullMode.Wait
             });
-            _videoPump = PumpVideoAsync(_videoProcess, start, request, true, _frames.Writer, token);
+            _videoPump = RunVideoWorkersAsync(
+                _videoWorkers, plan, start, request, continuous: true, _frames.Writer, token);
             _presentation = PresentFramesAsync(_frames.Reader, request.FrameRate, token);
         }
         else
         {
-            _videoPump = PumpVideoAsync(_videoProcess, start, request, false, null, token);
+            _videoPump = RunVideoWorkersAsync(
+                _videoWorkers, plan, start, request, continuous: false, null, token);
         }
     }
 
@@ -230,10 +234,7 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         if (plan.AudioLayers.Length == 0) return;
         _audioCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = _audioCancellation.Token;
-        var command = _commands.Build(plan, new RenderOutputOptions(
-            RenderPurpose.AudioServer, "pipe:1", 16, 16,
-            IncludeVideo: false, IncludeAudio: true, IncludeOverlays: false));
-        _audioProcess = StartProcess(command);
+        _audioWorkers = new AudioWorkerSupervisor(_ffmpegPath, ReportAudioWorkerFailure);
         _audioSampleRate = plan.AudioSampleRate;
         _audioBuffer = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(_audioSampleRate, 2))
         {
@@ -243,38 +244,28 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         };
         _audioOutput = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, true, 80);
         _audioOutput.Init(_audioBuffer);
-        _audioPump = PumpAudioAsync(_audioProcess, token);
+        _audioPump = RunAudioWorkersAsync(_audioWorkers, plan, _request.Generation.Audio, token);
         await WaitForPrerollAsync(_audioBuffer, token).ConfigureAwait(false);
         _fallbackClock.Restart();
         _audioOutput.Play();
     }
 
-    private async Task PumpVideoAsync(
-        Process process,
+    private async Task RunVideoWorkersAsync(
+        VideoWorkerSupervisor workers,
+        RenderPlan plan,
         TimelineTime start,
         PreviewRequest request,
         bool continuous,
         ChannelWriter<VideoFrame>? writer,
         CancellationToken cancellationToken)
     {
-        var frameSize = checked(request.Width * request.Height * 4);
-        var buffer = GC.AllocateUninitializedArray<byte>(frameSize);
-        var index = 0L;
         try
         {
-            while (await ReadExactlyAsync(process.StandardOutput.BaseStream, buffer, cancellationToken).ConfigureAwait(false))
+            await workers.RunAsync(plan, request, start, continuous, async frame =>
             {
-                var bytes = GC.AllocateUninitializedArray<byte>(frameSize);
-                Buffer.BlockCopy(buffer, 0, bytes, 0, frameSize);
-                var frame = new VideoFrame(start + TimelineTime.FromFrames(index++, request.FrameRate),
-                    request.Width, request.Height, request.Width * 4, bytes, request.Generation.Video);
-                if (!continuous)
-                {
-                    Present(frame);
-                    break;
-                }
-                await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
-            }
+                if (continuous) await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+                else Present(frame);
+            }, cancellationToken).ConfigureAwait(false);
             writer?.TryComplete();
         }
         catch (OperationCanceledException) { }
@@ -306,48 +297,27 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         catch (Exception exception) { ReportPipelineFailure(exception, video: true); }
     }
 
-    private async Task PumpAudioAsync(Process process, CancellationToken cancellationToken)
+    private async Task RunAudioWorkersAsync(
+        AudioWorkerSupervisor workers,
+        RenderPlan plan,
+        long generation,
+        CancellationToken cancellationToken)
     {
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
         {
-            while (true)
+            await workers.RunAsync(plan, plan.Range.Start, generation, async block =>
             {
-                var read = await process.StandardOutput.BaseStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                if (read == 0) break;
                 var provider = _audioBuffer;
-                if (provider is null) break;
+                if (provider is null || block.Generation != _request.Generation.Audio) return;
                 while (provider.BufferedDuration > TimeSpan.FromSeconds(1.5))
                     await Task.Delay(10, cancellationToken).ConfigureAwait(false);
-                provider.AddSamples(buffer, 0, read);
-                var complete = read - read % (sizeof(float) * 2);
-                if (complete > 0)
-                {
-                    var samples = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(buffer.AsSpan(0, complete));
-                    AudioMeterUpdated?.Invoke(this, _meter.Measure(samples));
-                }
-            }
+                var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(block.InterleavedSamples.Span);
+                provider.AddSamples(bytes.ToArray(), 0, bytes.Length);
+                AudioMeterUpdated?.Invoke(this, _meter.Measure(block.InterleavedSamples.Span, block.Channels));
+            }, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception exception) { ReportPipelineFailure(exception, video: false); }
-        finally { ArrayPool<byte>.Shared.Return(buffer); }
-    }
-
-    private Process StartProcess(ExternalRenderCommand command)
-    {
-        var info = new ProcessStartInfo
-        {
-            FileName = _ffmpegPath,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        foreach (var argument in command.Arguments) info.ArgumentList.Add(argument);
-        var process = new Process { StartInfo = info };
-        if (!process.Start()) throw new InvalidOperationException("FFmpeg preview pipeline did not start.");
-        _ = DrainErrorsAsync(process);
-        return process;
     }
 
     private async Task StopPipelinesAsync()
@@ -360,12 +330,11 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     private async Task StopVideoAsync()
     {
         _videoCancellation?.Cancel();
-        TryKill(_videoProcess);
+        if (_videoWorkers is not null) await _videoWorkers.DisposeAsync().ConfigureAwait(false);
         var tasks = new[] { _videoPump, _presentation }.Where(item => item is not null).Cast<Task>().ToArray();
         if (tasks.Length > 0)
             try { await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
-        _videoProcess?.Dispose();
-        _videoProcess = null;
+        _videoWorkers = null;
         _videoPump = null;
         _presentation = null;
         _frames = null;
@@ -377,34 +346,16 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     {
         _audioCancellation?.Cancel();
         _audioOutput?.Stop();
-        TryKill(_audioProcess);
+        if (_audioWorkers is not null) await _audioWorkers.DisposeAsync().ConfigureAwait(false);
         if (_audioPump is not null)
             try { await _audioPump.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
-        _audioProcess?.Dispose();
         _audioOutput?.Dispose();
-        _audioProcess = null;
+        _audioWorkers = null;
         _audioOutput = null;
         _audioBuffer = null;
         _audioPump = null;
         _audioCancellation?.Dispose();
         _audioCancellation = null;
-    }
-
-    private static async Task<bool> ReadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken cancellationToken)
-    {
-        var offset = 0;
-        while (offset < buffer.Length)
-        {
-            var read = await stream.ReadAsync(buffer[offset..], cancellationToken).ConfigureAwait(false);
-            if (read == 0) return false;
-            offset += read;
-        }
-        return true;
-    }
-
-    private static async Task DrainErrorsAsync(Process process)
-    {
-        try { await process.StandardError.ReadToEndAsync().ConfigureAwait(false); } catch { }
     }
 
     private static async Task WaitForPrerollAsync(BufferedWaveProvider provider, CancellationToken cancellationToken)
@@ -435,9 +386,15 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
 
     private void ReportPipelineFailure(Exception exception, bool video)
     {
-        if (video && _audioProcess is null || !video && _videoProcess is null) SetState(PreviewState.Failed);
+        if (video && _audioWorkers is null || !video && _videoWorkers is null) SetState(PreviewState.Failed);
         Failed?.Invoke(this, exception);
     }
+
+    private void ReportVideoWorkerFailure(Exception exception)
+        => Failed?.Invoke(this, exception);
+
+    private void ReportAudioWorkerFailure(Exception exception)
+        => Failed?.Invoke(this, exception);
 
     private static RenderPlan SlicePlan(RenderPlan plan, TimeRange range)
     {
@@ -460,11 +417,6 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
 
     private static TimelineTime Clamp(TimelineTime value, TimelineTime minimum, TimelineTime maximum)
         => value < minimum ? minimum : value > maximum ? maximum : value;
-
-    private static void TryKill(Process? process)
-    {
-        try { if (process is { HasExited: false }) process.Kill(entireProcessTree: true); } catch { }
-    }
 
     private void SetState(PreviewState state)
     {

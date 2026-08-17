@@ -185,9 +185,9 @@ public sealed class RenderPlanTests
         var command = new FfmpegRenderCommandBuilder().Build(withVideo, new RenderOutputOptions(
             RenderPurpose.Export, "F:\\output.mp4", 320, 180));
         var graph = command.Arguments[command.Arguments.IndexOf("-filter_complex") + 1];
-        Assert.Contains("fade=t=in", graph);
-        Assert.Contains("curve=iqsin", graph);
-        Assert.Contains("curve=hsin", graph);
+        Assert.Contains("alpha(X,Y)*clip((T+", graph);
+        Assert.Contains("volume='cos(clip((t+", graph);
+        Assert.Contains("volume='sin(clip((t+", graph);
     }
 
     [Fact]

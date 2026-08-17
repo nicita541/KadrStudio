@@ -106,6 +106,17 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
             .ConfigureAwait(false);
     }
 
+    public async Task<MediaHostDiagnostics> GetDiagnosticsAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+        var response = await SendAndWaitAsync(
+            MediaHostPacket.Empty(MediaHostPacketType.Diagnostics, Guid.NewGuid()), cancellationToken)
+            .ConfigureAwait(false);
+        if (response.Type != MediaHostPacketType.DiagnosticsResult)
+            throw new InvalidDataException($"Unexpected diagnostics response {response.Type}.");
+        return response.ReadHeader<MediaHostDiagnostics>();
+    }
+
     public void TerminateHostForTest()
     {
         var process = _host;

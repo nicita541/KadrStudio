@@ -17,5 +17,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Kadr\KadrStudio.csproj" />
+    <ProjectReference Include="..\..\src\Kadr.MediaHost\KadrStudio.MediaHost.csproj" />
   </ItemGroup>
 </Project>

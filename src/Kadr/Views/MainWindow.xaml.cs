@@ -87,6 +87,7 @@ public partial class MainWindow : Window
         TimelineEditor.PlayheadChanged += TimelineEditor_PlayheadChanged;
         TimelineEditor.EditRequested += TimelineEditor_EditRequested;
         TimelineEditor.AssetDropped += TimelineEditor_AssetDropped;
+        UpdateWhisperAvailability();
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -530,19 +531,90 @@ public partial class MainWindow : Window
     }
 
     private void ShowText_Click(object sender, RoutedEventArgs e)
-        => SetLeftPanel(showAnalysis: false, showHistory: false, showText: true);
-
-    private void SetLeftPanel(bool showAnalysis, bool showHistory, bool showText)
     {
-        MediaPanel.Visibility = showAnalysis || showHistory || showText ? Visibility.Collapsed : Visibility.Visible;
+        UpdateWhisperAvailability();
+        SetLeftPanel(showAnalysis: false, showHistory: false, showText: true);
+    }
+
+    private void ShowTransitions_Click(object sender, RoutedEventArgs e)
+    {
+        SetLeftPanel(showAnalysis: false, showHistory: false, showText: false, showTransitions: true);
+        RefreshTransitionList();
+    }
+
+    private void SetLeftPanel(bool showAnalysis, bool showHistory, bool showText, bool showTransitions = false)
+    {
+        MediaPanel.Visibility = showAnalysis || showHistory || showText || showTransitions ? Visibility.Collapsed : Visibility.Visible;
         AnalysisPanel.Visibility = showAnalysis ? Visibility.Visible : Visibility.Collapsed;
         HistoryPanel.Visibility = showHistory ? Visibility.Visible : Visibility.Collapsed;
         TextPanel.Visibility = showText ? Visibility.Visible : Visibility.Collapsed;
-        MediaNavButton.Tag = showAnalysis || showHistory || showText ? null : "Selected";
+        TransitionsPanel.Visibility = showTransitions ? Visibility.Visible : Visibility.Collapsed;
+        MediaNavButton.Tag = showAnalysis || showHistory || showText || showTransitions ? null : "Selected";
         AnalysisNavButton.Tag = showAnalysis ? "Selected" : null;
         HistoryNavButton.Tag = showHistory ? "Selected" : null;
         TextNavButton.Tag = showText ? "Selected" : null;
+        TransitionsNavButton.Tag = showTransitions ? "Selected" : null;
     }
+
+    private void AddTransition_Click(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.SelectedClip is null)
+        {
+            TransitionStatusText.Text = "Выберите левый клип у склейки на таймлайне.";
+            return;
+        }
+        if (TransitionKindComboBox.SelectedItem is not ComboBoxItem { Tag: string tag } ||
+            !Enum.TryParse<KadrStudio.Core.Domain.TransitionKind>(tag, out var kind))
+            return;
+        if (!double.TryParse(TransitionDurationTextBox.Text.Replace(',', '.'),
+                NumberStyles.Float, CultureInfo.InvariantCulture, out var duration))
+        {
+            TransitionStatusText.Text = "Введите длительность числом, например 1,0.";
+            return;
+        }
+        try
+        {
+            var id = _viewModel.AddTransition(_viewModel.SelectedClip.Id, kind, duration);
+            RefreshTransitionList();
+            TransitionListBox.SelectedItem = TransitionListBox.Items.Cast<TransitionListItem>()
+                .FirstOrDefault(item => item.Id == id);
+            TransitionStatusText.Text = "Переход добавлен и сразу участвует в preview/export.";
+            UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+        }
+        catch (Exception exception)
+        {
+            TransitionStatusText.Text = exception.Message;
+        }
+    }
+
+    private void DeleteTransition_Click(object sender, RoutedEventArgs e)
+    {
+        if (TransitionListBox.SelectedItem is not TransitionListItem selected) return;
+        _viewModel.DeleteTransition(selected.Id);
+        RefreshTransitionList();
+        UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+    }
+
+    private void RefreshTransitionList()
+    {
+        TransitionListBox.ItemsSource = _viewModel.GetTransitions()
+            .OrderBy(item => item.Start)
+            .Select(item => new TransitionListItem(
+                item.Id,
+                $"{TransitionKindLabel(item.Kind)}  {FormatEditorTime(item.Start.TotalSeconds)}  {item.Duration.TotalSeconds:0.##} с"))
+            .ToArray();
+    }
+
+    private static string TransitionKindLabel(KadrStudio.Core.Domain.TransitionKind kind) => kind switch
+    {
+        KadrStudio.Core.Domain.TransitionKind.CrossDissolve => "Растворение",
+        KadrStudio.Core.Domain.TransitionKind.DipToBlack => "В чёрный",
+        KadrStudio.Core.Domain.TransitionKind.DipToWhite => "В белый",
+        KadrStudio.Core.Domain.TransitionKind.Wipe => "Вытеснение",
+        KadrStudio.Core.Domain.TransitionKind.Slide => "Сдвиг",
+        KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio => "Аудио Constant Power",
+        _ => kind.ToString()
+    };
 
     private async Task RefreshInlineHistoryAsync(Guid? selectedId = null)
     {
@@ -705,6 +777,12 @@ public partial class MainWindow : Window
 
     private async void AutoSubtitles_Click(object sender, RoutedEventArgs e)
     {
+        var availability = _viewModel.AutoSubtitleService.GetWhisperAvailability();
+        if (!availability.IsReady)
+        {
+            ConfigureWhisper();
+            return;
+        }
         var selected = _viewModel.SelectedClip;
         var audioClip = selected?.Track == TrackKind.Audio
             ? selected
@@ -759,6 +837,44 @@ public partial class MainWindow : Window
         {
             _viewModel.IsBusy = false;
         }
+    }
+
+    private void ConfigureWhisper()
+    {
+        var executableDialog = new OpenFileDialog
+        {
+            Title = "Выберите whisper-cli.exe из whisper.cpp",
+            Filter = "whisper.cpp (whisper*.exe)|whisper*.exe|Программы (*.exe)|*.exe",
+            CheckFileExists = true
+        };
+        if (executableDialog.ShowDialog(this) != true) return;
+        var modelDialog = new OpenFileDialog
+        {
+            Title = "Выберите локальную модель whisper.cpp",
+            Filter = "Модель whisper.cpp (ggml-*.bin)|ggml-*.bin|Модели (*.bin)|*.bin",
+            CheckFileExists = true
+        };
+        if (modelDialog.ShowDialog(this) != true) return;
+        try
+        {
+            WhisperConfiguration.Save(executableDialog.FileName, modelDialog.FileName);
+            UpdateWhisperAvailability();
+            _viewModel.StatusText = "Локальный whisper.cpp настроен";
+        }
+        catch (Exception exception)
+        {
+            ShowError("Не удалось сохранить настройку whisper.cpp", exception);
+        }
+    }
+
+    private void UpdateWhisperAvailability()
+    {
+        var availability = _viewModel.AutoSubtitleService.GetWhisperAvailability();
+        AutoSubtitlesButton.Content = availability.IsReady ? "Автосубтитры" : "Настроить whisper.cpp";
+        WhisperStatusText.Text = availability.Message;
+        WhisperStatusText.Foreground = availability.IsReady
+            ? new SolidColorBrush(Color.FromRgb(110, 231, 183))
+            : FindResource("MutedTextBrush") as Brush ?? Brushes.Gray;
     }
 
     private static TextOverlay CreateSubtitleOverlay(double start, double duration, string text) => new()
@@ -1866,6 +1982,7 @@ public partial class MainWindow : Window
         {
             case nameof(MainViewModel.Project):
                 ResetPreviewState();
+                RefreshTransitionList();
                 break;
             case nameof(MainViewModel.TimelinePresentationRevision):
                 TimelineEditor.Project = _viewModel.Project;
@@ -1883,6 +2000,8 @@ public partial class MainWindow : Window
     }
 
     private void UpdateWindowTitle() => Title = $"{_viewModel.ProjectTitle} — Kadr Studio";
+
+    private sealed record TransitionListItem(Guid Id, string Label);
 
     private async Task<bool> ConfirmCanLoseChangesAsync()
     {

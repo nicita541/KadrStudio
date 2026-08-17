@@ -104,7 +104,8 @@ public sealed class AutomationOrchestrator(
             VideoCodec = asset.VideoCodec,
             AudioCodec = asset.AudioCodec,
             FileSizeBytes = asset.FileSizeBytes,
-            IsMissing = asset.IsMissing
+            IsMissing = asset.IsMissing,
+            ProbeResult = asset.ProbeResult
         };
 
     private static string Fingerprint(MediaAsset asset)

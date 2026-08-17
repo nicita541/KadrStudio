@@ -1008,6 +1008,38 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             inPoint is null ? null : KadrStudio.Core.Domain.TimelineTime.FromSeconds(inPoint.Value),
             outPoint is null ? null : KadrStudio.Core.Domain.TimelineTime.FromSeconds(outPoint.Value)));
 
+    public IReadOnlyList<KadrStudio.Core.Domain.TimelineTransition> GetTransitions()
+        => _editorSession.State.Transitions;
+
+    public Guid AddTransition(Guid fromClipId, KadrStudio.Core.Domain.TransitionKind kind, double durationSeconds)
+    {
+        var state = _editorSession.State;
+        var from = state.FindMediaClip(fromClipId)
+            ?? throw new EditRejectedException("Выбранный клип больше не существует.");
+        var track = state.FindTrack(from.TrackId)
+            ?? throw new EditRejectedException("Дорожка выбранного клипа не найдена.");
+        var to = state.MediaClips
+            .Where(item => item.TrackId == from.TrackId && item.Start == from.End)
+            .OrderBy(item => item.Id)
+            .FirstOrDefault()
+            ?? throw new EditRejectedException("Справа должен находиться соседний клип без зазора.");
+        if (track.Kind == KadrStudio.Core.Domain.TrackKind.Audio &&
+            kind != KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio ||
+            track.Kind == KadrStudio.Core.Domain.TrackKind.Visual &&
+            kind == KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio)
+            throw new EditRejectedException("Тип перехода не подходит выбранной дорожке.");
+        var duration = KadrStudio.Core.Domain.TimelineTime.FromSeconds(Math.Clamp(durationSeconds, 0.04, 30));
+        var half = new KadrStudio.Core.Domain.TimelineTime(duration.Ticks / 2);
+        var transition = new KadrStudio.Core.Domain.TimelineTransition(
+            Guid.NewGuid(), kind, track.Id, from.Id, to.Id, from.End - half, duration);
+        ExecuteCoreCommand("Переход добавлен", new UpsertTransitionCommand(transition), from.Id);
+        return transition.Id;
+    }
+
+    public bool DeleteTransition(Guid transitionId)
+        => ExecuteCoreCommand("Переход удалён",
+            new DeleteTransitionsCommand(new HashSet<Guid> { transitionId }), SelectedClip?.Id);
+
     public Guid? SplitTextOverlay(Guid overlayId, double position)
     {
         var current = _editorSession.State.FindTextClip(overlayId);

@@ -111,16 +111,34 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
                 $"Шаг 5/5: покадровая проверка — {range.Title}"));
             var coarseStart = range.SourceStart;
             var coarseEnd = range.SourceStart + range.Duration;
-            var start = await FindExactCutAsync(asset.Path, coarseStart, result.SourceStart, result.SourceEnd, cancellationToken);
-            var end = await FindExactCutAsync(asset.Path, coarseEnd, result.SourceStart, result.SourceEnd, cancellationToken);
+            var exactFrameRate = asset.ProbeResult?.FrameRate;
+            var fps = exactFrameRate?.FramesPerSecond is > 0 ? exactFrameRate.Value.FramesPerSecond :
+                asset.FrameRate > 0 ? asset.FrameRate : 25;
+            var startVerification = await VerifyBoundaryAsync(
+                asset.Path, coarseStart, result.SourceStart, result.SourceEnd, fps, cancellationToken);
+            var endVerification = await VerifyBoundaryAsync(
+                asset.Path, coarseEnd, result.SourceStart, result.SourceEnd, fps, cancellationToken);
+            var start = startVerification.VerifiedTime;
+            var end = endVerification.VerifiedTime;
             if (end <= start + 0.1)
             {
-                start = coarseStart;
-                end = coarseEnd;
+                // A short semantic range can make both independent searches pick
+                // the same strong cut. Preserve each useful boundary instead of
+                // discarding the verified start and reverting the whole range.
+                if (start >= coarseEnd - 0.1) start = coarseStart;
+                if (coarseEnd > start + 0.1) end = coarseEnd;
+                else if (coarseStart < end - 0.1) start = coarseStart;
             }
-            var fps = asset.FrameRate > 0 ? asset.FrameRate : 25;
-            start = Math.Round(start * fps) / fps;
-            end = Math.Round(end * fps) / fps;
+            if (asset.ProbeResult?.IsVariableFrameRate != true && exactFrameRate is { } rate)
+            {
+                start = KadrStudio.Core.Domain.TimelineTime.FromSeconds(start).SnapToFrame(rate).TotalSeconds;
+                end = KadrStudio.Core.Domain.TimelineTime.FromSeconds(end).SnapToFrame(rate).TotalSeconds;
+            }
+            else if (asset.ProbeResult?.IsVariableFrameRate != true)
+            {
+                start = Math.Round(start * fps) / fps;
+                end = Math.Round(end * fps) / fps;
+            }
             var startDelta = start - coarseStart;
             var endDelta = end - coarseEnd;
             var startFrames = (int)Math.Round(startDelta * fps);
@@ -129,7 +147,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             var description = string.Join(" ", new[]
             {
                 range.Description,
-                $"Каскад: общий обзор → точная зона → проверка соседних кадров.",
+                $"Каскад: общий обзор → кандидаты склеек → точная зона → проверка соседних кадров.",
                 $"Начало сдвинуто на {Signed(startDelta)} с ({Signed(startFrames)} кадр.), конец — на {Signed(endDelta)} с ({Signed(endFrames)} кадр.).",
                 $"Расчётная точность ±{precision:0.###} с (1 кадр при {fps:0.###} fps)."
             }.Where(value => !string.IsNullOrWhiteSpace(value)));
@@ -157,19 +175,29 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         };
     }
 
-    private async Task<double> FindExactCutAsync(
+    public async Task<BoundaryVerificationResult> VerifyBoundaryAsync(
         string path,
         double target,
         double minimum,
         double maximum,
-        CancellationToken cancellationToken)
+        double framesPerSecond,
+        CancellationToken cancellationToken = default)
     {
-        if (target <= minimum + 0.05) return minimum;
-        if (target >= maximum - 0.05) return maximum;
-        var coarseCandidates = await ScanSceneCutsAsync(path, target, minimum, maximum, 12, 0.18, cancellationToken);
+        if (target <= minimum + 0.05)
+            return new BoundaryVerificationResult(target, minimum, minimum, minimum, 0, 0, 0);
+        if (target >= maximum - 0.05)
+            return new BoundaryVerificationResult(target, maximum, maximum, maximum, 0, 0, 0);
+        var coarseCandidates = await ScanSceneCutsAsync(path, target, minimum, maximum, 12, 0.10, cancellationToken);
         var coarse = coarseCandidates.OrderBy(time => Math.Abs(time - target)).FirstOrDefault(target);
-        var fineCandidates = await ScanSceneCutsAsync(path, coarse, minimum, maximum, 3, 0.07, cancellationToken);
-        return fineCandidates.OrderBy(time => Math.Abs(time - coarse)).FirstOrDefault(coarse);
+        var fineCandidates = await ScanSceneCutsAsync(path, coarse, minimum, maximum, 3, 0.035, cancellationToken);
+        var fine = fineCandidates.OrderBy(time => Math.Abs(time - coarse)).FirstOrDefault(coarse);
+        var verificationRadius = Math.Max(0.25, 6 / Math.Max(1, framesPerSecond));
+        var frameCandidates = await ScanSceneCutsAsync(
+            path, fine, minimum, maximum, verificationRadius, 0.012, cancellationToken);
+        var verified = frameCandidates.OrderBy(time => Math.Abs(time - fine)).FirstOrDefault(fine);
+        return new BoundaryVerificationResult(
+            target, coarse, fine, verified,
+            coarseCandidates.Count, fineCandidates.Count, frameCandidates.Count);
     }
 
     private async Task<IReadOnlyList<double>> ScanSceneCutsAsync(
@@ -544,3 +572,12 @@ public sealed record DetectedVideoRange(
     double Confidence);
 
 public sealed record VideoAnalysisProgress(double Percent, string Stage);
+
+public sealed record BoundaryVerificationResult(
+    double RequestedTime,
+    double CoarseCandidate,
+    double FineCandidate,
+    double VerifiedTime,
+    int CoarseCandidateCount,
+    int FineCandidateCount,
+    int FrameCandidateCount);

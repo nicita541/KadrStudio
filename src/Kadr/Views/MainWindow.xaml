@@ -162,21 +162,15 @@
                         <TextBlock Text="История" FontSize="9" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
-                <Button Style="{StaticResource NavButton}" IsEnabled="False" Visibility="Collapsed" ToolTip="Будет добавлено в следующей версии">
-                    <StackPanel>
-                        <TextBlock Text="&#xE714;" FontFamily="Segoe MDL2 Assets" FontSize="20" HorizontalAlignment="Center" />
-                        <TextBlock Text="Запись" FontSize="10" HorizontalAlignment="Center" Margin="0,4,0,0" />
-                    </StackPanel>
-                </Button>
                 <Button x:Name="TextNavButton" Style="{StaticResource NavButton}" ToolTip="Текст и автосубтитры" Click="ShowText_Click">
                     <StackPanel>
                         <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M4,5 L20,5 M12,5 L12,20 M8,20 L16,20" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Canvas></Viewbox>
                         <TextBlock Text="Текст" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
-                <Button Style="{StaticResource NavButton}" IsEnabled="False" Visibility="Collapsed" ToolTip="Будет добавлено в следующей версии">
+                <Button x:Name="TransitionsNavButton" Style="{StaticResource NavButton}" ToolTip="Переходы между соседними клипами" Click="ShowTransitions_Click">
                     <StackPanel>
-                        <TextBlock Text="&#xE8D7;" FontFamily="Segoe MDL2 Assets" FontSize="20" HorizontalAlignment="Center" />
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M3,5 L13,5 L13,19 L3,19 Z M11,12 L21,5 L21,19 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.7" Fill="Transparent" StrokeLineJoin="Round"/></Canvas></Viewbox>
                         <TextBlock Text="Переходы" FontSize="9" HorizontalAlignment="Center" Margin="0,4,0,0" />
                     </StackPanel>
                 </Button>
@@ -562,8 +556,13 @@
                     <Grid Margin="0,0,0,8">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                         <Button Style="{StaticResource AccentButton}" Click="CreateTextOverlay_Click" Content="Добавить текст" Padding="8,7" />
-                        <Button Grid.Column="2" Style="{StaticResource ButtonBase}" Click="AutoSubtitles_Click" Content="Автосубтитры" Padding="8,7" />
+                        <Button x:Name="AutoSubtitlesButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="AutoSubtitles_Click" Content="Автосубтитры" Padding="8,7" />
                     </Grid>
+                    <TextBlock x:Name="WhisperStatusText"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               FontSize="9"
+                               TextWrapping="Wrap"
+                               Margin="0,0,0,8" />
                     <Button Style="{StaticResource ButtonBase}" Click="ImportSrt_Click" Content="Импортировать SRT…" Padding="8,7" Margin="0,0,0,10" />
 
                     <ListBox x:Name="TextOverlayList"
@@ -610,6 +609,36 @@
                     <Button Style="{StaticResource ButtonBase}" Click="DeleteTextOverlay_Click" Content="Удалить выбранный текст" Foreground="#FFBBC2" BorderBrush="#70404A" Padding="8,7" />
                 </StackPanel>
             </ScrollViewer>
+        </Border>
+
+        <!-- Переходы -->
+        <Border x:Name="TransitionsPanel"
+                Grid.Row="1" Grid.Column="1"
+                Background="{StaticResource PanelBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,1,0"
+                Visibility="Collapsed">
+            <StackPanel Margin="14">
+                <TextBlock Text="Переходы" FontSize="18" FontWeight="SemiBold" />
+                <TextBlock Text="Выберите левый клип у склейки. Переход использует доступные края исходников."
+                           Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,14" />
+                <TextBlock Text="Тип" Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
+                <ComboBox x:Name="TransitionKindComboBox" SelectedIndex="0" Margin="0,4,0,10">
+                    <ComboBoxItem Content="Перекрёстное растворение" Tag="CrossDissolve" />
+                    <ComboBoxItem Content="Затемнение в чёрный" Tag="DipToBlack" />
+                    <ComboBoxItem Content="Затемнение в белый" Tag="DipToWhite" />
+                    <ComboBoxItem Content="Вытеснение" Tag="Wipe" />
+                    <ComboBoxItem Content="Сдвиг" Tag="Slide" />
+                    <ComboBoxItem Content="Плавный аудиопереход" Tag="ConstantPowerAudio" />
+                </ComboBox>
+                <TextBlock Text="Длительность, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
+                <TextBox x:Name="TransitionDurationTextBox" Text="1.0" Margin="0,4,0,12" />
+                <Button Style="{StaticResource AccentButton}" Click="AddTransition_Click" Content="Добавить на выбранную склейку" Padding="8,8" />
+                <TextBlock x:Name="TransitionStatusText" Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,10,0,12" />
+                <TextBlock Text="Переходы проекта" FontWeight="SemiBold" Margin="0,0,0,6" />
+                <ListBox x:Name="TransitionListBox" Height="180" DisplayMemberPath="Label" Margin="0,0,0,10" />
+                <Button Style="{StaticResource ButtonBase}" Click="DeleteTransition_Click" Content="Удалить выбранный переход" Foreground="#FFBBC2" BorderBrush="#70404A" Padding="8,7" />
+            </StackPanel>
         </Border>
 
         <GridSplitter Grid.Row="1"

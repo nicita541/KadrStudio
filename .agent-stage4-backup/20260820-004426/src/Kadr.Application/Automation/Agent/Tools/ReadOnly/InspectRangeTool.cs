@@ -6,7 +6,7 @@ public sealed class InspectRangeTool : IAgentTool
 {
     private static readonly AgentToolDescriptor ToolDescriptor = new(
         "inspect_range",
-        "Inspect only a requested time range of media or a sequence. Use this instead of analyzing an entire file when the task only needs local context. The requested detail controls the evidence channel. Optional query tells the analysis backend what semantic question the agent is trying to answer.",
+        "Inspect only a requested time range of media or a sequence. Use this instead of analyzing an entire file when the task only needs local context. The requested detail controls what kind of evidence the backend should return.",
         AgentToolAccess.ReadOnly,
         AgentToolJson.ParseObject(
             """
@@ -33,11 +33,6 @@ public sealed class InspectRangeTool : IAgentTool
                   "type": "string",
                   "enum": ["summary", "frames", "audio", "transcript", "all"],
                   "default": "summary"
-                },
-                "query": {
-                  "type": "string",
-                  "maxLength": 2000,
-                  "description": "Optional semantic question for this exact range. Keep it task-specific and concise."
                 }
               },
               "required": [
@@ -70,8 +65,7 @@ public sealed class InspectRangeTool : IAgentTool
             "target_id",
             "start_seconds",
             "end_seconds",
-            "detail",
-            "query");
+            "detail");
 
         var targetKind = ParseTargetKind(
             AgentToolJson.RequireString(arguments, "target_kind"));
@@ -95,15 +89,13 @@ public sealed class InspectRangeTool : IAgentTool
 
         var detail = ParseDetail(
             AgentToolJson.OptionalString(arguments, "detail"));
-        var query = AgentToolJson.OptionalString(arguments, "query") ?? string.Empty;
 
         var request = new AgentRangeInspectionRequest(
             targetKind,
             targetId,
             startSeconds,
             endSeconds,
-            detail,
-            query);
+            detail);
 
         var data = await _backend.InspectRangeAsync(
             context,

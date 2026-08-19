@@ -74,62 +74,6 @@ public sealed class AutomationOrchestrator(
         return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<VideoAnalysisPipelineResult> InspectTechnicalRangeAsync(
-        VideoAnalysisRequest request,
-        IProgress<VideoAnalysisProgress>? progress = null,
-        CancellationToken cancellationToken = default,
-        JobPriority priority = JobPriority.UserInitiated)
-    {
-        var isolatedRequest = request with { Asset = CopyAsset(request.Asset) };
-        var key = JobKey.Create(
-            "agent-technical-range",
-            isolatedRequest.Asset.Id,
-            Fingerprint(isolatedRequest.Asset),
-            isolatedRequest.SourceStart,
-            isolatedRequest.SourceEnd);
-
-        var job = scheduler.Schedule(new JobRequest<VideoAnalysisPipelineResult>(
-            key,
-            JobLane.Analysis,
-            priority,
-            async token =>
-            {
-                var result = await analysis.AnalyzeAsync(
-                    isolatedRequest,
-                    progress,
-                    token).ConfigureAwait(false);
-
-                // VideoAnalysisService also emits heuristic structural labels for the legacy
-                // montage flow. Agent observations must not present those guesses as facts.
-                // Keep only mechanical measurements here; semantic meaning is requested
-                // separately from the generic vision tool when the agent needs it.
-                var technicalRanges = result.Ranges
-                    .Where(item => item.Kind is MarkerKind.Scene or MarkerKind.BlackFrame or
-                        MarkerKind.Silence or MarkerKind.Freeze)
-                    .OrderBy(item => item.SourceStart)
-                    .ThenBy(item => item.Kind)
-                    .ToArray();
-
-                var sceneCount = technicalRanges.Count(item => item.Kind == MarkerKind.Scene);
-                var blackCount = technicalRanges.Count(item => item.Kind == MarkerKind.BlackFrame);
-                var silenceCount = technicalRanges.Count(item => item.Kind == MarkerKind.Silence);
-                var freezeCount = technicalRanges.Count(item => item.Kind == MarkerKind.Freeze);
-                var technical = result with
-                {
-                    Summary =
-                        $"Technical range {result.SourceStart:0.###}-{result.SourceEnd:0.###}s: " +
-                        $"scene cuts {sceneCount}, black frames {blackCount}, " +
-                        $"silences {silenceCount}, freezes {freezeCount}.",
-                    Ranges = technicalRanges
-                };
-
-                return new VideoAnalysisPipelineResult(technical, null);
-            },
-            PauseDuringExport: priority >= JobPriority.Background));
-
-        return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
-    }
-
     public async Task<VideoAnalysisPipelineResult> EnhanceStructureAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
@@ -159,45 +103,6 @@ public sealed class AutomationOrchestrator(
                 return new VideoAnalysisPipelineResult(refined, null);
             },
             PauseDuringExport: priority >= JobPriority.Background));
-        return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
-    }
-
-    public async Task<OllamaRangeInspection> InspectRangeAsync(
-        MediaAsset asset,
-        VideoAnalysisResult baseline,
-        string query,
-        string model,
-        IProgress<VideoAnalysisProgress>? progress = null,
-        CancellationToken cancellationToken = default,
-        JobPriority priority = JobPriority.UserInitiated)
-    {
-        if (string.IsNullOrWhiteSpace(model))
-            throw new ArgumentException("A vision model is required.", nameof(model));
-
-        var snapshot = CopyAsset(asset);
-        var key = JobKey.Create(
-            "agent-range-vision",
-            snapshot.Id,
-            Fingerprint(snapshot),
-            baseline.SourceStart,
-            baseline.SourceEnd,
-            query,
-            model);
-
-        var job = scheduler.Schedule(new JobRequest<OllamaRangeInspection>(
-            key,
-            JobLane.Analysis,
-            priority,
-            token => new ValueTask<OllamaRangeInspection>(
-                ollama.InspectRangeAsync(
-                    snapshot,
-                    baseline,
-                    query,
-                    model,
-                    progress,
-                    token)),
-            PauseDuringExport: priority >= JobPriority.Background));
-
         return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
     }
 

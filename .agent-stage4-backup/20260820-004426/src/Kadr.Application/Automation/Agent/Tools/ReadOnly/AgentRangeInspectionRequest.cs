@@ -20,5 +20,4 @@ public sealed record AgentRangeInspectionRequest(
     Guid TargetId,
     double StartSeconds,
     double EndSeconds,
-    AgentRangeInspectionDetail Detail,
-    string Query = "");
+    AgentRangeInspectionDetail Detail);

@@ -6,9 +6,6 @@ using System.Windows.Data;
 using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
-using KadrStudio.Application.Automation.Agent;
-using KadrStudio.Application.Automation.Agent.Tools;
-using KadrStudio.Application.Automation.Agent.Tools.ReadOnly;
 using KadrStudio.Application.Media;
 using KadrStudio.Application.Storage;
 using KadrStudio.Infrastructure.Media;
@@ -16,7 +13,6 @@ using KadrStudio.Application.Caching;
 using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Models;
 using KadrStudio.Services;
-using KadrStudio.Services.Agent;
 using CoreGameEditingProfile = KadrStudio.Core.Domain.GameEditingProfile;
 using CoreMediaAnalysisManifest = KadrStudio.Core.Domain.MediaAnalysisManifest;
 using CoreMontagePlan = KadrStudio.Core.Domain.MontagePlan;
@@ -97,19 +93,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AiMontageCoordinator = new AiMontageCoordinator(
             AiMontageAnalysisService,
             new OllamaMontagePlanningProvider(OllamaVideoAnalysisService));
-
-        AiAgentOrchestrator = new AiAgentOrchestrator();
-        var agentRangeInspector = new AgentMediaRangeInspector(
-            AutomationOrchestrator,
-            AutoSubtitleService,
-            OllamaVideoAnalysisService,
-            _artifactStore);
-        AgentReadOnlyToolBackend = new KadrAgentReadOnlyToolBackend(
-            () => _editorSession.State,
-            agentRangeInspector);
-        AgentToolRegistry = AgentReadOnlyToolSet.Create(AgentReadOnlyToolBackend);
-        AgentToolExecutor = new AgentToolExecutor(AgentToolRegistry);
-
         AttachProject(_project);
         BuildMediaView();
     }
@@ -126,10 +109,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public AiMontageAnalysisService AiMontageAnalysisService { get; }
     public IAiMontageCoordinator AiMontageCoordinator { get; }
-    public AiAgentOrchestrator AiAgentOrchestrator { get; }
-    public KadrAgentReadOnlyToolBackend AgentReadOnlyToolBackend { get; }
-    public AgentToolRegistry AgentToolRegistry { get; }
-    public AgentToolExecutor AgentToolExecutor { get; }
     public IArtifactStore ArtifactStore => _artifactStore;
     public KadrStudio.Core.Domain.ProjectState CoreState => _editorSession.State;
     public long TimelinePresentationRevision => _timelinePresentationRevision;

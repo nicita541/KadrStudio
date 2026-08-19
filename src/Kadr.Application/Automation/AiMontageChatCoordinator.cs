@@ -17,23 +17,85 @@ public sealed class AiMontageChatCoordinator
 {
     public AiChatRoute Route(string message, string? explicitPresetId, MontagePlan? activePlan = null)
     {
+        var normalized = message.Trim().ToLowerInvariant();
+
         if (!string.IsNullOrWhiteSpace(explicitPresetId))
         {
-            var preset = AutomationPresets.BuiltIn.FirstOrDefault(item =>
-                item.Id.Equals(explicitPresetId, StringComparison.OrdinalIgnoreCase));
-            if (preset is not null) return new AiChatRoute(AiChatIntentKind.PresetMontage, preset);
+            var explicitPreset = AutomationPresets.BuiltIn.FirstOrDefault(
+                preset => string.Equals(
+                    preset.Id,
+                    explicitPresetId,
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (explicitPreset is not null)
+            {
+                return new AiChatRoute(
+                    AiChatIntentKind.PresetMontage,
+                    explicitPreset);
+            }
         }
 
-        var normalized = message.Trim().ToLowerInvariant();
         if (activePlan is not null && ContainsAny(normalized,
                 "исправ", "измени", "оставь", "не удаляй", "сделай", "пересобери"))
-            return new AiChatRoute(AiChatIntentKind.PlanRevision, activePlan.PresetSnapshot);
+        {
+            return new AiChatRoute(
+                AiChatIntentKind.PlanRevision,
+                activePlan.PresetSnapshot);
+        }
+
+        // Явная команда объединения нескольких серий.
         if (ContainsAny(normalized,
-                "объедини серии", "объединить серии", "склей серии", "склеить серии",
-                "опенинг", "эндинг", "рекап", "что было в предыдущей", "что будет далее"))
-            return new AiChatRoute(AiChatIntentKind.PresetMontage, AutomationPresets.AnimeMergeEpisodes);
-        if (ContainsAny(normalized, "удали ", "выреж", "разреж", "раздели", "delete ", "split "))
+                "объедини серии",
+                "объединить серии",
+                "склей серии",
+                "склеить серии"))
+        {
+            return new AiChatRoute(
+                AiChatIntentKind.PresetMontage,
+                AutomationPresets.AnimeMergeEpisodes);
+        }
+
+        // Удаление структурных частей видео должно идти через AI-план,
+        // потому что сначала нужно определить, где находится опенинг/эндинг/рекап.
+        var asksToRemove = ContainsAny(normalized,
+            "удали ",
+            "удалить ",
+            "убери ",
+            "убрать ",
+            "выреж",
+            "remove ");
+
+        var mentionsStructuralPart = ContainsAny(normalized,
+            "опенинг",
+            "эндинг",
+            "рекап",
+            "opening",
+            "ending",
+            "recap");
+
+        if (asksToRemove && mentionsStructuralPart)
+        {
+            return new AiChatRoute(AiChatIntentKind.MontagePlan);
+        }
+
+        // Обычные прямые команды таймлайна.
+        if (ContainsAny(normalized,
+                "удали ",
+                "удалить ",
+                "убери ",
+                "убрать ",
+                "выреж",
+                "разреж",
+                "раздели",
+                "delete ",
+                "remove ",
+                "split "))
+        {
             return new AiChatRoute(AiChatIntentKind.TimelineCommand);
+        }
+
+        // Упоминание аниме-структуры само по себе больше не означает,
+        // что пользователь хочет объединять несколько серий.
         return new AiChatRoute(AiChatIntentKind.MontagePlan);
     }
 

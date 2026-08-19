@@ -89,15 +89,51 @@ $ollamaCandidates = @(
     (Join-Path $repoRoot 'tools\ollama.exe'),
     (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
 )
+
 $ollamaCommand = Get-Command ollama.exe -ErrorAction SilentlyContinue
-if ($ollamaCommand) { $ollamaCandidates += $ollamaCommand.Source }
-$ollamaSource = $ollamaCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-if (-not $ollamaSource) {
-    throw 'Не найден ollama.exe для встроенного локального ИИ-сервера.'
+if ($ollamaCommand) {
+    $ollamaCandidates += $ollamaCommand.Source
 }
+
+$ollamaSource = $ollamaCandidates |
+    Where-Object {
+        if (-not $_ -or -not (Test-Path -LiteralPath $_ -PathType Leaf)) {
+            return $false
+        }
+
+        $root = Split-Path -Parent $_
+        $server = Join-Path $root 'lib\ollama\llama-server.exe'
+
+        Test-Path -LiteralPath $server -PathType Leaf
+    } |
+    Select-Object -First 1
+
+if (-not $ollamaSource) {
+    throw 'Не найден полный runtime Ollama с lib\ollama\llama-server.exe.'
+}
+
+$ollamaRoot = Split-Path -Parent $ollamaSource
+$ollamaLibSource = Join-Path $ollamaRoot 'lib'
+
 $aiPath = Join-Path $publishPath 'ai'
 New-Item -ItemType Directory -Path $aiPath -Force | Out-Null
-Copy-Item -LiteralPath $ollamaSource -Destination (Join-Path $aiPath 'ollama.exe') -Force
+
+Copy-Item `
+    -LiteralPath $ollamaSource `
+    -Destination (Join-Path $aiPath 'ollama.exe') `
+    -Force
+
+Copy-Item `
+    -LiteralPath $ollamaLibSource `
+    -Destination (Join-Path $aiPath 'lib') `
+    -Recurse `
+    -Force
+
+$embeddedLlamaServer = Join-Path $aiPath 'lib\ollama\llama-server.exe'
+
+if (-not (Test-Path -LiteralPath $embeddedLlamaServer -PathType Leaf)) {
+    throw 'В Release не попал lib\ollama\llama-server.exe.'
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'KadrStudio.exe'))) {
     throw 'Сборка не создала KadrStudio.exe.'

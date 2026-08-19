@@ -561,6 +561,66 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 contextText.AppendLine($"- {item.Id:N}");
         }
 
+        using var montageSchema = JsonDocument.Parse(
+            """
+            {
+              "type": "object",
+              "properties": {
+                "summary": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "segment_id": {
+                        "type": "string"
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "hook",
+                          "setup",
+                          "development",
+                          "payoff",
+                          "ending"
+                        ]
+                      },
+                      "transition_after": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "cross_dissolve",
+                          "dip_to_black"
+                        ]
+                      },
+                      "volume": {
+                        "type": "number"
+                      },
+                      "subtitles": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "segment_id",
+                      "role",
+                      "transition_after",
+                      "volume",
+                      "subtitles"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "summary",
+                "items"
+              ],
+              "additionalProperties": false
+            }
+            """);
+
         using var response = await _httpClient.PostAsJsonAsync(
             "api/chat",
             new
@@ -568,29 +628,75 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 model,
                 stream = false,
                 think = false,
-                format = "json",
+                format = montageSchema.RootElement,
                 messages = new object[]
                 {
                     new
                     {
                         role = "system",
                         content =
-                            "Ты универсальный режиссёр монтажа. Материал может быть любым: разговор, фильм, аниме, игра, обучение, блог или запись события. " +
-                            "Ты не меняешь таймлайн, а возвращаешь декларативный план JSON без Markdown: " +
-                            "{\"summary\":\"...\",\"items\":[{\"segment_id\":\"32 hex\",\"role\":\"hook|setup|development|payoff|ending\"," +
-                            "\"reason\":\"почему\",\"transition_after\":\"none|cross_dissolve|dip_to_black\",\"volume\":1.0,\"subtitles\":true}]}. " +
-                            "Используй только переданные segment_id, каждый максимум один раз. Обязательные элементы включай всегда. " +
-                            "Строй понятную причинно-следственную историю и соблюдай целевую длительность."
+                            "Ты универсальный режиссёр монтажа. " +
+                            "Верни только JSON строго по переданной JSON Schema, без Markdown и без текста вокруг JSON. " +
+                            "Используй только переданные segment_id и каждый не более одного раза. " +
+                            "Порядок items — итоговый порядок монтажа. " +
+                            "Обязательные элементы включай всегда. " +
+                            "Не используй все кандидаты без необходимости: выбери материал под целевую длительность. " +
+                            "Роли: hook, setup, development, payoff, ending."
                     },
-                    new { role = "user", content = contextText.ToString() }
+                    new
+                    {
+                        role = "user",
+                        content = contextText.ToString()
+                    }
                 },
-                options = new { temperature = 0.12, num_ctx = 16384, num_predict = 4096 }
+                options = new
+                {
+                    temperature = 0,
+                    num_ctx = 32768,
+                    num_predict = 8192
+                }
             },
             cancellationToken);
-        await EnsureSuccessAsync(response, $"ИИ-модель {model} не составила план монтажа", cancellationToken);
+
+        await EnsureSuccessAsync(
+            response,
+            $"ИИ-модель {model} не составила план монтажа",
+            cancellationToken);
+
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
         using var envelope = JsonDocument.Parse(responseJson);
-        var rawContent = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+
+        var rawContent =
+            envelope.RootElement
+                .GetProperty("message")
+                .GetProperty("content")
+                .GetString()
+            ?? string.Empty;
+
+        var doneReason =
+            envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
+                ? doneReasonElement.GetString()
+                : null;
+
+        var evalCount =
+            envelope.RootElement.TryGetProperty("eval_count", out var evalCountElement) &&
+            evalCountElement.TryGetInt32(out var parsedEvalCount)
+                ? parsedEvalCount
+                : 0;
+
+        if (string.IsNullOrWhiteSpace(rawContent))
+        {
+            throw new InvalidOperationException(
+                $"ИИ вернул пустой монтажный план. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+        }
+
+        if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
+            !rawContent.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"ИИ оборвал JSON до завершения. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+        }
+
         using var result = JsonDocument.Parse(ExtractJson(rawContent));
         var summary = GetString(result.RootElement, "summary");
         var items = new List<CoreMontagePlanItem>();

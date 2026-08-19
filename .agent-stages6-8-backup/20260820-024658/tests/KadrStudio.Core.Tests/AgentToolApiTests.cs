@@ -156,7 +156,7 @@ public sealed class AgentToolApiTests
     }
 
     [Fact]
-    public async Task Editing_tool_requires_separate_draft()
+    public async Task Editing_tool_is_blocked_by_stage_three_executor()
     {
         var registry = new AgentToolRegistry();
         registry.Register(new FakeEditingTool());
@@ -169,44 +169,7 @@ public sealed class AgentToolApiTests
             AgentToolCall.Create(task.Id, "fake_edit"));
 
         Assert.Equal(AgentToolResultStatus.Rejected, result.Status);
-        Assert.Equal("draft_required", result.ErrorCode);
-    }
-
-    [Fact]
-    public async Task Editing_tool_is_rejected_during_planning()
-    {
-        var registry = new AgentToolRegistry();
-        registry.Register(new FakeEditingTool());
-
-        var executor = new AgentToolExecutor(registry);
-        var task = CreateTask(phase: AgentTaskPhase.Investigating);
-
-        var result = await executor.ExecuteAsync(
-            task,
-            AgentToolCall.Create(task.Id, "fake_edit"));
-
-        Assert.Equal(AgentToolResultStatus.Rejected, result.Status);
-        Assert.Equal("editing_phase_required", result.ErrorCode);
-    }
-
-    [Fact]
-    public async Task Editing_tool_can_execute_only_on_separate_draft()
-    {
-        var registry = new AgentToolRegistry();
-        registry.Register(new FakeEditingTool());
-
-        var executor = new AgentToolExecutor(registry);
-        var task = CreateTask(
-            phase: AgentTaskPhase.Executing,
-            sourceSequenceId: Guid.NewGuid(),
-            draftSequenceId: Guid.NewGuid());
-
-        var result = await executor.ExecuteAsync(
-            task,
-            AgentToolCall.Create(task.Id, "fake_edit"));
-
-        Assert.True(result.IsSuccess);
-        Assert.Equal("fake_edit", result.ToolName);
+        Assert.Equal("editing_tools_disabled", result.ErrorCode);
     }
 
     [Fact]
@@ -392,13 +355,8 @@ public sealed class AgentToolApiTests
             AgentToolContext context,
             JsonElement arguments,
             CancellationToken cancellationToken)
-            => ValueTask.FromResult(
-                AgentToolExecutionOutput.From(
-                    "Fake draft edit completed.",
-                    new
-                    {
-                        draft_sequence_id = context.DraftSequenceId
-                    }));
+            => throw new InvalidOperationException(
+                "Editing tool must not execute during Stage 3.");
     }
 
     private sealed class LargeReadOnlyTool : IAgentTool

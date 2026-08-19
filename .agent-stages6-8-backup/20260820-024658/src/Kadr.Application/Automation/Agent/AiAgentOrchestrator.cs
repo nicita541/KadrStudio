@@ -48,8 +48,7 @@ public sealed class AiAgentOrchestrator
         Guid projectId,
         Guid sourceSequenceId,
         string userRequest,
-        Guid? conversationId = null,
-        long? sourceSequenceRevision = null)
+        Guid? conversationId = null)
     {
         if (projectId == Guid.Empty)
         {
@@ -94,8 +93,7 @@ public sealed class AiAgentOrchestrator
                 null,
                 null,
                 now,
-                now,
-                sourceSequenceRevision);
+                now);
 
             created = AppendJournal(
                 created,
@@ -110,9 +108,7 @@ public sealed class AiAgentOrchestrator
         return created;
     }
 
-    public AgentTaskState BeginInvestigation(
-        string? note = null,
-        long? sourceSequenceRevision = null)
+    public AgentTaskState BeginInvestigation(string? note = null)
     {
         return Mutate(current =>
         {
@@ -141,7 +137,6 @@ public sealed class AiAgentOrchestrator
                 Phase = AgentTaskPhase.Investigating,
                 ResumePhase = null,
                 Plan = plan,
-                SourceSequenceRevision = sourceSequenceRevision ?? current.SourceSequenceRevision,
                 UpdatedAt = now
             };
 

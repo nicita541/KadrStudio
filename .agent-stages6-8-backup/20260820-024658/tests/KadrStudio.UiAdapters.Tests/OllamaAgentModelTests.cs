@@ -131,7 +131,7 @@ public sealed class OllamaAgentModelTests
     {
         var handler = new AgentOllamaHandler(
             """
-            {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"Собрать безопасный черновик.","plan_summary":"Изменения будут выполнены только после утверждения.","plan_constraints":["Не менять основной таймлайн."],"plan_steps":[{"title":"Исследовать","description":"Использовать только необходимые наблюдения."},{"title":"Смонтировать","description":"Работать в отдельном Agent Draft."},{"title":"Проверить","description":"Проверить результат после монтажа."}],"completion_summary":""}
+            {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"Собрать безопасный черновик.","plan_summary":"Изменения будут выполнены только после утверждения.","plan_constraints":["Не менять основной таймлайн."],"plan_steps":[{"title":"Исследовать","description":"Использовать только необходимые наблюдения."},{"title":"Смонтировать","description":"Работать в отдельном Agent Draft."},{"title":"Проверить","description":"Проверить результат после монтажа."}]}
             """);
 
         var options = new OllamaServerOptions(
@@ -160,104 +160,10 @@ public sealed class OllamaAgentModelTests
         Assert.Equal(
             "Собрать безопасный черновик.",
             decision.Plan!.Objective);
-        Assert.Collection(
-            decision.Plan.Steps,
-            step => Assert.Equal("Исследовать", step.Title),
-            step => Assert.Equal("Смонтировать", step.Title),
-            step => Assert.Equal("Проверить", step.Title));
+        Assert.Equal(3, decision.Plan.Steps.Length);
         Assert.Contains(
             "Не менять основной таймлайн.",
             decision.Plan.Constraints);
-    }
-
-    [Fact]
-    public async Task Remote_agent_model_supports_begin_verification_action()
-    {
-        var handler = new AgentOllamaHandler(
-            """
-            {"action":"begin_verification","progress":"Перехожу к проверке.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":""}
-            """);
-        var options = new OllamaServerOptions(
-            new Uri("https://ai.example.test/"),
-            "agent-secret",
-            "agent-model");
-
-        using var service = new OllamaVideoAnalysisService(
-            new FfmpegLocator(),
-            new ProcessRunner(),
-            options,
-            handler);
-
-        var model = new OllamaAgentModel(service);
-        var decision = await model.DecideAsync(
-            new AgentModelTurnRequest(
-                CreateTask(),
-                ImmutableArray<AgentToolDescriptor>.Empty,
-                ImmutableArray<AgentModelObservation>.Empty,
-                ImmutableArray<AgentConversationContextMessage>.Empty,
-                4,
-                AgentModelTurnMode.Execution),
-            CancellationToken.None);
-
-        Assert.Equal(
-            AgentModelActionKind.BeginVerification,
-            decision.Action);
-
-        using var requestDocument = JsonDocument.Parse(
-            handler.ChatRequestBody);
-        var userMessage = requestDocument.RootElement
-            .GetProperty("messages")
-            .EnumerateArray()
-            .Single(message =>
-                string.Equals(
-                    message.GetProperty("role").GetString(),
-                    "user",
-                    StringComparison.Ordinal));
-        using var turnDocument = JsonDocument.Parse(
-            userMessage.GetProperty("content").GetString()!);
-
-        Assert.Equal(
-            "execution",
-            turnDocument.RootElement
-                .GetProperty("mode")
-                .GetString());
-    }
-
-    [Fact]
-    public async Task Remote_agent_model_parses_verified_completion_summary()
-    {
-        var handler = new AgentOllamaHandler(
-            """
-            {"action":"complete_task","progress":"Проверка завершена.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":"Agent Draft проверен; утверждённый план выполнен."}
-            """);
-        var options = new OllamaServerOptions(
-            new Uri("https://ai.example.test/"),
-            "agent-secret",
-            "agent-model");
-
-        using var service = new OllamaVideoAnalysisService(
-            new FfmpegLocator(),
-            new ProcessRunner(),
-            options,
-            handler);
-
-        var model = new OllamaAgentModel(service);
-        var decision = await model.DecideAsync(
-            new AgentModelTurnRequest(
-                CreateTask(),
-                ImmutableArray<AgentToolDescriptor>.Empty,
-                ImmutableArray<AgentModelObservation>.Empty,
-                ImmutableArray<AgentConversationContextMessage>.Empty,
-                5,
-                AgentModelTurnMode.Verification),
-            CancellationToken.None);
-
-        Assert.Equal(
-            AgentModelActionKind.CompleteTask,
-            decision.Action);
-        Assert.Equal(
-            "Agent Draft проверен; утверждённый план выполнен.",
-            decision.CompletionSummary);
     }
 
     [Fact]
@@ -320,7 +226,7 @@ public sealed class OllamaAgentModelTests
         {
             _responseContent = string.IsNullOrWhiteSpace(responseContent)
                 ? """
-                  {"action":"use_tool","progress":"Смотрю структуру проекта.","tool_name":"inspect_project","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":""}
+                  {"action":"use_tool","progress":"Смотрю структуру проекта.","tool_name":"inspect_project","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[]}
                   """
                 : responseContent;
         }
@@ -414,7 +320,7 @@ public sealed class OllamaAgentModelTests
 
                     json = WrapChatContent(
                         """
-                        {"action":"ask_user","progress":"Нужно уточнение.","tool_name":"","tool_arguments":{},"question":"Какой результат считать приоритетным?","question_context":"Данных проекта недостаточно для выбора.","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":""}
+                        {"action":"ask_user","progress":"Нужно уточнение.","tool_name":"","tool_arguments":{},"question":"Какой результат считать приоритетным?","question_context":"Данных проекта недостаточно для выбора.","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[]}
                         """);
                     break;
 

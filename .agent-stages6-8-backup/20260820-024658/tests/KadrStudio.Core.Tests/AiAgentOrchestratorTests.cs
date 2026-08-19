@@ -51,42 +51,6 @@ public sealed class AiAgentOrchestratorTests
     }
 
     [Fact]
-    public void Task_remembers_source_sequence_revision_for_safe_approval()
-    {
-        var coordinator = new AiAgentOrchestrator();
-
-        var task = coordinator.StartTask(
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            "Подготовь план.",
-            sourceSequenceRevision: 42);
-
-        Assert.Equal(42, task.SourceSequenceRevision);
-    }
-
-    [Fact]
-    public void New_investigation_can_refresh_source_revision()
-    {
-        var coordinator = new AiAgentOrchestrator();
-
-        coordinator.StartTask(
-            Guid.NewGuid(),
-            Guid.NewGuid(),
-            "Подготовь план.",
-            sourceSequenceRevision: 3);
-        coordinator.BeginPlanning();
-        coordinator.PublishPlan(CreatePlan());
-
-        var refreshed = coordinator.BeginInvestigation(
-            "Исходный таймлайн изменился; проверить план заново.",
-            sourceSequenceRevision: 4);
-
-        Assert.Equal(AgentTaskPhase.Investigating, refreshed.Phase);
-        Assert.Equal(4, refreshed.SourceSequenceRevision);
-        Assert.False(refreshed.HasApprovedPlan);
-    }
-
-    [Fact]
     public void Execution_requires_user_approved_plan_and_separate_draft()
     {
         var coordinator = new AiAgentOrchestrator();

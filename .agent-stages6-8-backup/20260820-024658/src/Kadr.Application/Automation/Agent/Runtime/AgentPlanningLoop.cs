@@ -24,7 +24,6 @@ public sealed class AgentPlanningLoop
 
     private readonly List<AgentModelObservation> _observations = [];
     private Guid? _memoryTaskId;
-    private long? _memorySourceSequenceRevision;
     private int _nextObservationSequence = 1;
     private string? _lastToolSignature;
     private int _consecutiveIdenticalToolCalls;
@@ -65,7 +64,7 @@ public sealed class AgentPlanningLoop
         try
         {
             var task = RequireCurrentTask();
-            EnsureMemoryFor(task);
+            EnsureMemoryFor(task.Id);
 
             if (task.IsTerminal ||
                 task.Phase is AgentTaskPhase.WaitingForUserInput or
@@ -107,8 +106,7 @@ public sealed class AgentPlanningLoop
                         GetPlanningToolDescriptors(),
                         GetObservationContext(),
                         GetConversationContext(),
-                        turn,
-                        AgentModelTurnMode.Planning);
+                        turn);
 
                     decision = await _model.DecideAsync(
                         request,
@@ -255,16 +253,11 @@ public sealed class AgentPlanningLoop
         var task = RequireCurrentTask();
         if (task.Phase == AgentTaskPhase.Investigating)
         {
-            task = _orchestrator.BeginPlanning(
+            _orchestrator.BeginPlanning(
                 "Agent finished investigation and is preparing the proposed edit plan.");
         }
 
-        return task.Plan is null
-            ? _orchestrator.PublishPlan(decision.Plan)
-            : _orchestrator.RevisePlan(
-                decision.Plan,
-                AgentPlanRevisionSource.Agent,
-                "Agent updated the plan from the latest user instructions and evidence.");
+        return _orchestrator.PublishPlan(decision.Plan);
     }
 
     private ImmutableArray<AgentToolDescriptor> GetPlanningToolDescriptors()
@@ -376,24 +369,19 @@ public sealed class AgentPlanningLoop
         return total;
     }
 
-    private void EnsureMemoryFor(AgentTaskState task)
+    private void EnsureMemoryFor(Guid taskId)
     {
-        if (_memoryTaskId == task.Id &&
-            _memorySourceSequenceRevision == task.SourceSequenceRevision)
+        if (_memoryTaskId == taskId)
         {
             return;
         }
 
-        // Evidence collected for another source revision can no longer be treated
-        // as current. Keep it only when the user revises the plan without changing
-        // the underlying source sequence.
         lock (_observations)
         {
             _observations.Clear();
         }
 
-        _memoryTaskId = task.Id;
-        _memorySourceSequenceRevision = task.SourceSequenceRevision;
+        _memoryTaskId = taskId;
         _nextObservationSequence = 1;
         _lastToolSignature = null;
         _consecutiveIdenticalToolCalls = 0;

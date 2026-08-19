@@ -8,9 +8,9 @@ using KadrStudio.Application.Automation.Agent.Tools;
 namespace KadrStudio.Services.Agent;
 
 /// <summary>
-/// Current Ollama implementation of the model-agnostic agent contract.
-/// The model chooses exactly one externally visible action per turn and never
-/// receives direct access to project objects.
+/// Current local/remote Ollama implementation of the model-agnostic agent model
+/// contract. It emits exactly one externally visible action per turn and never
+/// asks the model to expose hidden chain-of-thought.
 /// </summary>
 public sealed class OllamaAgentModel(
     OllamaVideoAnalysisService ollama) : IAgentModel
@@ -18,6 +18,10 @@ public sealed class OllamaAgentModel(
     private const int MaximumPlanConstraints = 24;
     private const int MaximumPlanSteps = 24;
 
+    // The turn payload is JSON embedded inside Ollama's string message content.
+    // Preserve real Unicode here so, after the outer HTTP JSON is decoded by
+    // Ollama, the model sees the user's actual text instead of literal \uXXXX
+    // escape sequences.
     private static readonly JsonSerializerOptions TurnPayloadJsonOptions = new()
     {
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
@@ -30,13 +34,7 @@ public sealed class OllamaAgentModel(
           "properties": {
             "action": {
               "type": "string",
-              "enum": [
-                "use_tool",
-                "ask_user",
-                "publish_plan",
-                "begin_verification",
-                "complete_task"
-              ]
+              "enum": ["use_tool", "ask_user", "publish_plan"]
             },
             "progress": { "type": "string" },
             "tool_name": { "type": "string" },
@@ -63,8 +61,7 @@ public sealed class OllamaAgentModel(
                 "required": ["title", "description"],
                 "additionalProperties": false
               }
-            },
-            "completion_summary": { "type": "string" }
+            }
           },
           "required": [
             "action",
@@ -76,12 +73,44 @@ public sealed class OllamaAgentModel(
             "plan_objective",
             "plan_summary",
             "plan_constraints",
-            "plan_steps",
-            "completion_summary"
+            "plan_steps"
           ],
           "additionalProperties": false
         }
         """);
+
+    private const string SystemPrompt =
+        """
+        /no_think
+        Ты монтажный AI-агент Kadr Studio на этапе исследования и подготовки плана.
+        На каждом ходе выбери ровно ОДНО внешнее действие:
+        use_tool, ask_user или publish_plan.
+
+        Правила:
+        - Не раскрывай chain-of-thought, скрытые рассуждения или внутренние рассуждения.
+          Поле progress — только короткий понятный пользователю статус действия.
+        - Сначала понимай задачу пользователя и учитывай ВСЕ уже данные им ответы и ограничения.
+        - Не задавай вопрос, если ответ можно получить из сообщения пользователя, предыдущих ответов
+          или доступными read-only tools.
+        - Задавай ask_user только если существенная неопределённость реально не разрешается
+          имеющимися данными и инструментами.
+        - Не придумывай id, таймкоды, содержание видео или факты. Получай их инструментами.
+        - Механические сигналы сами по себе не являются монтажным решением:
+          тишина, чёрный кадр, смена сцены и похожие признаки — только наблюдения.
+          При необходимости исследуй контекст вокруг них.
+        - Используй инструменты целенаправленно. Не анализируй весь материал без необходимости.
+          Если достаточно узкого диапазона, исследуй узкий диапазон.
+        - Собирай достаточно фактов для задачи, но не вызывай один и тот же tool без новой причины.
+        - publish_plan разрешён только когда данных достаточно для конкретного и проверяемого плана.
+        - План описывает будущие изменения, но на этом этапе ничего не монтируется.
+          Основной timeline должен оставаться нетронутым; выполнение позже пойдёт в отдельный Agent Draft.
+        - Ограничения пользователя обязательны. Если будущая идея выходит за утверждённую задачу,
+          она не должна молча попадать в план.
+        - В tool_name используй только имя из available_tools.
+        - tool_arguments должны строго соответствовать input_schema выбранного инструмента.
+        - Для неиспользуемых полей верни: пустую строку, пустой объект или пустой массив.
+        - Верни только JSON по переданной schema.
+        """;
 
     private readonly OllamaVideoAnalysisService _ollama =
         ollama ?? throw new ArgumentNullException(nameof(ollama));
@@ -92,83 +121,14 @@ public sealed class OllamaAgentModel(
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        var userPrompt = BuildTurnPayload(request);
         var raw = await _ollama.RunAgentStructuredTurnAsync(
             DecisionSchema,
-            BuildSystemPrompt(request.Mode),
-            BuildTurnPayload(request),
+            SystemPrompt,
+            userPrompt,
             cancellationToken).ConfigureAwait(false);
 
         return ParseDecision(raw);
-    }
-
-    private static string BuildSystemPrompt(AgentModelTurnMode mode)
-    {
-        var phaseRules = mode switch
-        {
-            AgentModelTurnMode.Planning =>
-                """
-                Сейчас этап ИССЛЕДОВАНИЯ И ПЛАНА.
-                Разрешённые итоговые действия: use_tool, ask_user, publish_plan.
-                Не выполняй монтаж. Используй только read-only tools.
-                publish_plan делай только когда данных достаточно для конкретного,
-                проверяемого и понятного пользователю плана.
-                """,
-            AgentModelTurnMode.Execution =>
-                """
-                Сейчас этап ВЫПОЛНЕНИЯ УТВЕРЖДЁННОГО ПЛАНА на отдельном Agent Draft.
-                Разрешённые итоговые действия: use_tool, ask_user, begin_verification.
-                Выполняй только утверждённый план и явно одобренные пользователем уточнения.
-                Не меняй исходную последовательность. Не делай лишних улучшений "заодно".
-                Если нужно удалить несколько диапазонов, измеренных на одном состоянии таймлайна,
-                предпочитай ripple_delete_ranges. Если используешь отдельные ripple-delete вызовы,
-                удаляй справа налево либо заново inspect_timeline после каждого сдвига.
-                Когда все запланированные изменения выполнены, выбери begin_verification.
-                """,
-            AgentModelTurnMode.Verification =>
-                """
-                Сейчас этап ПРОВЕРКИ Agent Draft.
-                Разрешённые итоговые действия: use_tool, ask_user, complete_task.
-                Сначала проверь фактические изменения read-only инструментами.
-                Обязательно вызови inspect_agent_edits после последнего изменения, затем
-                inspect_timeline и/или inspect_range для проверки фактического состояния
-                черновика и важных новых склеек/изменённых мест.
-                Если обнаружена ошибка в рамках утверждённого плана, можешь исправить её
-                editing tool и затем снова проверить. Если исправление выходит за рамки
-                утверждённого плана, сначала спроси пользователя.
-                complete_task выбирай только после фактической проверки результата.
-                """,
-            _ => throw new ArgumentOutOfRangeException(nameof(mode))
-        };
-
-        return
-            """
-            /no_think
-            Ты монтажный AI-агент Kadr Studio.
-
-            Общие правила:
-            - На каждом ходе выбери ровно ОДНО внешнее действие.
-            - Не раскрывай chain-of-thought, скрытые рассуждения или внутренние рассуждения.
-              progress — только короткий понятный пользователю статус текущего действия.
-            - Учитывай исходный запрос, весь доступный диалог, уже данные пользователем ответы,
-              утверждённый план и ограничения.
-            - Не спрашивай пользователя, если ответ уже есть в сообщениях либо его можно
-              надёжно получить доступным инструментом.
-            - ask_user используй только при существенной неопределённости, которую нельзя
-              безопасно разрешить имеющимися данными и tools.
-            - Не придумывай id, таймкоды, содержание видео или факты. Получай их tools.
-            - Механические признаки сами по себе не являются монтажным решением:
-              тишина, чёрный кадр, смена сцены и похожие сигналы — только наблюдения.
-              При необходимости исследуй смысловой контекст вокруг них.
-            - Работай целенаправленно. Не анализируй весь материал, когда достаточно
-              конкретного диапазона.
-            - В tool_name используй только имя из available_tools.
-            - tool_arguments должны строго соответствовать input_schema выбранного tool.
-            - Никогда не пытайся изменить source sequence: editing tools предназначены
-              только для Agent Draft и дополнительно проверяются приложением.
-            - Для неиспользуемых полей schema верни пустую строку, пустой объект или пустой массив.
-            - Верни только JSON по переданной schema.
-
-            """ + phaseRules;
     }
 
     private static string BuildTurnPayload(
@@ -235,13 +195,11 @@ public sealed class OllamaAgentModel(
         var payload = new
         {
             turn = request.TurnIndex,
-            mode = request.Mode.ToString().ToLowerInvariant(),
             task = new
             {
                 id = request.Task.Id,
                 project_id = request.Task.ProjectId,
                 source_sequence_id = request.Task.SourceSequenceId,
-                source_sequence_revision = request.Task.SourceSequenceRevision,
                 draft_sequence_id = request.Task.DraftSequenceId,
                 phase = request.Task.Phase.ToString().ToLowerInvariant(),
                 user_request = request.Task.UserRequest,
@@ -252,7 +210,7 @@ public sealed class OllamaAgentModel(
             available_tools = tools,
             observations,
             instruction =
-                "Choose exactly one next action that is valid for the current mode."
+                "Choose exactly one next action. Prefer a useful tool over a user question when the tool can resolve the uncertainty."
         };
 
         return JsonSerializer.Serialize(payload, TurnPayloadJsonOptions);
@@ -261,10 +219,8 @@ public sealed class OllamaAgentModel(
     private static AgentModelDecision ParseDecision(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
-        {
             throw new InvalidOperationException(
                 "Agent model returned an empty structured response.");
-        }
 
         using var document = JsonDocument.Parse(raw);
         var root = document.RootElement;
@@ -277,10 +233,6 @@ public sealed class OllamaAgentModel(
             "use_tool" => ParseToolDecision(root, progress),
             "ask_user" => ParseQuestionDecision(root, progress),
             "publish_plan" => ParsePlanDecision(root, progress),
-            "begin_verification" => AgentModelDecision.BeginVerification(progress),
-            "complete_task" => AgentModelDecision.CompleteTask(
-                ReadRequiredString(root, "completion_summary"),
-                progress),
             _ => throw new InvalidOperationException(
                 $"Agent model returned unknown action '{action}'.")
         };
@@ -366,17 +318,17 @@ public sealed class OllamaAgentModel(
         }
 
         if (steps.Count == 0)
-        {
             throw new InvalidOperationException(
                 "Agent model published a plan without valid steps.");
-        }
+
+        var plan = AgentPlanDraft.Create(
+            objective,
+            summary,
+            constraints,
+            steps);
 
         return AgentModelDecision.PublishPlan(
-            AgentPlanDraft.Create(
-                objective,
-                summary,
-                constraints,
-                steps),
+            plan,
             progress);
     }
 
@@ -386,10 +338,8 @@ public sealed class OllamaAgentModel(
     {
         var value = ReadString(element, propertyName);
         if (string.IsNullOrWhiteSpace(value))
-        {
             throw new InvalidOperationException(
                 $"Agent model response field '{propertyName}' is required.");
-        }
 
         return value;
     }

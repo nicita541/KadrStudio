@@ -3,9 +3,9 @@ namespace KadrStudio.Application.Automation.Agent.Tools;
 /// <summary>
 /// Safe execution boundary for agent tools.
 ///
-/// Read-only tools are available while the task is being researched or
-/// verified. Editing tools are allowed only while the agent owns a separate
-/// draft sequence during execution/verification.
+/// Stage 3 deliberately permits read-only tools only. Editing tools may be
+/// described and registered, but are rejected here until the later editing
+/// stage adds draft-only mutation rules.
 /// </summary>
 public sealed class AgentToolExecutor
 {
@@ -85,26 +85,13 @@ public sealed class AgentToolExecutor
                 startedAt);
         }
 
-        if (tool.Descriptor.Access == AgentToolAccess.Editing)
+        if (tool.Descriptor.Access != AgentToolAccess.ReadOnly)
         {
-            if (task.Phase is not (AgentTaskPhase.Executing or AgentTaskPhase.Verifying))
-            {
-                return Rejected(
-                    call,
-                    "editing_phase_required",
-                    "Editing tools are available only while executing or verifying an approved agent draft.",
-                    startedAt);
-            }
-
-            if (task.DraftSequenceId is not { } draftSequenceId ||
-                draftSequenceId == task.SourceSequenceId)
-            {
-                return Rejected(
-                    call,
-                    "draft_required",
-                    "Editing tools require a separate agent draft sequence.",
-                    startedAt);
-            }
+            return Rejected(
+                call,
+                "editing_tools_disabled",
+                "Stage 3 allows read-only agent tools only.",
+                startedAt);
         }
 
         try

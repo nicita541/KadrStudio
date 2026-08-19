@@ -15,20 +15,11 @@ public sealed record AgentConversationContextMessage(
     string Text,
     DateTimeOffset CreatedAt);
 
-public enum AgentModelTurnMode
-{
-    Planning,
-    Execution,
-    Verification
-}
-
 public enum AgentModelActionKind
 {
     UseTool,
     AskUser,
-    PublishPlan,
-    BeginVerification,
-    CompleteTask
+    PublishPlan
 }
 
 public sealed record AgentModelObservation(
@@ -60,8 +51,7 @@ public sealed record AgentModelTurnRequest(
     ImmutableArray<AgentToolDescriptor> AvailableTools,
     ImmutableArray<AgentModelObservation> Observations,
     ImmutableArray<AgentConversationContextMessage> Conversation,
-    int TurnIndex,
-    AgentModelTurnMode Mode = AgentModelTurnMode.Planning);
+    int TurnIndex);
 
 public sealed record AgentModelDecision(
     AgentModelActionKind Action,
@@ -70,8 +60,7 @@ public sealed record AgentModelDecision(
     JsonElement ToolArguments,
     string Question,
     string QuestionContext,
-    AgentPlanDraft? Plan,
-    string CompletionSummary)
+    AgentPlanDraft? Plan)
 {
     public static AgentModelDecision UseTool(
         string toolName,
@@ -84,8 +73,7 @@ public sealed record AgentModelDecision(
             arguments.Clone(),
             string.Empty,
             string.Empty,
-            null,
-            string.Empty);
+            null);
 
     public static AgentModelDecision AskUser(
         string question,
@@ -98,8 +86,7 @@ public sealed record AgentModelDecision(
             AgentToolJson.EmptyObject(),
             question ?? string.Empty,
             context ?? string.Empty,
-            null,
-            string.Empty);
+            null);
 
     public static AgentModelDecision PublishPlan(
         AgentPlanDraft plan,
@@ -111,31 +98,5 @@ public sealed record AgentModelDecision(
             AgentToolJson.EmptyObject(),
             string.Empty,
             string.Empty,
-            plan ?? throw new ArgumentNullException(nameof(plan)),
-            string.Empty);
-
-    public static AgentModelDecision BeginVerification(
-        string progress = "")
-        => new(
-            AgentModelActionKind.BeginVerification,
-            progress ?? string.Empty,
-            string.Empty,
-            AgentToolJson.EmptyObject(),
-            string.Empty,
-            string.Empty,
-            null,
-            string.Empty);
-
-    public static AgentModelDecision CompleteTask(
-        string summary,
-        string progress = "")
-        => new(
-            AgentModelActionKind.CompleteTask,
-            progress ?? string.Empty,
-            string.Empty,
-            AgentToolJson.EmptyObject(),
-            string.Empty,
-            string.Empty,
-            null,
-            summary ?? string.Empty);
+            plan ?? throw new ArgumentNullException(nameof(plan)));
 }

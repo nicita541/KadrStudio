@@ -17,8 +17,7 @@ public sealed record AgentTaskState(
     string? CompletionSummary,
     string? FailureMessage,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt,
-    long? SourceSequenceRevision = null)
+    DateTimeOffset UpdatedAt)
 {
     public bool IsTerminal =>
         Phase is AgentTaskPhase.Completed or AgentTaskPhase.Failed or AgentTaskPhase.Stopped;

@@ -748,10 +748,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
         }
 
-        // The context builder has dynamic length because messages can be filtered
-        // and one chat message may expand into multiple agent-context messages.
-        // MoveToImmutable() requires Count == Capacity; ToImmutable() is correct here.
-        return builder.ToImmutable();
+        return builder.MoveToImmutable();
     }
 
     public void SaveAiConversation(KadrStudio.Core.Domain.AiConversation conversation)

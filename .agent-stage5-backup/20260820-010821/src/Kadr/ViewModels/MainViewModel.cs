@@ -7,7 +7,6 @@ using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Automation.Agent;
-using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.ReadOnly;
 using KadrStudio.Application.Media;
@@ -110,13 +109,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             agentRangeInspector);
         AgentToolRegistry = AgentReadOnlyToolSet.Create(AgentReadOnlyToolBackend);
         AgentToolExecutor = new AgentToolExecutor(AgentToolRegistry);
-        AgentModel = new OllamaAgentModel(OllamaVideoAnalysisService);
-        AgentPlanningLoop = new AgentPlanningLoop(
-            AiAgentOrchestrator,
-            AgentToolRegistry,
-            AgentToolExecutor,
-            AgentModel,
-            conversationProvider: BuildAgentConversationContext);
 
         AttachProject(_project);
         BuildMediaView();
@@ -138,8 +130,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public KadrAgentReadOnlyToolBackend AgentReadOnlyToolBackend { get; }
     public AgentToolRegistry AgentToolRegistry { get; }
     public AgentToolExecutor AgentToolExecutor { get; }
-    public IAgentModel AgentModel { get; }
-    public AgentPlanningLoop AgentPlanningLoop { get; }
     public IArtifactStore ArtifactStore => _artifactStore;
     public KadrStudio.Core.Domain.ProjectState CoreState => _editorSession.State;
     public long TimelinePresentationRevision => _timelinePresentationRevision;
@@ -674,53 +664,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public KadrStudio.Core.Domain.AiConversation GetAiConversation()
         => _editorSession.State.AiConversation;
-
-    private ImmutableArray<AgentConversationContextMessage> BuildAgentConversationContext()
-    {
-        var builder = ImmutableArray.CreateBuilder<AgentConversationContextMessage>();
-
-        foreach (var message in _editorSession.State.AiConversation.Messages)
-        {
-            if (string.IsNullOrWhiteSpace(message.Text))
-            {
-                continue;
-            }
-
-            if (message.Role == KadrStudio.Core.Domain.AiChatRole.User)
-            {
-                builder.Add(new AgentConversationContextMessage(
-                    AgentConversationRole.User,
-                    message.Text.Trim(),
-                    message.CreatedAt));
-                continue;
-            }
-
-            if (message.Kind is not (
-                    KadrStudio.Core.Domain.AiChatMessageKind.Text or
-                    KadrStudio.Core.Domain.AiChatMessageKind.Question or
-                    KadrStudio.Core.Domain.AiChatMessageKind.Plan or
-                    KadrStudio.Core.Domain.AiChatMessageKind.Draft))
-            {
-                continue;
-            }
-
-            builder.Add(new AgentConversationContextMessage(
-                AgentConversationRole.Assistant,
-                message.Text.Trim(),
-                message.CreatedAt));
-
-            if (message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Question &&
-                !string.IsNullOrWhiteSpace(message.Answer))
-            {
-                builder.Add(new AgentConversationContextMessage(
-                    AgentConversationRole.User,
-                    $"Ответ на вопрос «{message.Text.Trim()}»: {message.Answer.Trim()}",
-                    message.CreatedAt));
-            }
-        }
-
-        return builder.MoveToImmutable();
-    }
 
     public void SaveAiConversation(KadrStudio.Core.Domain.AiConversation conversation)
     {

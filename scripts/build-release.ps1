@@ -56,12 +56,20 @@ $dotnetExe = $dotnetCommand.Source
 Write-Host "Используется SDK: $(& $dotnetExe --version)" -ForegroundColor DarkGray
 
 if (Test-Path -LiteralPath $publishPath) {
-    Remove-Item -LiteralPath $publishPath -Recurse -Force
+    $publishPrefix = [System.IO.Path]::GetFullPath($publishPath).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    foreach ($item in Get-ChildItem -LiteralPath $publishPath -Force) {
+        $itemPath = [System.IO.Path]::GetFullPath($item.FullName)
+        if (-not $itemPath.StartsWith($publishPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Элемент публикации вышел за пределы каталога сборки: $itemPath"
+        }
+        Remove-Item -LiteralPath $itemPath -Recurse -Force
+    }
 }
 New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
 
 Write-Host 'Восстановление, сборка и тестирование всего решения…' -ForegroundColor Cyan
-& $dotnetExe restore $solutionPath --disable-parallel
+& $dotnetExe restore $solutionPath --disable-parallel --disable-build-servers -m:1
 if ($LASTEXITCODE -ne 0) { throw "dotnet restore solution завершился с кодом $LASTEXITCODE" }
 
 & $dotnetExe build $solutionPath -c Release --no-restore -m:1 -nr:false -warnaserror
@@ -70,12 +78,26 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet build solution завершился с 
 & $dotnetExe test $solutionPath -c Release --no-build --no-restore -m:1 -nr:false
 if ($LASTEXITCODE -ne 0) { throw "dotnet test завершился с кодом $LASTEXITCODE" }
 
-& $dotnetExe restore $projectPath --runtime win-x64 --disable-parallel
+& $dotnetExe restore $projectPath --runtime win-x64 --disable-parallel --disable-build-servers -m:1
 if ($LASTEXITCODE -ne 0) { throw "dotnet restore win-x64 завершился с кодом $LASTEXITCODE" }
 
 Write-Host 'Создание переносимой Windows-сборки…' -ForegroundColor Cyan
-& $dotnetExe publish $projectPath -c Release --runtime win-x64 --self-contained true --no-restore -warnaserror -o $publishPath
+& $dotnetExe publish $projectPath -c Release --runtime win-x64 --self-contained true --no-restore --disable-build-servers -m:1 -warnaserror -o $publishPath
 if ($LASTEXITCODE -ne 0) { throw "dotnet publish завершился с кодом $LASTEXITCODE" }
+
+$ollamaCandidates = @(
+    (Join-Path $repoRoot 'tools\ollama.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
+)
+$ollamaCommand = Get-Command ollama.exe -ErrorAction SilentlyContinue
+if ($ollamaCommand) { $ollamaCandidates += $ollamaCommand.Source }
+$ollamaSource = $ollamaCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+if (-not $ollamaSource) {
+    throw 'Не найден ollama.exe для встроенного локального ИИ-сервера.'
+}
+$aiPath = Join-Path $publishPath 'ai'
+New-Item -ItemType Directory -Path $aiPath -Force | Out-Null
+Copy-Item -LiteralPath $ollamaSource -Destination (Join-Path $aiPath 'ollama.exe') -Force
 
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'KadrStudio.exe'))) {
     throw 'Сборка не создала KadrStudio.exe.'
@@ -88,6 +110,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'tools\ffprobe.exe'))) 
 }
 if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'mediahost\Kadr.MediaHost.exe'))) {
     throw 'В сборку не попал Kadr.MediaHost.exe.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'ai\ollama.exe'))) {
+    throw 'В сборку не попал встроенный локальный ИИ-сервер ollama.exe.'
 }
 
 Write-Host 'Проверка запуска готового приложения…' -ForegroundColor Cyan

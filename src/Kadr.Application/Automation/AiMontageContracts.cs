@@ -29,6 +29,12 @@ public sealed record MontageDraftCompilation(
     SequenceState Sequence,
     ImmutableArray<string> Warnings);
 
+public sealed record MontagePreparationResult(
+    ImmutableDictionary<Guid, MediaAnalysisManifest> Manifests,
+    MontagePlan Plan,
+    ImmutableArray<string> Warnings,
+    ImmutableArray<MontageDecision> PendingDecisions);
+
 public interface IMediaAnalysisPipeline
 {
     Task<ImmutableDictionary<Guid, MediaAnalysisManifest>> AnalyzeSourcesAsync(
@@ -64,6 +70,13 @@ public interface IMontagePlanCompiler
 
 public interface IAiMontageCoordinator
 {
+    Task<MontagePreparationResult> PreparePlanAsync(
+        ProjectState project,
+        MediaAnalysisRequest analysisRequest,
+        MontageRequest montageRequest,
+        IProgress<double>? progress = null,
+        CancellationToken cancellationToken = default);
+
     Task<ImmutableDictionary<Guid, MediaAnalysisManifest>> AnalyzeSourcesAsync(
         ProjectState project,
         MediaAnalysisRequest request,
@@ -85,6 +98,13 @@ public interface IAiMontageCoordinator
 
     MontagePlanValidationResult ValidatePlan(ProjectState project, MontagePlan plan);
 
+    MontagePlan ResolveDecision(
+        ProjectState project,
+        MontagePlan plan,
+        Guid decisionId,
+        string answer,
+        TimelineTime? resolvedTime = null);
+
     MontageDraftCompilation CreateDraft(
         ProjectState project,
         MontagePlan plan,
@@ -95,10 +115,35 @@ public sealed class AiMontageCoordinator(
     IMediaAnalysisPipeline analysis,
     IMontagePlanningProvider planning,
     IMontagePlanValidator? validator = null,
-    IMontagePlanCompiler? compiler = null) : IAiMontageCoordinator
+    IMontagePlanCompiler? compiler = null,
+    AnimeEpisodeMergePlanner? animePlanner = null) : IAiMontageCoordinator
 {
     private readonly IMontagePlanValidator _validator = validator ?? new MontagePlanValidator();
     private readonly IMontagePlanCompiler _compiler = compiler ?? new MontagePlanCompiler();
+    private readonly AnimeEpisodeMergePlanner _animePlanner = animePlanner ?? new AnimeEpisodeMergePlanner();
+
+    public async Task<MontagePreparationResult> PreparePlanAsync(
+        ProjectState project,
+        MediaAnalysisRequest analysisRequest,
+        MontageRequest montageRequest,
+        IProgress<double>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var analysisProgress = progress is null
+            ? null
+            : new Progress<double>(value => progress.Report(Math.Clamp(value, 0, 1) * 0.9));
+        var manifests = await analysis.AnalyzeSourcesAsync(
+            project, analysisRequest, analysisProgress, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var plan = montageRequest.Preset?.Recipe == AutomationRecipeKind.MergeEpisodes
+            ? _animePlanner.CreatePlan(project, montageRequest, manifests)
+            : await CreatePlanAsync(project, montageRequest, manifests, cancellationToken).ConfigureAwait(false);
+        progress?.Report(1);
+        var pending = plan.Decisions.IsDefault
+            ? ImmutableArray<MontageDecision>.Empty
+            : plan.Decisions.Where(item => !item.IsResolved).ToImmutableArray();
+        return new MontagePreparationResult(manifests, plan, plan.Warnings, pending);
+    }
 
     public Task<ImmutableDictionary<Guid, MediaAnalysisManifest>> AnalyzeSourcesAsync(
         ProjectState project,
@@ -113,6 +158,8 @@ public sealed class AiMontageCoordinator(
         ImmutableDictionary<Guid, MediaAnalysisManifest> manifests,
         CancellationToken cancellationToken = default)
     {
+        if (request.Preset?.Recipe == AutomationRecipeKind.MergeEpisodes)
+            return _animePlanner.CreatePlan(project, request, manifests);
         var plan = await planning.CreatePlanAsync(
             new MontagePlanningContext(project, request, manifests), cancellationToken).ConfigureAwait(false);
         return EnsureSafeOrConflict(project, plan);
@@ -135,7 +182,8 @@ public sealed class AiMontageCoordinator(
             plan.MaximumDuration,
             revisionRequest.Trim(),
             plan.ProfileSnapshot,
-            plan.Constraints);
+            plan.Constraints,
+            plan.PresetSnapshot);
         var revised = await planning.RevisePlanAsync(
             new MontagePlanningContext(project, request, manifests, plan, revisionRequest.Trim()),
             cancellationToken).ConfigureAwait(false);
@@ -145,6 +193,16 @@ public sealed class AiMontageCoordinator(
 
     public MontagePlanValidationResult ValidatePlan(ProjectState project, MontagePlan plan)
         => _validator.Validate(project, plan);
+
+    public MontagePlan ResolveDecision(
+        ProjectState project,
+        MontagePlan plan,
+        Guid decisionId,
+        string answer,
+        TimelineTime? resolvedTime = null)
+        => plan.PresetSnapshot?.Recipe == AutomationRecipeKind.MergeEpisodes
+            ? _animePlanner.ResolveDecision(project, plan, decisionId, answer, resolvedTime)
+            : throw new InvalidOperationException("Текущий сценарий не содержит интерактивных решений.");
 
     public MontageDraftCompilation CreateDraft(
         ProjectState project,

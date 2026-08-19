@@ -227,6 +227,7 @@ public sealed class MontagePlanCompiler(IMontagePlanValidator? validator = null)
 
     private static string RoleTitle(MontageRole role) => role switch
     {
+        MontageRole.Opening => "Опенинг",
         MontageRole.Hook => "Хук",
         MontageRole.Setup => "Завязка",
         MontageRole.Development => "Развитие",

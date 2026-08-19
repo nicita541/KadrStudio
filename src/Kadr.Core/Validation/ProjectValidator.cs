@@ -31,6 +31,7 @@ public sealed class ProjectValidator : IProjectValidator
         ValidateSequenceWorkspace(project, errors);
         ValidateSourceAnnotations(project, errors);
         ValidateMontagePlans(project, errors);
+        ValidateAiConversation(project, errors);
         return errors.Count == 0 ? ValidationResult.Valid : new ValidationResult(errors);
     }
 
@@ -333,6 +334,22 @@ public sealed class ProjectValidator : IProjectValidator
                 if (item.Confidence is < 0 or > 1 || item.Volume is < 0 or > 2)
                     errors.Add(new("montage-plan.parameters", "Montage plan item parameters are invalid.", item.Id));
             }
+        }
+    }
+
+    private static void ValidateAiConversation(ProjectState project, ICollection<ValidationError> errors)
+    {
+        var conversation = project.AiConversation;
+        if (conversation.Id == Guid.Empty)
+            errors.Add(new("ai-chat.identity", "AI conversation ID cannot be empty."));
+        foreach (var duplicate in conversation.Messages.GroupBy(message => message.Id).Where(group => group.Count() > 1))
+            errors.Add(new("ai-chat.duplicate-message", "AI chat message IDs must be unique.", duplicate.Key));
+        foreach (var message in conversation.Messages)
+        {
+            if (message.Id == Guid.Empty || string.IsNullOrWhiteSpace(message.Text))
+                errors.Add(new("ai-chat.message", "AI chat message is invalid.", message.Id));
+            if (message.ProgressPercent is < 0 or > 100)
+                errors.Add(new("ai-chat.progress", "AI chat progress must be between 0 and 100.", message.Id));
         }
     }
 }

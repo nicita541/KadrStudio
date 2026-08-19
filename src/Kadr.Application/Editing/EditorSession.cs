@@ -54,14 +54,18 @@ public sealed class EditorSession : IEditorSession
             Revision = checked(before.Revision + 1),
             UpdatedAt = DateTimeOffset.UtcNow
         };
-        candidate = candidate.SynchronizeActiveSequence();
+        if (transaction.SynchronizeActiveSequence)
+            candidate = candidate.SynchronizeActiveSequence();
         EnsureValid(candidate);
         var changes = ProjectChangeSet.Between(before, candidate);
 
         _state = candidate;
-        _undo.AddLast(new HistoryEntry(before, candidate, transaction.Description));
-        while (_undo.Count > MaximumUndoEntries) _undo.RemoveFirst();
-        _redo.Clear();
+        if (transaction.RecordInHistory)
+        {
+            _undo.AddLast(new HistoryEntry(before, candidate, transaction.Description));
+            while (_undo.Count > MaximumUndoEntries) _undo.RemoveFirst();
+            _redo.Clear();
+        }
         StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(before, candidate, transaction.Description, false, changes));
         return new EditResult(true, candidate, transaction.Description, candidate.Revision, changes);
     }

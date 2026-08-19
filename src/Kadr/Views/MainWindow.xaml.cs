@@ -12,6 +12,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using KadrStudio.Controls;
 using KadrStudio.Application.Automation;
+using KadrStudio.Application.Editing;
 using KadrStudio.Models;
 using KadrStudio.Playback;
 using KadrStudio.Services;
@@ -21,6 +22,7 @@ using CoreAnalysisManifest = KadrStudio.Core.Domain.MediaAnalysisManifest;
 using CoreGameProfile = KadrStudio.Core.Domain.GameEditingProfile;
 using CoreMontagePlan = KadrStudio.Core.Domain.MontagePlan;
 using CoreMontagePlanItem = KadrStudio.Core.Domain.MontagePlanItem;
+using CoreMontageDecision = KadrStudio.Core.Domain.MontageDecision;
 using CoreSequenceState = KadrStudio.Core.Domain.SequenceState;
 using CoreSourceAnnotation = KadrStudio.Core.Domain.SourceAnnotation;
 
@@ -49,11 +51,17 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<OllamaModelInfo> _localAiModels = [];
     private readonly ObservableCollection<ProjectHistoryEntry> _inlineHistoryEntries = [];
     private readonly ObservableCollection<AiPlanItemRow> _aiPlanRows = [];
+    private readonly ObservableCollection<AiStructuralSegmentRow> _aiStructuralRows = [];
     private readonly ObservableCollection<AiSequenceRow> _aiSequenceRows = [];
     private readonly ObservableCollection<AiAnnotationRow> _aiAnnotationRows = [];
+    private readonly ObservableCollection<AiChatMessageRow> _aiChatRows = [];
+    private readonly AiMontageChatCoordinator _aiChatCoordinator = new();
+    private readonly Dictionary<Guid, KadrStudio.Core.Domain.TimelineTime> _aiBoundaryTimes = [];
     private ImmutableDictionary<Guid, CoreAnalysisManifest> _aiManifests = ImmutableDictionary<Guid, CoreAnalysisManifest>.Empty;
     private CoreMontagePlan? _activeMontagePlan;
     private bool _isRefreshingLocalAiModels;
+    private Task? _localAiInitializationTask;
+    private bool _isAiChatBusy;
     private double _previewScale = 1;
     private bool _useHalfQualityPreview = true;
     private AudioWorkspaceWindow? _audioWorkspaceWindow;
@@ -69,6 +77,7 @@ public partial class MainWindow : Window
     private string _previewTextBeforeEdit = string.Empty;
     private TextOverlay? _previewEditedOverlay;
     private TextOverlay? _textPanelDraft;
+    private KadrStudio.Core.Domain.TransitionKind _selectedTransitionKind = KadrStudio.Core.Domain.TransitionKind.CrossDissolve;
 
     public MainWindow() : this(null)
     {
@@ -95,10 +104,33 @@ public partial class MainWindow : Window
         LocalAiModelComboBox.ItemsSource = _localAiModels;
         AiGameProfileComboBox.ItemsSource = _viewModel.GetGameEditingProfiles();
         AiGameProfileComboBox.SelectedItem = _viewModel.GetGameEditingProfiles()
-            .FirstOrDefault(item => item.Id == "rust") ?? _viewModel.GetGameEditingProfiles().FirstOrDefault();
+            .FirstOrDefault(item => item.Id == "universal") ?? _viewModel.GetGameEditingProfiles().FirstOrDefault();
+        AiScenarioComboBox.ItemsSource = _viewModel.GetAutomationPresets()
+            .Where(item => item.ProfileId == GetSelectedAiProfile().Id)
+            .ToArray();
+        AiScenarioComboBox.SelectedIndex = AiScenarioComboBox.Items.Count > 0 ? 0 : -1;
         AiPlanItemsListBox.ItemsSource = _aiPlanRows;
+        AiExcludedSegmentsListBox.ItemsSource = _aiStructuralRows;
         AiSequencesListBox.ItemsSource = _aiSequenceRows;
         AiAnnotationsListBox.ItemsSource = _aiAnnotationRows;
+        AiChatMessagesListBox.ItemsSource = _aiChatRows;
+        AiChatScenarioComboBox.ItemsSource = new[]
+        {
+            new AiChatScenarioOption(null, "Авто · Универсальный"),
+            new AiChatScenarioOption(
+                KadrStudio.Application.Automation.AutomationPresets.AnimeMergeEpisodes.Id,
+                "Пресет · Аниме: объединить серии")
+        };
+        AiChatScenarioComboBox.SelectedIndex = 0;
+        AiChatContextComboBox.ItemsSource = new[]
+        {
+            new AiChatContextOption(null, "Контекст · Авто"),
+            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary, "Вся медиатека"),
+            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence, "Текущий таймлайн"),
+            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.SelectedClips, "Выбранный клип")
+        };
+        AiChatContextComboBox.SelectedIndex = 0;
+        RefreshAiChatRows();
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
 
         _playbackTimer = new DispatcherTimer(DispatcherPriority.Render)
@@ -612,6 +644,7 @@ public partial class MainWindow : Window
         _viewModel.EnsureSequenceWorkspace();
         SetLeftPanel(showAnalysis: true, showHistory: false, showText: false);
         RefreshAiWorkspaceUi();
+        RefreshAiChatRows();
         if (_localAiModels.Count == 0 && !_isRefreshingLocalAiModels)
         {
             _ = RefreshLocalAiModelsAsync(showError: false);
@@ -666,9 +699,6 @@ public partial class MainWindow : Window
             TransitionStatusText.Text = "Выберите левый клип у склейки на таймлайне.";
             return;
         }
-        if (TransitionKindComboBox.SelectedItem is not ComboBoxItem { Tag: string tag } ||
-            !Enum.TryParse<KadrStudio.Core.Domain.TransitionKind>(tag, out var kind))
-            return;
         if (!double.TryParse(TransitionDurationTextBox.Text.Replace(',', '.'),
                 NumberStyles.Float, CultureInfo.InvariantCulture, out var duration))
         {
@@ -677,17 +707,26 @@ public partial class MainWindow : Window
         }
         try
         {
-            var id = _viewModel.AddTransition(_viewModel.SelectedClip.Id, kind, duration);
+            var id = _viewModel.AddTransition(_viewModel.SelectedClip.Id, _selectedTransitionKind, duration);
             RefreshTransitionList();
             TransitionListBox.SelectedItem = TransitionListBox.Items.Cast<TransitionListItem>()
                 .FirstOrDefault(item => item.Id == id);
-            TransitionStatusText.Text = "Переход добавлен и сразу участвует в preview/export.";
+            TransitionStatusText.Text = "Переход добавлен. Клипы должны касаться — накладывать их вручную не нужно.";
             UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         }
         catch (Exception exception)
         {
             TransitionStatusText.Text = exception.Message;
         }
+    }
+
+    private void TransitionPreset_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not RadioButton { Tag: KadrStudio.Core.Domain.TransitionKind kind }) return;
+        _selectedTransitionKind = kind;
+        TransitionStatusText.Text = kind == KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio
+            ? "Выбран аудиопереход. Укажите левый аудиоклип у склейки."
+            : "Выберите левый видеоклип у склейки и добавьте переход.";
     }
 
     private void DeleteTransition_Click(object sender, RoutedEventArgs e)
@@ -704,7 +743,9 @@ public partial class MainWindow : Window
             .OrderBy(item => item.Start)
             .Select(item => new TransitionListItem(
                 item.Id,
-                $"{TransitionKindLabel(item.Kind)}  {FormatEditorTime(item.Start.TotalSeconds)}  {item.Duration.TotalSeconds:0.##} с"))
+                TransitionKindLabel(item.Kind),
+                $"{FormatEditorTime(item.Start.TotalSeconds)} · {item.Duration.TotalSeconds:0.##} с",
+                item.Kind == KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio ? "АУДИО" : "ВИДЕО"))
             .ToArray();
     }
 
@@ -835,6 +876,8 @@ public partial class MainWindow : Window
         {
             _textPanelDraft = overlay.Clone();
             TextPropertiesPanel.DataContext = _textPanelDraft;
+            TextPropertiesPanel.Visibility = Visibility.Visible;
+            TextEmptyState.Visibility = Visibility.Collapsed;
             TimelineEditor.SelectedTextOverlayId = overlay.Id;
             TimelineEditor.SelectedClipId = null;
             _viewModel.SelectedClip = null;
@@ -844,6 +887,8 @@ public partial class MainWindow : Window
         {
             _textPanelDraft = null;
             TextPropertiesPanel.DataContext = null;
+            TextPropertiesPanel.Visibility = Visibility.Collapsed;
+            TextEmptyState.Visibility = Visibility.Visible;
         }
     }
 
@@ -975,14 +1020,12 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ConfigureWhisper_Click(object sender, RoutedEventArgs e) => ConfigureWhisper();
+
     private void UpdateWhisperAvailability()
     {
         var availability = _viewModel.AutoSubtitleService.GetWhisperAvailability();
-        AutoSubtitlesButton.Content = availability.IsReady ? "Автосубтитры" : "Настроить whisper.cpp";
-        WhisperStatusText.Text = availability.Message;
-        WhisperStatusText.Foreground = availability.IsReady
-            ? new SolidColorBrush(Color.FromRgb(110, 231, 183))
-            : FindResource("MutedTextBrush") as Brush ?? Brushes.Gray;
+        AutoSubtitlesButton.ToolTip = availability.Message;
     }
 
     private static TextOverlay CreateSubtitleOverlay(double start, double duration, string text) => new()
@@ -1131,14 +1174,33 @@ public partial class MainWindow : Window
 
     private async Task RefreshLocalAiModelsAsync(bool showError)
     {
-        if (_isRefreshingLocalAiModels)
+        if (_localAiInitializationTask is { IsCompleted: false } running)
         {
+            await running;
             return;
         }
 
+        var initialization = RefreshLocalAiModelsCoreAsync(showError);
+        _localAiInitializationTask = initialization;
+        try
+        {
+            await initialization;
+        }
+        finally
+        {
+            if (ReferenceEquals(_localAiInitializationTask, initialization))
+                _localAiInitializationTask = null;
+        }
+    }
+
+    private async Task RefreshLocalAiModelsCoreAsync(bool showError)
+    {
+
         _isRefreshingLocalAiModels = true;
         RefreshLocalAiModelsButton.IsEnabled = false;
-        LocalAiStatusTextBlock.Text = "Запуск отдельного Ollama на диске F:…";
+        LocalAiStatusTextBlock.Text = _viewModel.OllamaVideoAnalysisService.IsRemote
+            ? $"Подключение к ИИ-серверу {_viewModel.OllamaVideoAnalysisService.Endpoint.Host}…"
+            : "Запуск локального ИИ-сервера и подготовка модели…";
         try
         {
             var selectedName = (LocalAiModelComboBox.SelectedItem as OllamaModelInfo)?.Name;
@@ -1150,6 +1212,8 @@ public partial class MainWindow : Window
             }
 
             var preferred = _localAiModels.FirstOrDefault(model => model.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase))
+                ?? _localAiModels.FirstOrDefault(model => model.Name.Equals(
+                    _viewModel.OllamaVideoAnalysisService.PreferredModel, StringComparison.OrdinalIgnoreCase))
                 ?? _localAiModels.FirstOrDefault(model => model.Name.Equals("qwen3-vl:4b-instruct", StringComparison.OrdinalIgnoreCase))
                 ?? _localAiModels.FirstOrDefault(model => model.SupportsVision)
                 ?? _localAiModels.FirstOrDefault();
@@ -1157,14 +1221,14 @@ public partial class MainWindow : Window
             UseLocalAiCheckBox.IsEnabled = preferred is not null;
             LocalAiModelComboBox.IsEnabled = preferred is not null;
             LocalAiStatusTextBlock.Text = preferred is null
-                ? "В папке проекта нет локальных моделей."
-                : $"Готово: {preferred.Name}. Модели: {_viewModel.OllamaVideoAnalysisService.ModelRoot}";
+                ? "ИИ-сервер не вернул доступных моделей."
+                : $"Готово: {preferred.Name} · {_viewModel.OllamaVideoAnalysisService.ModelRoot}";
         }
         catch (Exception exception)
         {
             UseLocalAiCheckBox.IsEnabled = false;
             LocalAiModelComboBox.IsEnabled = false;
-            LocalAiStatusTextBlock.Text = $"Локальный ИИ недоступен: {exception.Message}";
+            LocalAiStatusTextBlock.Text = $"ИИ недоступен: {exception.Message}";
             if (showError)
             {
                 ShowError("Не удалось подключить локальный ИИ", exception);
@@ -1215,6 +1279,594 @@ public partial class MainWindow : Window
     }
 
     private void CancelAnalysis_Click(object sender, RoutedEventArgs e) => _analysisCancellation?.Cancel();
+
+    private async void AiChatSend_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isAiChatBusy)
+        {
+            _analysisCancellation?.Cancel();
+            return;
+        }
+        await SendAiChatMessageAsync();
+    }
+
+    private async void AiChatSuggestion_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string prompt }) AiChatPromptTextBox.Text = prompt;
+        await SendAiChatMessageAsync();
+    }
+
+    private async void AiChatPrompt_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) return;
+        e.Handled = true;
+        await SendAiChatMessageAsync();
+    }
+
+    private async Task SendAiChatMessageAsync()
+    {
+        var prompt = AiChatPromptTextBox.Text?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(prompt) || _isAiChatBusy) return;
+
+        var now = DateTimeOffset.UtcNow;
+        var userMessage = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.User,
+            KadrStudio.Core.Domain.AiChatMessageKind.Text, prompt, now);
+        var progressMessage = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+            KadrStudio.Core.Domain.AiChatMessageKind.Progress,
+            "Изучаю проект и подготавливаю безопасный план…", now,
+            KadrStudio.Core.Domain.AiChatOperationState.Running, 0);
+        var conversation = _aiChatCoordinator.Append(_viewModel.GetAiConversation(), userMessage);
+        conversation = _aiChatCoordinator.Append(conversation, progressMessage);
+        SaveAiConversation(conversation);
+        AiChatPromptTextBox.Clear();
+        SetAiChatBusy(true);
+
+        _analysisCancellation?.Cancel();
+        _analysisCancellation?.Dispose();
+        _analysisCancellation = new CancellationTokenSource();
+        var token = _analysisCancellation.Token;
+        try
+        {
+            var scenario = AiChatScenarioComboBox.SelectedItem as AiChatScenarioOption;
+            var route = _aiChatCoordinator.Route(prompt, scenario?.PresetId, _activeMontagePlan);
+            switch (route.Intent)
+            {
+                case AiChatIntentKind.PresetMontage:
+                    await PreparePresetChatPlanAsync(prompt, route.Preset ?? AutomationPresets.AnimeMergeEpisodes,
+                        progressMessage.Id, token);
+                    break;
+                case AiChatIntentKind.PlanRevision when _activeMontagePlan is not null:
+                    await ReviseChatPlanAsync(prompt, progressMessage.Id, token);
+                    break;
+                case AiChatIntentKind.TimelineCommand:
+                    await PrepareTimelineCommandChatPlanAsync(prompt, progressMessage.Id, token);
+                    break;
+                default:
+                    await PrepareGenericChatPlanAsync(prompt, progressMessage.Id, token);
+                    break;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            CompleteChatProgress(progressMessage.Id, "Подготовка остановлена.",
+                KadrStudio.Core.Domain.AiChatMessageKind.Error,
+                KadrStudio.Core.Domain.AiChatOperationState.Cancelled);
+        }
+        catch (Exception exception)
+        {
+            CompleteChatProgress(progressMessage.Id, exception.Message,
+                KadrStudio.Core.Domain.AiChatMessageKind.Error,
+                KadrStudio.Core.Domain.AiChatOperationState.Failed);
+        }
+        finally
+        {
+            SetAiChatBusy(false);
+        }
+    }
+
+    private async Task PreparePresetChatPlanAsync(
+        string prompt,
+        KadrStudio.Core.Domain.AutomationPreset preset,
+        Guid progressMessageId,
+        CancellationToken token)
+    {
+        var model = await ResolveChatModelAsync(requireVision: true, token);
+        var profile = _viewModel.GetGameEditingProfiles().First(item => item.Id == preset.ProfileId);
+        var mergeEpisodes = preset.Recipe == KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
+        var scope = ResolveChatScope(useAllSources: mergeEpisodes);
+        if (mergeEpisodes && scope.SourceIds.Length < 2)
+            throw new InvalidOperationException("Для объединения добавьте в медиатеку минимум две серии.");
+        var request = BuildChatMontageRequest(prompt, scope, profile, preset);
+        var progress = new Progress<double>(value =>
+            UpdateChatProgress(progressMessageId, value,
+                value < 0.35 ? "Технический анализ серий…" :
+                value < 0.75 ? "ИИ проверяет структуру и повторяющиеся блоки…" :
+                "Уточняю покадровые границы и собираю план…"));
+        var result = await _viewModel.PrepareMontagePlanAsync(
+            new MediaAnalysisRequest(scope.SourceIds, profile, model.Name, DeepAnalysis: true),
+            request, progress, token);
+        _aiManifests = result.Manifests;
+        _activeMontagePlan = result.Plan;
+        CompleteChatProgress(progressMessageId, "Анализ завершён.",
+            KadrStudio.Core.Domain.AiChatMessageKind.Text,
+            KadrStudio.Core.Domain.AiChatOperationState.Completed);
+        AppendChatPlan(result.Plan);
+    }
+
+    private async Task PrepareGenericChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
+    {
+        var model = await ResolveChatModelAsync(requireVision: false, token);
+        var profile = _viewModel.GetGameEditingProfiles()
+            .FirstOrDefault(item => item.Id == "universal")
+            ?? _viewModel.GetGameEditingProfiles().First();
+        var scope = ResolveChatScope(useAllSources: false);
+        if (scope.SourceIds.IsDefaultOrEmpty)
+            throw new InvalidOperationException("Добавьте видео в медиатеку или на таймлайн.");
+        var request = BuildChatMontageRequest(prompt, scope, profile, null);
+        var progress = new Progress<double>(value =>
+            UpdateChatProgress(progressMessageId, value,
+                value < 0.75 ? "Анализирую материал…" : "Собираю подробный план…"));
+        _aiManifests = await _viewModel.AnalyzeMontageSourcesAsync(
+            new MediaAnalysisRequest(scope.SourceIds, profile, model.Name, DeepAnalysis: model.SupportsVision),
+            progress, token);
+        _activeMontagePlan = await _viewModel.CreateMontagePlanAsync(request, _aiManifests, token);
+        CompleteChatProgress(progressMessageId, "Анализ завершён.",
+            KadrStudio.Core.Domain.AiChatMessageKind.Text,
+            KadrStudio.Core.Domain.AiChatOperationState.Completed);
+        AppendChatPlan(_activeMontagePlan);
+    }
+
+    private async Task ReviseChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
+    {
+        if (_activeMontagePlan is null) return;
+        var sourceIds = _activeMontagePlan.Dependencies.SourceFingerprints.Keys.ToImmutableArray();
+        if (sourceIds.Any(id => !_aiManifests.ContainsKey(id)))
+        {
+            var model = await ResolveChatModelAsync(requireVision: false, token);
+            _aiManifests = await _viewModel.AnalyzeMontageSourcesAsync(
+                new MediaAnalysisRequest(sourceIds, _activeMontagePlan.ProfileSnapshot, model.Name, model.SupportsVision),
+                new Progress<double>(value => UpdateChatProgress(progressMessageId, value, "Проверяю зависимые фрагменты…")),
+                token);
+        }
+        _activeMontagePlan = await _viewModel.ReviseMontagePlanAsync(
+            _activeMontagePlan, prompt, _aiManifests, token);
+        CompleteChatProgress(progressMessageId, "План исправлен.",
+            KadrStudio.Core.Domain.AiChatMessageKind.Text,
+            KadrStudio.Core.Domain.AiChatOperationState.Completed);
+        AppendChatPlan(_activeMontagePlan);
+    }
+
+    private async Task PrepareTimelineCommandChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
+    {
+        EditCommandPlan plan;
+        var selected = _viewModel.SelectedClip is { } clip
+            ? _viewModel.CoreState.FindMediaClip(clip.Id)
+            : null;
+        if (EditingCommandPlanner.TryCreateDeterministic(_viewModel.CoreState, prompt, selected, out var deterministic))
+        {
+            plan = deterministic;
+        }
+        else
+        {
+            var model = await ResolveChatModelAsync(requireVision: false, token);
+            plan = await _viewModel.OllamaVideoAnalysisService.PlanEditsAsync(
+                _viewModel.CoreState, prompt, model.Name, selected, token);
+        }
+
+        var commands = plan.Commands.Select(command => new KadrStudio.Core.Domain.AiChatEditCommand(
+            command.Type switch
+            {
+                EditCommandType.DeleteRange => KadrStudio.Core.Domain.AiChatEditCommandKind.DeleteRange,
+                EditCommandType.SplitAt => KadrStudio.Core.Domain.AiChatEditCommandKind.SplitAt,
+                _ => KadrStudio.Core.Domain.AiChatEditCommandKind.DeleteSelected
+            }, command.Start, command.End, command.Reason)).ToImmutableArray();
+        var details = plan.Commands.Select(FormatEditCommand).ToImmutableArray();
+        var snapshot = new KadrStudio.Core.Domain.AiPlanCardSnapshot(
+            "Команда текущему таймлайну", plan.Summary,
+            KadrStudio.Core.Domain.TimelineTime.Zero, details, [], [], commands.Length > 0);
+        CompleteChatProgress(progressMessageId, "Команда разобрана. Таймлайн пока не изменён.",
+            KadrStudio.Core.Domain.AiChatMessageKind.Text,
+            KadrStudio.Core.Domain.AiChatOperationState.Completed);
+        var message = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+            KadrStudio.Core.Domain.AiChatMessageKind.Plan, plan.Summary, DateTimeOffset.UtcNow,
+            PlanSnapshot: snapshot, EditCommands: commands);
+        SaveAiConversation(_aiChatCoordinator.Append(_viewModel.GetAiConversation(), message));
+    }
+
+    private KadrStudio.Core.Domain.MontageScope ResolveChatScope(bool useAllSources)
+    {
+        var selectedKind = (AiChatContextComboBox.SelectedItem as AiChatContextOption)?.Kind;
+        var kind = selectedKind ?? (useAllSources
+            ? KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary
+            : _viewModel.SelectedClip is not null
+                ? KadrStudio.Core.Domain.MontageScopeKind.SelectedClips
+                : KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence);
+        IEnumerable<KadrStudio.Core.Domain.MediaClip> clips = _viewModel.CoreState.MediaClips;
+        Guid? sequenceId = null;
+        if (kind == KadrStudio.Core.Domain.MontageScopeKind.SelectedClips)
+        {
+            clips = _viewModel.SelectedClip is { } selected ? clips.Where(item => item.Id == selected.Id) : [];
+            sequenceId = _viewModel.CoreState.ActiveSequenceId;
+        }
+        else if (kind == KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence)
+        {
+            sequenceId = _viewModel.CoreState.ActiveSequenceId;
+        }
+
+        ImmutableArray<Guid> sourceIds;
+        ImmutableArray<Guid> clipIds = [];
+        if (kind == KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary)
+        {
+            sourceIds = _viewModel.CoreState.Sources.Values
+                .Where(source => source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
+                .Select(source => source.Id).ToImmutableArray();
+        }
+        else
+        {
+            var material = clips.Where(clip =>
+                    _viewModel.CoreState.Sources.TryGetValue(clip.SourceId, out var source) &&
+                    source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
+                .ToImmutableArray();
+            sourceIds = material.Select(clip => clip.SourceId).Distinct().ToImmutableArray();
+            clipIds = material.Select(clip => clip.Id).ToImmutableArray();
+            if (sourceIds.IsDefaultOrEmpty && selectedKind is null)
+            {
+                kind = KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary;
+                sequenceId = null;
+                sourceIds = _viewModel.CoreState.Sources.Values
+                    .Where(source => source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
+                    .Select(source => source.Id).ToImmutableArray();
+            }
+        }
+        return new KadrStudio.Core.Domain.MontageScope(kind, sourceIds, sequenceId, clipIds);
+    }
+
+    private KadrStudio.Core.Domain.MontageRequest BuildChatMontageRequest(
+        string prompt,
+        KadrStudio.Core.Domain.MontageScope scope,
+        CoreGameProfile profile,
+        KadrStudio.Core.Domain.AutomationPreset? preset)
+    {
+        var mergeEpisodes = preset?.Recipe == KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
+        var total = Math.Max(1, scope.SourceIds
+            .Where(_viewModel.CoreState.Sources.ContainsKey)
+            .Sum(id => _viewModel.CoreState.Sources[id].Duration.TotalSeconds));
+        var target = mergeEpisodes ? total : Math.Clamp(total * 0.35, 30, 720);
+        var sourceIds = scope.SourceIds.ToHashSet();
+        var constraints = _viewModel.CoreState.SourceAnnotations
+            .Where(item => sourceIds.Contains(item.SourceId))
+            .Select(item => new KadrStudio.Core.Domain.MontageConstraint(
+                item.Id, item.SourceId, item.Kind, item.SourceRange, item.Note, IsHard: true))
+            .ToImmutableArray();
+        return new KadrStudio.Core.Domain.MontageRequest(
+            Guid.NewGuid(), scope,
+            mergeEpisodes ? KadrStudio.Core.Domain.MontageTargetFormat.Source : KadrStudio.Core.Domain.MontageTargetFormat.YouTube,
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(mergeEpisodes ? 1 : Math.Min(30, target)),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(target),
+            KadrStudio.Core.Domain.TimelineTime.FromSeconds(mergeEpisodes ? total : Math.Max(target, Math.Min(1200, total))),
+            prompt, profile, constraints, preset);
+    }
+
+    private async Task<OllamaModelInfo> ResolveChatModelAsync(
+        bool requireVision,
+        CancellationToken cancellationToken = default)
+    {
+        if (_localAiModels.Count == 0) await RefreshLocalAiModelsAsync(showError: false);
+        var model = requireVision
+            ? _localAiModels.FirstOrDefault(item => item.SupportsVision)
+            : _localAiModels.FirstOrDefault(item => item.SupportsVision) ?? _localAiModels.FirstOrDefault();
+        if (model is null)
+            throw new InvalidOperationException(requireVision
+                ? "Для точного анализа нужна доступная vision-модель на ИИ-сервере."
+                : "ИИ-модель недоступна. Проверьте подключение к серверу.");
+        await _viewModel.OllamaVideoAnalysisService.VerifyModelAsync(model.Name, cancellationToken);
+        LocalAiModelComboBox.SelectedItem = model;
+        UseLocalAiCheckBox.IsChecked = true;
+        return model;
+    }
+
+    private void AppendChatPlan(CoreMontagePlan plan)
+    {
+        var validation = _viewModel.AiMontageCoordinator.ValidatePlan(_viewModel.CoreState, plan);
+        var canCreate = validation.IsValid && plan.Status == KadrStudio.Core.Domain.MontagePlanStatus.Ready &&
+                        plan.Decisions.All(decision => decision.IsResolved);
+        var snapshot = _aiChatCoordinator.CreatePlanSnapshot(_viewModel.CoreState, plan, canCreate);
+        var planMessage = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+            KadrStudio.Core.Domain.AiChatMessageKind.Plan, plan.Summary, DateTimeOffset.UtcNow,
+            PlanId: plan.Id, PlanSnapshot: snapshot);
+        var conversation = _aiChatCoordinator.Append(_viewModel.GetAiConversation(), planMessage);
+        var question = _aiChatCoordinator.FindNextQuestion(conversation, plan);
+        if (question is not null) conversation = _aiChatCoordinator.Append(conversation, question);
+        SaveAiConversation(conversation);
+    }
+
+    private void UpdateChatProgress(Guid messageId, double progress, string text)
+    {
+        var row = _aiChatRows.FirstOrDefault(item => item.Id == messageId);
+        row?.UpdateProgress((int)Math.Round(Math.Clamp(progress, 0, 1) * 100), text);
+    }
+
+    private void CompleteChatProgress(
+        Guid messageId,
+        string text,
+        KadrStudio.Core.Domain.AiChatMessageKind kind,
+        KadrStudio.Core.Domain.AiChatOperationState state)
+    {
+        var conversation = _viewModel.GetAiConversation();
+        var existing = conversation.Messages.FirstOrDefault(message => message.Id == messageId);
+        if (existing is null) return;
+        SaveAiConversation(_aiChatCoordinator.Replace(conversation, existing with
+        {
+            Text = text,
+            Kind = kind,
+            OperationState = state,
+            ProgressPercent = 100
+        }));
+    }
+
+    private void SetAiChatBusy(bool busy)
+    {
+        _isAiChatBusy = busy;
+        AiChatSendButton.Content = busy ? "Остановить" : "Отправить";
+        AiChatPromptTextBox.IsEnabled = !busy;
+        AiChatScenarioComboBox.IsEnabled = !busy;
+        AiChatContextComboBox.IsEnabled = !busy;
+    }
+
+    private void SaveAiConversation(KadrStudio.Core.Domain.AiConversation conversation)
+    {
+        _viewModel.SaveAiConversation(conversation);
+        RefreshAiChatRows();
+    }
+
+    private void RefreshAiChatRows()
+    {
+        _aiChatRows.Clear();
+        var conversation = _viewModel.GetAiConversation();
+        foreach (var message in conversation.Messages)
+        {
+            var plan = message.PlanId is { } planId ? _viewModel.CoreState.FindMontagePlan(planId) : null;
+            var decision = message.DecisionId is { } decisionId
+                ? plan?.Decisions.FirstOrDefault(item => item.Id == decisionId)
+                : null;
+            var row = new AiChatMessageRow(message, plan, decision);
+            _aiChatRows.Add(row);
+            if (row.IsBoundaryQuestionVisible && !row.HasAnswer)
+            {
+                if (!_aiBoundaryTimes.ContainsKey(row.Id))
+                    _aiBoundaryTimes[row.Id] = decision?.ResolvedTime ?? decision?.SuggestedTime ??
+                                               KadrStudio.Core.Domain.TimelineTime.Zero;
+                _ = RefreshAiBoundaryFrameAsync(row);
+            }
+        }
+        AiChatSuggestionsPanel.Visibility = conversation.Messages.IsDefaultOrEmpty
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        if (_aiChatRows.Count > 0)
+            Dispatcher.BeginInvoke(() => AiChatMessagesListBox.ScrollIntoView(_aiChatRows[^1]), DispatcherPriority.Background);
+    }
+
+    private void AiChatQuestionOption_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: AiChatQuestionOptionRow option } || !option.IsEnabled) return;
+        ResolveAiChatDecision(option.MessageId, option.Option.Id, option.Option.Label, null);
+    }
+
+    private async void AiChatPreviousFrame_Click(object sender, RoutedEventArgs e)
+        => await MoveAiChatBoundaryAsync((sender as Button)?.Tag, -1);
+
+    private async void AiChatNextFrame_Click(object sender, RoutedEventArgs e)
+        => await MoveAiChatBoundaryAsync((sender as Button)?.Tag, 1);
+
+    private async Task MoveAiChatBoundaryAsync(object? tag, int direction)
+    {
+        if (tag is not Guid messageId) return;
+        var message = _viewModel.GetAiConversation().Messages.FirstOrDefault(item => item.Id == messageId);
+        var plan = message?.PlanId is { } planId ? _viewModel.CoreState.FindMontagePlan(planId) : null;
+        var decision = message?.DecisionId is { } decisionId
+            ? plan?.Decisions.FirstOrDefault(item => item.Id == decisionId)
+            : null;
+        var source = decision?.SourceId is { } sourceId
+            ? _viewModel.CoreState.Sources.GetValueOrDefault(sourceId)
+            : null;
+        if (message is null || decision is null || source is null) return;
+        var step = source.FrameRate?.FrameDuration ?? _viewModel.CoreState.FrameRate.FrameDuration;
+        var current = _aiBoundaryTimes.GetValueOrDefault(messageId, decision.SuggestedTime ?? KadrStudio.Core.Domain.TimelineTime.Zero);
+        var candidate = direction < 0 ? current - step : current + step;
+        if (candidate < KadrStudio.Core.Domain.TimelineTime.Zero) candidate = KadrStudio.Core.Domain.TimelineTime.Zero;
+        if (candidate > source.Duration) candidate = source.Duration;
+        _aiBoundaryTimes[messageId] = candidate;
+        var row = _aiChatRows.FirstOrDefault(item => item.Id == messageId);
+        if (row is not null) await RefreshAiBoundaryFrameAsync(row);
+    }
+
+    private void AiChatConfirmFrame_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as Button)?.Tag is not Guid messageId) return;
+        var time = _aiBoundaryTimes.GetValueOrDefault(messageId);
+        ResolveAiChatDecision(messageId, time.ToString(), FormatBoundaryTime(time), time);
+    }
+
+    private void ResolveAiChatDecision(
+        Guid messageId,
+        string answer,
+        string answerLabel,
+        KadrStudio.Core.Domain.TimelineTime? resolvedTime)
+    {
+        var conversation = _viewModel.GetAiConversation();
+        var message = conversation.Messages.FirstOrDefault(item => item.Id == messageId);
+        var plan = message?.PlanId is { } planId ? _viewModel.CoreState.FindMontagePlan(planId) : null;
+        if (message?.DecisionId is not { } decisionId || plan is null) return;
+        _activeMontagePlan = _viewModel.ResolveMontageDecision(plan, decisionId, answer, resolvedTime);
+
+        conversation = _viewModel.GetAiConversation();
+        var currentMessage = conversation.Messages.FirstOrDefault(item => item.Id == messageId);
+        if (currentMessage is null) return;
+        conversation = _aiChatCoordinator.Replace(conversation, currentMessage with { Answer = answerLabel });
+        var next = _aiChatCoordinator.FindNextQuestion(conversation, _activeMontagePlan);
+        if (next is not null)
+        {
+            conversation = _aiChatCoordinator.Append(conversation, next);
+            SaveAiConversation(conversation);
+        }
+        else
+        {
+            SaveAiConversation(conversation);
+            AppendChatPlan(_activeMontagePlan);
+        }
+    }
+
+    private async Task RefreshAiBoundaryFrameAsync(AiChatMessageRow row)
+    {
+        var message = _viewModel.GetAiConversation().Messages.FirstOrDefault(item => item.Id == row.Id);
+        var plan = message?.PlanId is { } planId ? _viewModel.CoreState.FindMontagePlan(planId) : null;
+        var decision = message?.DecisionId is { } decisionId
+            ? plan?.Decisions.FirstOrDefault(item => item.Id == decisionId)
+            : null;
+        if (decision?.SourceId is not { } sourceId || !_viewModel.CoreState.Sources.ContainsKey(sourceId)) return;
+        var time = _aiBoundaryTimes.GetValueOrDefault(row.Id, decision.SuggestedTime ?? KadrStudio.Core.Domain.TimelineTime.Zero);
+        try
+        {
+            var path = await _viewModel.GetTimelineThumbnailAsync(sourceId, time, CancellationToken.None);
+            row.UpdateBoundary(
+                !string.IsNullOrWhiteSpace(path) && File.Exists(path) ? LoadBitmap(path) : null,
+                FormatBoundaryTime(time));
+        }
+        catch (Exception exception)
+        {
+            row.UpdateBoundary(null, $"{FormatBoundaryTime(time)} · кадр недоступен: {exception.Message}");
+        }
+    }
+
+    private async void AiChatCreateDraft_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as Button)?.Tag is not Guid messageId) return;
+        var message = _viewModel.GetAiConversation().Messages.FirstOrDefault(item => item.Id == messageId);
+        if (message is null || message.PlanSnapshot?.CanCreateDraft != true) return;
+        try
+        {
+            Guid? sequenceId;
+            string text;
+            if (!message.EditCommands.IsDefaultOrEmpty)
+            {
+                var commands = message.EditCommands.Select(command => new EditCommand(
+                    command.Kind switch
+                    {
+                        KadrStudio.Core.Domain.AiChatEditCommandKind.DeleteRange => EditCommandType.DeleteRange,
+                        KadrStudio.Core.Domain.AiChatEditCommandKind.SplitAt => EditCommandType.SplitAt,
+                        _ => EditCommandType.DeleteSelected
+                    }, command.Start, command.End, command.Reason)).ToArray();
+                var count = _viewModel.BeginEditPlanReview(new EditCommandPlan(message.Text, commands));
+                if (count == 0) throw new InvalidOperationException("Команда не изменила таймлайн.");
+                sequenceId = _viewModel.CoreState.ActiveSequenceId;
+                text = $"Создан проверяемый черновик: {count} изменений.";
+            }
+            else
+            {
+                var plan = message.PlanId is { } planId ? _viewModel.CoreState.FindMontagePlan(planId) : null;
+                if (plan is null) throw new InvalidOperationException("План больше не найден в проекте.");
+                var sequence = _viewModel.CreateMontageDraft(plan, _aiManifests);
+                sequenceId = sequence.Id;
+                text = $"Черновик «{sequence.Name}» создан отдельно от исходного таймлайна.";
+            }
+
+            var conversation = _viewModel.GetAiConversation();
+            var sourceMessage = conversation.Messages.First(item => item.Id == messageId);
+            conversation = _aiChatCoordinator.Replace(conversation, sourceMessage with
+            {
+                PlanSnapshot = sourceMessage.PlanSnapshot! with { CanCreateDraft = false }
+            });
+            conversation = _aiChatCoordinator.Append(conversation, new KadrStudio.Core.Domain.AiChatMessage(
+                Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+                KadrStudio.Core.Domain.AiChatMessageKind.Draft, text, DateTimeOffset.UtcNow,
+                SequenceId: sequenceId));
+            SaveAiConversation(conversation);
+            ResetPreviewState();
+            TimelineEditor.InvalidateVisual();
+        }
+        catch (Exception exception)
+        {
+            AppendAiChatError(exception.Message);
+        }
+        await Task.CompletedTask;
+    }
+
+    private void AiChatOpenDraft_Click(object sender, RoutedEventArgs e)
+    {
+        var message = FindAiChatMessage((sender as Button)?.Tag);
+        if (message?.SequenceId is not { } sequenceId || _viewModel.CoreState.FindSequence(sequenceId) is null) return;
+        _viewModel.ActivateSequence(sequenceId);
+        ResetPreviewState();
+        TimelineEditor.InvalidateVisual();
+    }
+
+    private async void AiChatAcceptDraft_Click(object sender, RoutedEventArgs e)
+    {
+        var message = FindAiChatMessage((sender as Button)?.Tag);
+        if (message is null) return;
+        if (_viewModel.HasPendingEditReview)
+        {
+            await _viewModel.AcceptEditPlanReviewAsync();
+        }
+        else if (message.SequenceId is { } sequenceId && _viewModel.CoreState.FindSequence(sequenceId) is not null)
+        {
+            _viewModel.ActivateSequence(sequenceId);
+            _viewModel.AcceptActiveMontageDraft();
+        }
+        CompleteDraftChatMessage(message.Id, "Черновик принят.");
+    }
+
+    private void AiChatDeleteDraft_Click(object sender, RoutedEventArgs e)
+    {
+        var message = FindAiChatMessage((sender as Button)?.Tag);
+        if (message is null) return;
+        if (_viewModel.HasPendingEditReview)
+        {
+            _viewModel.RejectEditPlanReview();
+        }
+        else if (message.SequenceId is { } sequenceId && _viewModel.CoreState.FindSequence(sequenceId) is not null)
+        {
+            _viewModel.ActivateSequence(sequenceId);
+            _viewModel.DeleteActiveMontageDraft();
+        }
+        CompleteDraftChatMessage(message.Id, "Черновик удалён; исходный таймлайн сохранён.");
+        ResetPreviewState();
+        TimelineEditor.InvalidateVisual();
+    }
+
+    private KadrStudio.Core.Domain.AiChatMessage? FindAiChatMessage(object? tag)
+        => tag is Guid messageId
+            ? _viewModel.GetAiConversation().Messages.FirstOrDefault(item => item.Id == messageId)
+            : null;
+
+    private void CompleteDraftChatMessage(Guid messageId, string text)
+    {
+        var conversation = _viewModel.GetAiConversation();
+        var message = conversation.Messages.FirstOrDefault(item => item.Id == messageId);
+        if (message is null) return;
+        SaveAiConversation(_aiChatCoordinator.Replace(conversation, message with
+        {
+            Kind = KadrStudio.Core.Domain.AiChatMessageKind.Text,
+            Text = text
+        }));
+    }
+
+    private void AppendAiChatError(string text)
+    {
+        var message = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+            KadrStudio.Core.Domain.AiChatMessageKind.Error, text, DateTimeOffset.UtcNow,
+            KadrStudio.Core.Domain.AiChatOperationState.Failed);
+        SaveAiConversation(_aiChatCoordinator.Append(_viewModel.GetAiConversation(), message));
+    }
+
+    private static string FormatBoundaryTime(KadrStudio.Core.Domain.TimelineTime time)
+        => TimeSpan.FromSeconds(time.TotalSeconds).ToString(@"hh\:mm\:ss\.fff", CultureInfo.InvariantCulture) +
+           $" · {time.Ticks} PTS";
 
     private async void ApplyEditPrompt_Click(object sender, RoutedEventArgs e)
     {
@@ -1356,11 +2008,83 @@ public partial class MainWindow : Window
             : "720";
     }
 
+    private void AiMaterialProfile_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (AiScenarioComboBox is null || AiPreparePlanButton is null ||
+            AiGameProfileComboBox.SelectedItem is not CoreGameProfile profile)
+            return;
+        var presets = _viewModel.GetAutomationPresets()
+            .Where(item => item.ProfileId.Equals(profile.Id, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        AiScenarioComboBox.ItemsSource = presets;
+        AiScenarioComboBox.SelectedIndex = presets.Length > 0 ? 0 : -1;
+        AiScenarioComboBox.IsEnabled = presets.Length > 0;
+        AiPreparePlanButton.Visibility = presets.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (profile.Kind == KadrStudio.Core.Domain.MaterialProfileKind.Anime)
+            AnalysisPromptTextBox.Text = "Объедини серии: один опенинг в начале, затем сюжет без эндингов, рекапов и превью.";
+    }
+
+    private async void AiPreparePlan_Click(object sender, RoutedEventArgs e)
+        => await PrepareAiPlanAsync();
+
+    private async Task PrepareAiPlanAsync()
+    {
+        try
+        {
+            var request = BuildAiMontageRequest();
+            if (request.Preset is null)
+                throw new InvalidOperationException("Выберите сценарий монтажа.");
+            if (!request.Scope.SourceIds.Any())
+                throw new InvalidOperationException("В выбранной области нет видеоисходников.");
+            if (UseLocalAiCheckBox.IsChecked != true ||
+                LocalAiModelComboBox.SelectedItem is not OllamaModelInfo { SupportsVision: true } model)
+                throw new InvalidOperationException(
+                    "Для точного аниме-пресета выберите локальную vision-модель. Без неё вероятностное удаление не выполняется.");
+
+            _analysisCancellation?.Cancel();
+            _analysisCancellation?.Dispose();
+            _analysisCancellation = new CancellationTokenSource();
+            SetAiMontageBusy(true, "Технический проход → vision-проверка → покадровые границы → план…");
+            var progress = new Progress<double>(value =>
+            {
+                AnalysisProgressBar.IsIndeterminate = false;
+                AnalysisProgressBar.Value = Math.Clamp(value * 100, 0, 100);
+                _viewModel.StatusText = $"Подготовка ИИ-плана: {value:P0}";
+            });
+            var result = await _viewModel.PrepareMontagePlanAsync(
+                new MediaAnalysisRequest(
+                    request.Scope.SourceIds, request.Profile, model.Name, DeepAnalysis: true),
+                request,
+                progress,
+                _analysisCancellation.Token);
+            _aiManifests = result.Manifests;
+            _activeMontagePlan = result.Plan;
+            RefreshAiPlanRows();
+            AiMontageTabControl.SelectedIndex = 2;
+            AnalysisSummaryTextBlock.Text = result.PendingDecisions.IsDefaultOrEmpty
+                ? "План готов. Все удаляемые границы подтверждены; можно создать черновик."
+                : $"План подготовлен. Требуется уточнить: {result.PendingDecisions.Length}.";
+        }
+        catch (OperationCanceledException)
+        {
+            AnalysisSummaryTextBlock.Text = "Подготовка плана отменена.";
+        }
+        catch (Exception exception)
+        {
+            AnalysisSummaryTextBlock.Text = exception.Message;
+            ShowError("Не удалось подготовить план", exception);
+        }
+        finally
+        {
+            SetAiMontageBusy(false);
+        }
+    }
+
     private async void AiAnalyzeSources_Click(object sender, RoutedEventArgs e)
     {
         try
         {
-            SetAiMontageBusy(true, "Подготавливается индекс сцен, речи и игровых событий…");
+            SetAiMontageBusy(true, "Подготавливается индекс сцен, речи и важных событий…");
             _aiManifests = await AnalyzeAiSourcesAsync();
             AnalysisSummaryTextBlock.Text = _aiManifests.Count == 0
                 ? "В выбранной области нет видео для анализа."
@@ -1385,6 +2109,11 @@ public partial class MainWindow : Window
 
     private async void AiGeneratePlan_Click(object sender, RoutedEventArgs e)
     {
+        if (AiScenarioComboBox.SelectedItem is KadrStudio.Core.Domain.AutomationPreset)
+        {
+            await PrepareAiPlanAsync();
+            return;
+        }
         try
         {
             var request = BuildAiMontageRequest();
@@ -1832,16 +2561,29 @@ public partial class MainWindow : Window
     {
         var scope = ResolveAiScope();
         var profile = GetSelectedAiProfile();
-        var format = AiTargetFormatComboBox.SelectedItem is ComboBoxItem formatItem &&
+        var preset = AiScenarioComboBox.SelectedItem as KadrStudio.Core.Domain.AutomationPreset;
+        var mergeEpisodes = preset?.Recipe == KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
+        var format = mergeEpisodes
+            ? KadrStudio.Core.Domain.MontageTargetFormat.Source
+            : AiTargetFormatComboBox.SelectedItem is ComboBoxItem formatItem &&
                      string.Equals(formatItem.Tag?.ToString(), "Shorts", StringComparison.Ordinal)
             ? KadrStudio.Core.Domain.MontageTargetFormat.Shorts
             : KadrStudio.Core.Domain.MontageTargetFormat.YouTube;
-        var defaultSeconds = format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 45d : 720d;
+        var sourceDuration = scope.SourceIds
+            .Where(_viewModel.CoreState.Sources.ContainsKey)
+            .Sum(id => _viewModel.CoreState.Sources[id].Duration.TotalSeconds);
+        var defaultSeconds = mergeEpisodes
+            ? Math.Max(1, sourceDuration)
+            : format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 45d : 720d;
         if (!double.TryParse(AiTargetDurationTextBox.Text?.Replace(',', '.'), NumberStyles.Float,
                 CultureInfo.InvariantCulture, out var targetSeconds))
             targetSeconds = defaultSeconds;
-        var minimumSeconds = format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 15d : 480d;
-        var maximumSeconds = format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 90d : 1200d;
+        var minimumSeconds = mergeEpisodes
+            ? 1d
+            : format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 15d : 480d;
+        var maximumSeconds = mergeEpisodes
+            ? Math.Max(1, sourceDuration)
+            : format == KadrStudio.Core.Domain.MontageTargetFormat.Shorts ? 90d : 1200d;
         targetSeconds = Math.Clamp(targetSeconds, minimumSeconds, maximumSeconds);
         AiTargetDurationTextBox.Text = targetSeconds.ToString("0.###", CultureInfo.InvariantCulture);
 
@@ -1860,7 +2602,8 @@ public partial class MainWindow : Window
             KadrStudio.Core.Domain.TimelineTime.FromSeconds(maximumSeconds),
             AnalysisPromptTextBox.Text?.Trim() ?? string.Empty,
             profile,
-            constraints);
+            constraints,
+            preset);
     }
 
     private KadrStudio.Core.Domain.MontageScope ResolveAiScope()
@@ -1925,6 +2668,7 @@ public partial class MainWindow : Window
 
     private void SetAiMontageBusy(bool busy, string? status = null)
     {
+        AiPreparePlanButton.IsEnabled = !busy;
         AiAnalyzeSourcesButton.IsEnabled = !busy;
         AiGeneratePlanButton.IsEnabled = !busy;
         AiRevisePlanButton.IsEnabled = !busy && _activeMontagePlan is not null;
@@ -1970,11 +2714,15 @@ public partial class MainWindow : Window
     private void RefreshAiPlanRows(Guid? selectedId = null)
     {
         _aiPlanRows.Clear();
+        _aiStructuralRows.Clear();
         if (_activeMontagePlan is null)
         {
             AiPlanSummaryTextBlock.Text = "Сначала проанализируйте материал.";
             AiRevisePlanButton.IsEnabled = false;
             AiCreateDraftButton.IsEnabled = false;
+            AiDecisionsTitle.Visibility = Visibility.Collapsed;
+            AiDecisionsPanel.Visibility = Visibility.Collapsed;
+            AiDecisionsListBox.ItemsSource = null;
             return;
         }
 
@@ -1982,6 +2730,21 @@ public partial class MainWindow : Window
         {
             var sourceName = _viewModel.CoreState.Sources.GetValueOrDefault(item.SourceId)?.Name ?? "Удалённый исходник";
             _aiPlanRows.Add(new AiPlanItemRow(item, sourceName));
+        }
+        if (!_activeMontagePlan.StructuralSegments.IsDefaultOrEmpty)
+        {
+            var selectedOpening = _activeMontagePlan.Items.FirstOrDefault(item => item.Role == KadrStudio.Core.Domain.MontageRole.Opening);
+            foreach (var segment in _activeMontagePlan.StructuralSegments
+                         .Where(item => item.Kind == KadrStudio.Core.Domain.StructuralSegmentKind.Opening ||
+                                        item.Disposition == KadrStudio.Core.Domain.StructuralSegmentDisposition.Remove)
+                         .OrderBy(item => item.SourceId)
+                         .ThenBy(item => item.SourceRange.Start))
+            {
+                var sourceName = _viewModel.CoreState.Sources.GetValueOrDefault(segment.SourceId)?.Name ?? "Удалённый исходник";
+                var movedOpening = selectedOpening is not null && selectedOpening.SourceId == segment.SourceId &&
+                                   selectedOpening.SourceRange == segment.SourceRange;
+                _aiStructuralRows.Add(new AiStructuralSegmentRow(segment, sourceName, movedOpening));
+            }
         }
         var validation = _viewModel.AiMontageCoordinator.ValidatePlan(_viewModel.CoreState, _activeMontagePlan);
         var details = new[]
@@ -1992,10 +2755,33 @@ public partial class MainWindow : Window
             validation.IsValid ? string.Empty : string.Join(" ", validation.Validation.Errors.Select(item => item.Message))
         };
         AiPlanSummaryTextBlock.Text = string.Join(" ", details.Where(item => !string.IsNullOrWhiteSpace(item)));
-        AiRevisePlanButton.IsEnabled = validation.IsValid;
+        var pendingDecisions = _activeMontagePlan.Decisions.IsDefault
+            ? ImmutableArray<CoreMontageDecision>.Empty
+            : _activeMontagePlan.Decisions.Where(item => !item.IsResolved).ToImmutableArray();
+        AiDecisionsListBox.ItemsSource = pendingDecisions;
+        AiDecisionsTitle.Visibility = pendingDecisions.IsDefaultOrEmpty ? Visibility.Collapsed : Visibility.Visible;
+        AiDecisionsPanel.Visibility = pendingDecisions.IsDefaultOrEmpty ? Visibility.Collapsed : Visibility.Visible;
+        AiRevisePlanButton.IsEnabled = validation.IsValid &&
+                                      _activeMontagePlan.PresetSnapshot?.Recipe != KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
         AiCreateDraftButton.IsEnabled = validation.IsValid;
         if (selectedId is { } id)
             AiPlanItemsListBox.SelectedItem = _aiPlanRows.FirstOrDefault(item => item.Item.Id == id);
+    }
+
+    private void AiResolveDecision_Click(object sender, RoutedEventArgs e)
+    {
+        if (_activeMontagePlan is null || AiDecisionsListBox.SelectedItem is not CoreMontageDecision decision)
+        {
+            AnalysisSummaryTextBlock.Text = "Выберите вопрос, который нужно уточнить.";
+            return;
+        }
+        var conversation = _viewModel.GetAiConversation();
+        if (conversation.Messages.All(message => message.DecisionId != decision.Id))
+            conversation = _aiChatCoordinator.Append(conversation, new KadrStudio.Core.Domain.AiChatMessage(
+                Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
+                KadrStudio.Core.Domain.AiChatMessageKind.Question, decision.Prompt, DateTimeOffset.UtcNow,
+                PlanId: _activeMontagePlan.Id, DecisionId: decision.Id));
+        SaveAiConversation(conversation);
     }
 
     private void AnalysisMarkersList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
@@ -2066,6 +2852,14 @@ public partial class MainWindow : Window
             _viewModel.Playhead = Math.Min(_viewModel.Playhead, _viewModel.Project.Duration);
             TimelineEditor.PlayheadSeconds = _viewModel.Playhead;
             UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+        }
+        catch (EditRejectedException exception)
+        {
+            _viewModel.StatusText = exception.Errors.Any(item => item.Code == "clip.overlap")
+                ? "Клипы на одной дорожке не могут перекрываться. Для перехода поставьте их вплотную."
+                : exception.Message;
+            TimelineEditor.Project = _viewModel.Project;
+            TimelineEditor.InvalidateVisual();
         }
         catch (Exception exception)
         {
@@ -2766,6 +3560,117 @@ public partial class MainWindow : Window
 
     private void UpdateWindowTitle() => Title = $"{_viewModel.ProjectTitle} — Kadr Studio";
 
+    private sealed record AiChatScenarioOption(string? PresetId, string DisplayName);
+
+    private sealed record AiChatContextOption(
+        KadrStudio.Core.Domain.MontageScopeKind? Kind,
+        string DisplayName)
+    {
+        public override string ToString() => DisplayName;
+    }
+
+    private sealed record AiChatQuestionOptionRow(
+        Guid MessageId,
+        KadrStudio.Core.Domain.MontageDecisionOption Option,
+        bool IsEnabled)
+    {
+        public string Label => Option.Label;
+        public string Description => Option.Description;
+    }
+
+    private sealed class AiChatMessageRow : INotifyPropertyChanged
+    {
+        private string _text;
+        private int _progressPercent;
+        private ImageSource? _boundaryFrame;
+        private string _boundaryTimeLabel = "Подготавливается кадр…";
+
+        public AiChatMessageRow(
+            KadrStudio.Core.Domain.AiChatMessage message,
+            CoreMontagePlan? plan,
+            CoreMontageDecision? decision)
+        {
+            Message = message;
+            Plan = plan;
+            Decision = decision;
+            _text = message.Text;
+            _progressPercent = message.ProgressPercent;
+            var enabled = string.IsNullOrWhiteSpace(message.Answer);
+            Options = decision?.Options.Select(option => new AiChatQuestionOptionRow(message.Id, option, enabled)).ToArray()
+                      ?? Array.Empty<AiChatQuestionOptionRow>();
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+        public KadrStudio.Core.Domain.AiChatMessage Message { get; }
+        public CoreMontagePlan? Plan { get; }
+        public CoreMontageDecision? Decision { get; }
+        public Guid Id => Message.Id;
+        public string Author => Message.Role == KadrStudio.Core.Domain.AiChatRole.User ? "Вы" : "Kadr ИИ";
+        public string Text => _text;
+        public string TimeLabel => Message.CreatedAt.ToLocalTime().ToString("HH:mm", CultureInfo.CurrentCulture);
+        public HorizontalAlignment BubbleAlignment => Message.Role == KadrStudio.Core.Domain.AiChatRole.User
+            ? HorizontalAlignment.Right
+            : Message.Kind is KadrStudio.Core.Domain.AiChatMessageKind.Plan or
+                KadrStudio.Core.Domain.AiChatMessageKind.Question or
+                KadrStudio.Core.Domain.AiChatMessageKind.Draft
+                ? HorizontalAlignment.Stretch
+                : HorizontalAlignment.Left;
+        public Brush BubbleBrush => CreateBrush(Message.Role == KadrStudio.Core.Domain.AiChatRole.User
+            ? "#3C2866"
+            : Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Error ? "#3A2027" : "#202133");
+        public Brush BorderBrush => CreateBrush(Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Question
+            ? "#8B5CF6"
+            : Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Error ? "#B95A68" : "#383A48");
+        public Brush AuthorBrush => CreateBrush(Message.Role == KadrStudio.Core.Domain.AiChatRole.User ? "#D8C8FF" : "#B99AFF");
+        public bool IsProgressVisible => Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Progress;
+        public int ProgressPercent => _progressPercent;
+        public string ProgressLabel => $"{_progressPercent}%";
+        public bool IsPlanVisible => Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Plan && Message.PlanSnapshot is not null;
+        public string PlanDurationLabel => Message.PlanSnapshot is { Duration.Ticks: > 0 } snapshot
+            ? $"Итоговая длительность: {FormatEditorTime(snapshot.Duration.TotalSeconds)}"
+            : "Предлагаемые изменения";
+        public IReadOnlyList<string> RetainedItems => Message.PlanSnapshot?.RetainedItems ?? [];
+        public IReadOnlyList<string> RemovedItems => Message.PlanSnapshot?.RemovedItems ?? [];
+        public IReadOnlyList<string> Warnings => Message.PlanSnapshot?.Warnings ?? [];
+        public bool HasRemovedItems => RemovedItems.Count > 0;
+        public bool CanCreateDraft => Message.PlanSnapshot?.CanCreateDraft == true;
+        public bool IsQuestionVisible => Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Question;
+        public bool HasAnswer => !string.IsNullOrWhiteSpace(Message.Answer);
+        public string AnswerLabel => HasAnswer ? $"Выбрано: {Message.Answer}" : string.Empty;
+        public IReadOnlyList<AiChatQuestionOptionRow> Options { get; }
+        public bool IsBoundaryQuestionVisible => IsQuestionVisible && !HasAnswer && Decision?.Kind is
+            KadrStudio.Core.Domain.MontageDecisionKind.SegmentStart or
+            KadrStudio.Core.Domain.MontageDecisionKind.SegmentEnd;
+        public bool IsOptionQuestionVisible => IsQuestionVisible && !HasAnswer && !IsBoundaryQuestionVisible;
+        public ImageSource? BoundaryFrame => _boundaryFrame;
+        public string BoundaryTimeLabel => _boundaryTimeLabel;
+        public bool IsDraftVisible => Message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Draft;
+
+        public void UpdateProgress(int percent, string text)
+        {
+            _progressPercent = Math.Clamp(percent, 0, 100);
+            _text = text;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ProgressPercent)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ProgressLabel)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Text)));
+        }
+
+        public void UpdateBoundary(ImageSource? frame, string label)
+        {
+            _boundaryFrame = frame;
+            _boundaryTimeLabel = label;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(BoundaryFrame)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(BoundaryTimeLabel)));
+        }
+
+        private static Brush CreateBrush(string value)
+        {
+            var brush = (SolidColorBrush)new BrushConverter().ConvertFromString(value)!;
+            brush.Freeze();
+            return brush;
+        }
+    }
+
     private sealed record AiPlanItemRow(CoreMontagePlanItem Item, string SourceName)
     {
         public string Title => $"{Item.Order + 1}. {RoleLabel(Item.Role)} · {SourceName}";
@@ -2776,12 +3681,40 @@ public partial class MainWindow : Window
 
         private static string RoleLabel(KadrStudio.Core.Domain.MontageRole role) => role switch
         {
+            KadrStudio.Core.Domain.MontageRole.Opening => "Опенинг",
             KadrStudio.Core.Domain.MontageRole.Hook => "Hook",
             KadrStudio.Core.Domain.MontageRole.Setup => "Setup",
             KadrStudio.Core.Domain.MontageRole.Development => "Development",
             KadrStudio.Core.Domain.MontageRole.Payoff => "Payoff",
             KadrStudio.Core.Domain.MontageRole.Ending => "Ending",
             _ => role.ToString()
+        };
+    }
+
+    private sealed record AiStructuralSegmentRow(
+        KadrStudio.Core.Domain.StructuralSegment Segment,
+        string SourceName,
+        bool IsSelectedOpening)
+    {
+        public string Title => $"{KindLabel(Segment.Kind)} · {SourceName}" +
+                               (IsSelectedOpening ? " · перенесён в начало" : string.Empty);
+        public string TimeLabel =>
+            $"{FormatEditorTime(Segment.SourceRange.Start.TotalSeconds)}–{FormatEditorTime(Segment.SourceRange.End.TotalSeconds)}";
+        public string ConfidenceLabel => Segment.HasConfirmedBoundaries
+            ? $"ТОЧНО · {Segment.Confidence:P0}"
+            : $"ПРОВЕРИТЬ · {Segment.Confidence:P0}";
+        public string Evidence => Segment.Evidence.IsDefaultOrEmpty
+            ? "Нет подтверждающих данных."
+            : string.Join(" ", Segment.Evidence.Select(item => item.Summary));
+
+        private static string KindLabel(KadrStudio.Core.Domain.StructuralSegmentKind kind) => kind switch
+        {
+            KadrStudio.Core.Domain.StructuralSegmentKind.Opening => "Опенинг",
+            KadrStudio.Core.Domain.StructuralSegmentKind.Ending => "Эндинг",
+            KadrStudio.Core.Domain.StructuralSegmentKind.Recap => "Что было ранее",
+            KadrStudio.Core.Domain.StructuralSegmentKind.Preview => "Что будет далее",
+            KadrStudio.Core.Domain.StructuralSegmentKind.Credits => "Титры",
+            _ => kind.ToString()
         };
     }
 
@@ -2822,7 +3755,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private sealed record TransitionListItem(Guid Id, string Label);
+    private sealed record TransitionListItem(Guid Id, string Title, string Details, string TrackLabel);
 
     private async Task<bool> ConfirmCanLoseChangesAsync()
     {

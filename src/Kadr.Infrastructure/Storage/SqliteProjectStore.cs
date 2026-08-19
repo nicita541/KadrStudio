@@ -10,7 +10,7 @@ namespace KadrStudio.Infrastructure.Storage;
 
 public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IProjectStore
 {
-    private const int CurrentSchemaVersion = 4;
+    private const int CurrentSchemaVersion = 5;
     private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
@@ -273,6 +273,29 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                     ("$planId", plan.Id.ToString("N")), ("$itemId", item.Id.ToString("N")),
                     ("$order", item.Order), ("$json", JsonSerializer.Serialize(item))).ConfigureAwait(false);
             }
+        }
+
+        var conversation = project.AiConversation;
+        await ExecuteAsync(connection, transaction, """
+            INSERT INTO ai_conversation(singleton_id, id, created_at, updated_at)
+            VALUES(1, $id, $createdAt, $updatedAt);
+            """, token,
+            ("$id", conversation.Id.ToString("N")),
+            ("$createdAt", conversation.CreatedAt.ToString("O", CultureInfo.InvariantCulture)),
+            ("$updatedAt", conversation.UpdatedAt.ToString("O", CultureInfo.InvariantCulture))).ConfigureAwait(false);
+        for (var ordinal = 0; ordinal < conversation.Messages.Length; ordinal++)
+        {
+            var message = conversation.Messages[ordinal];
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO ai_chat_messages(
+                    id, conversation_id, message_order, role, kind, operation_state, created_at, message_json)
+                VALUES($id, $conversationId, $order, $role, $kind, $state, $createdAt, $json);
+                """, token,
+                ("$id", message.Id.ToString("N")), ("$conversationId", conversation.Id.ToString("N")),
+                ("$order", ordinal), ("$role", (int)message.Role), ("$kind", (int)message.Kind),
+                ("$state", (int)message.OperationState),
+                ("$createdAt", message.CreatedAt.ToString("O", CultureInfo.InvariantCulture)),
+                ("$json", JsonSerializer.Serialize(message))).ConfigureAwait(false);
         }
 
         for (var ordinal = 0; ordinal < project.MediaClips.Length; ordinal++)
@@ -718,6 +741,34 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                     reader.GetString(4), reader.GetInt32(5), ReadDateTimeOffset(reader, 6)));
         }
 
+        var conversation = AiConversation.Create();
+        if (await HasTableAsync(connection, "ai_conversation", token).ConfigureAwait(false))
+        {
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "SELECT id, created_at, updated_at FROM ai_conversation WHERE singleton_id = 1;";
+                await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+                if (await reader.ReadAsync(token).ConfigureAwait(false))
+                    conversation = new AiConversation(
+                        ReadGuid(reader, 0), ReadDateTimeOffset(reader, 1), ReadDateTimeOffset(reader, 2), []);
+            }
+            if (await HasTableAsync(connection, "ai_chat_messages", token).ConfigureAwait(false))
+            {
+                var messages = ImmutableArray.CreateBuilder<AiChatMessage>();
+                await using var command = connection.CreateCommand();
+                command.CommandText = "SELECT message_json FROM ai_chat_messages ORDER BY message_order;";
+                await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+                while (await reader.ReadAsync(token).ConfigureAwait(false))
+                {
+                    var message = JsonSerializer.Deserialize<AiChatMessage>(reader.GetString(0))
+                        ?? throw new InvalidDataException("Сообщение диалога ИИ повреждено.");
+                    messages.Add(message);
+                }
+                conversation = conversation with { Messages = messages.ToImmutable() };
+            }
+        }
+        conversation = conversation.RecoverInterruptedOperations();
+
         activeSequenceId ??= sequences[0].Id;
         var active = sequences.FirstOrDefault(item => item.Id == activeSequenceId.Value);
         if (active is null)
@@ -732,7 +783,8 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             ActiveSequenceId = synchronizedActive.Id,
             SourceAnnotations = annotations.ToImmutable(),
             AnalysisReferences = references.ToImmutable(),
-            MontagePlans = plans.ToImmutable()
+            MontagePlans = plans.ToImmutable(),
+            AiConversation = conversation
         };
     }
 
@@ -932,7 +984,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             CREATE TABLE IF NOT EXISTS montage_plans(
                 id TEXT PRIMARY KEY CHECK(length(id) = 32),
                 request_id TEXT NOT NULL CHECK(length(request_id) = 32),
-                status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 3),
+                status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 4),
                 target_format INTEGER NOT NULL CHECK(target_format BETWEEN 0 AND 2),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -945,6 +997,23 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 item_json TEXT NOT NULL CHECK(length(item_json) > 2),
                 PRIMARY KEY(plan_id, item_id),
                 UNIQUE(plan_id, item_order)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS ai_conversation(
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                id TEXT NOT NULL UNIQUE CHECK(length(id) = 32),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS ai_chat_messages(
+                id TEXT PRIMARY KEY CHECK(length(id) = 32),
+                conversation_id TEXT NOT NULL REFERENCES ai_conversation(id) ON DELETE CASCADE,
+                message_order INTEGER NOT NULL CHECK(message_order >= 0),
+                role INTEGER NOT NULL CHECK(role BETWEEN 0 AND 1),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
+                operation_state INTEGER NOT NULL CHECK(operation_state BETWEEN 0 AND 4),
+                created_at TEXT NOT NULL,
+                message_json TEXT NOT NULL CHECK(length(message_json) > 2),
+                UNIQUE(conversation_id, message_order)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS checkpoints(
                 id TEXT PRIMARY KEY NOT NULL CHECK(length(id) = 32),

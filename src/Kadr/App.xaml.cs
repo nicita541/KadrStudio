@@ -8,6 +8,8 @@ namespace KadrStudio;
 
 public partial class App : System.Windows.Application
 {
+    private static int _unhandledErrorDialogOpen;
+
     protected override void OnStartup(StartupEventArgs e)
     {
         DispatcherUnhandledException += OnDispatcherUnhandledException;
@@ -45,7 +47,8 @@ public partial class App : System.Windows.Application
                 Path.Combine(basePath, "KadrStudio.exe"),
                 Path.Combine(basePath, "tools", "ffmpeg.exe"),
                 Path.Combine(basePath, "tools", "ffprobe.exe"),
-                Path.Combine(basePath, "mediahost", "Kadr.MediaHost.exe")
+                Path.Combine(basePath, "mediahost", "Kadr.MediaHost.exe"),
+                Path.Combine(basePath, "ai", "ollama.exe")
             };
             var missing = requiredFiles.Where(path => !File.Exists(path)).ToArray();
             if (missing.Length > 0)
@@ -66,11 +69,21 @@ public partial class App : System.Windows.Application
 
     private static void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
-        MessageBox.Show(
-            $"Произошла непредвиденная ошибка.\n\n{e.Exception.Message}",
-            "Kadr Studio",
-            MessageBoxButton.OK,
-            MessageBoxImage.Error);
         e.Handled = true;
+        if (Interlocked.Exchange(ref _unhandledErrorDialogOpen, 1) != 0)
+            return;
+
+        try
+        {
+            MessageBox.Show(
+                $"Произошла непредвиденная ошибка.\n\n{e.Exception.Message}",
+                "Kadr Studio",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+        finally
+        {
+            Volatile.Write(ref _unhandledErrorDialogOpen, 0);
+        }
     }
 }

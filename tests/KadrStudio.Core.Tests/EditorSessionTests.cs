@@ -7,6 +7,36 @@ namespace KadrStudio.Core.Tests;
 public sealed class EditorSessionTests
 {
     [Fact]
+    public void Metadata_only_chat_update_is_saved_without_undo_or_sequence_revision_change()
+    {
+        var fixture = CreateLinkedProject();
+        var project = fixture.Project.EnsureSequenceContainer();
+        var session = new EditorSession(project);
+        var sequenceRevision = session.State.ActiveSequence!.Revision;
+        var conversation = session.State.AiConversation with
+        {
+            UpdatedAt = DateTimeOffset.UtcNow,
+            Messages =
+            [
+                new AiChatMessage(Guid.NewGuid(), AiChatRole.User, AiChatMessageKind.Text,
+                    "Собери монтаж", DateTimeOffset.UtcNow)
+            ]
+        };
+
+        var result = session.Execute(new EditTransaction(
+            "chat", [new ReplaceAiConversationCommand(conversation)],
+            RecordInHistory: false, SynchronizeActiveSequence: false));
+
+        Assert.True(result.Changed);
+        Assert.False(session.CanUndo);
+        Assert.Equal(sequenceRevision, session.State.ActiveSequence!.Revision);
+        Assert.Single(session.State.AiConversation.Messages);
+        Assert.False(result.Changes.InvalidatesVideo);
+        Assert.False(result.Changes.InvalidatesAudio);
+        Assert.False(result.Changes.InvalidatesOverlay);
+    }
+
+    [Fact]
     public void Invalid_transaction_is_atomic()
     {
         var fixture = CreateLinkedProject();

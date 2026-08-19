@@ -39,8 +39,8 @@ public sealed class OllamaMontagePlanningProvider(
                 : await _fallback.CreatePlanAsync(context, cancellationToken).ConfigureAwait(false);
             return plan with
             {
-                Summary = plan.Summary + " Локальная модель недоступна; использован детерминированный отбор.",
-                Warnings = plan.Warnings.Add($"Ollama: {exception.Message}")
+                Summary = plan.Summary + " ИИ не вернул безопасный структурированный ответ; использован проверенный базовый отбор.",
+                Warnings = plan.Warnings.Add($"ИИ-сервер: {exception.Message}")
             };
         }
     }

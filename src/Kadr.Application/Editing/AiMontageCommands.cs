@@ -24,6 +24,17 @@ public sealed record UpsertMontagePlanCommand(MontagePlan Plan) : IEditCommand
     }
 }
 
+public sealed record ReplaceAiConversationCommand(AiConversation Conversation) : IEditCommand
+{
+    public string Description => "Обновить диалог ИИ";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        ArgumentNullException.ThrowIfNull(Conversation);
+        return project with { AiConversation = Conversation };
+    }
+}
+
 public sealed record DeleteMontagePlanCommand(Guid PlanId) : IEditCommand
 {
     public string Description => "Удалить план ИИ-монтажа";

@@ -96,6 +96,9 @@ public sealed class MontagePlanValidator : IMontagePlanValidator
                 errors.Add(new("montage.required", "Обязательный диапазон отсутствует в плане.", required.Id));
         }
 
+        if (plan.PresetSnapshot?.Recipe == AutomationRecipeKind.MergeEpisodes)
+            ValidateEpisodeMerge(project, plan, errors);
+
         if (plan.Duration > plan.MaximumDuration)
             errors.Add(new("montage.too-long", "План длиннее максимальной длительности; обязательные фрагменты не были скрыто удалены.", plan.Id));
         else if (plan.Duration < plan.MinimumDuration)
@@ -119,4 +122,62 @@ public sealed class MontagePlanValidator : IMontagePlanValidator
 
     private static bool Intersects(TimeRange left, TimeRange right)
         => left.Start < right.End && left.End > right.Start;
+
+    private static void ValidateEpisodeMerge(
+        ProjectState project,
+        MontagePlan plan,
+        ICollection<ValidationError> errors)
+    {
+        var pending = plan.Decisions.IsDefault
+            ? []
+            : plan.Decisions.Where(item => !item.IsResolved).ToArray();
+        if (pending.Length > 0 || plan.Status == MontagePlanStatus.NeedsInput)
+            errors.Add(new(
+                "montage.needs-input",
+                "Перед созданием черновика ответьте на все вопросы ИИ-плана.",
+                plan.Id));
+
+        var openings = plan.Items.Where(item => item.Role == MontageRole.Opening).ToArray();
+        if (openings.Length != 1 || plan.Items.OrderBy(item => item.Order).FirstOrDefault()?.Role != MontageRole.Opening)
+            errors.Add(new(
+                "anime.opening",
+                "Объединённый монтаж должен начинаться ровно с одного подтверждённого опенинга.",
+                plan.Id));
+        if (plan.Items.Any(item => item.TransitionAfter is not null))
+            errors.Add(new(
+                "anime.transitions",
+                "Серии в этом сценарии соединяются прямыми склейками без переходов.",
+                plan.Id));
+
+        var structural = plan.StructuralSegments.IsDefault
+            ? ImmutableArray<StructuralSegment>.Empty
+            : plan.StructuralSegments;
+        foreach (var segment in structural.Where(item =>
+                     item.Kind == StructuralSegmentKind.Opening ||
+                     item.Disposition == StructuralSegmentDisposition.Remove))
+        {
+            if (!segment.HasConfirmedBoundaries)
+                errors.Add(new(
+                    "anime.boundary",
+                    "Удаляемый блок не имеет подтверждённых покадровых границ.",
+                    segment.Id));
+            foreach (var item in plan.Items.Where(item =>
+                         item.SourceId == segment.SourceId && item.Role != MontageRole.Opening &&
+                         Intersects(item.SourceRange, segment.SourceRange)))
+                errors.Add(new(
+                    "anime.removed-overlap",
+                    "Сюжетный диапазон пересекается с подтверждённым служебным блоком.",
+                    item.Id));
+        }
+
+        foreach (var sourceId in plan.Dependencies.SourceFingerprints.Keys)
+        {
+            if (!project.Sources.ContainsKey(sourceId)) continue;
+            if (!plan.Items.Any(item => item.SourceId == sourceId && item.Role != MontageRole.Opening))
+                errors.Add(new(
+                    "anime.episode-missing",
+                    $"Серия «{project.Sources[sourceId].Name}» не представлена в сюжетной части плана.",
+                    sourceId));
+        }
+    }
 }

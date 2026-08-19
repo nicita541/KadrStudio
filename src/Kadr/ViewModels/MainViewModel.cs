@@ -86,8 +86,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _automationScheduler = services.AutomationScheduler;
         AutomationOrchestrator = new AutomationOrchestrator(
             _automationScheduler, VideoAnalysisService, OllamaVideoAnalysisService, AutoSubtitleService);
+        var animeFingerprints = new AnimeFingerprintService(
+            services.FfmpegLocator, services.ProcessRunner, _artifactStore);
         AiMontageAnalysisService = new AiMontageAnalysisService(
-            AutomationOrchestrator, AutoSubtitleService, OllamaVideoAnalysisService, _artifactStore);
+            AutomationOrchestrator, AutoSubtitleService, OllamaVideoAnalysisService, _artifactStore, animeFingerprints);
         AiMontageCoordinator = new AiMontageCoordinator(
             AiMontageAnalysisService,
             new OllamaMontagePlanningProvider(OllamaVideoAnalysisService));
@@ -370,7 +372,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                     if (restored is null) continue;
                     restored.ThumbnailPath = importedAsset.ThumbnailPath;
                     restored.ProbeResult = importedAsset.ProbeResult;
-                    QueueTimelineMediaPreparation(restored);
                 }
                 QueueBackgroundAnalysis(imported.Select(item => item.Id));
             }
@@ -455,6 +456,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 clip.LinkGroupId, clip.Track == TrackKind.Visual)));
         ExecuteCoreCommand("Клип добавлен на таймлайн",
             new EnsureTrackAndAddMediaClipsCommand(additions), clip.Id);
+        if (Project.FindAsset(asset.Id) is { } timelineAsset)
+            QueueTimelineMediaPreparation(timelineAsset);
     }
 
     public void RefreshMediaOnlineState()
@@ -616,6 +619,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public IReadOnlyList<CoreGameEditingProfile> GetGameEditingProfiles()
         => _settingsService.LoadGameEditingProfiles();
 
+    public IReadOnlyList<KadrStudio.Core.Domain.AutomationPreset> GetAutomationPresets()
+        => AutomationPresets.BuiltIn;
+
     public Task SaveCustomGameEditingProfilesAsync(
         IEnumerable<CoreGameEditingProfile> profiles,
         CancellationToken cancellationToken = default)
@@ -635,6 +641,22 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public IReadOnlyList<CoreMontagePlan> GetMontagePlans()
         => _editorSession.State.MontagePlans;
 
+    public KadrStudio.Core.Domain.AiConversation GetAiConversation()
+        => _editorSession.State.AiConversation;
+
+    public void SaveAiConversation(KadrStudio.Core.Domain.AiConversation conversation)
+    {
+        var result = _editorSession.Execute(new EditTransaction(
+            "Диалог ИИ обновлён",
+            [new ReplaceAiConversationCommand(conversation)],
+            RecordInHistory: false,
+            SynchronizeActiveSequence: false));
+        if (!result.Changed) return;
+        IsDirty = true;
+        ScheduleAutosave("Диалог ИИ обновлён");
+        OnPropertyChanged(nameof(CoreState));
+    }
+
     public async Task<ImmutableDictionary<Guid, CoreMediaAnalysisManifest>> AnalyzeMontageSourcesAsync(
         MediaAnalysisRequest request,
         IProgress<double>? progress = null,
@@ -644,7 +666,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ResetBackgroundAnalysis();
         var snapshot = _editorSession.State;
         var manifests = await AiMontageCoordinator.AnalyzeSourcesAsync(
-            snapshot, request, progress, cancellationToken).ConfigureAwait(false);
+            snapshot, request, progress, cancellationToken);
         if (_editorSession.State.Id != snapshot.Id)
             throw new InvalidOperationException("Проект сменился во время анализа.");
         var references = manifests.Values.Select(item => new KadrStudio.Core.Domain.MediaAnalysisReference(
@@ -655,13 +677,50 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         return manifests;
     }
 
+    public async Task<MontagePreparationResult> PrepareMontagePlanAsync(
+        MediaAnalysisRequest analysisRequest,
+        CoreMontageRequest montageRequest,
+        IProgress<double>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ResetBackgroundAnalysis();
+        var snapshot = _editorSession.State;
+        var result = await AiMontageCoordinator.PreparePlanAsync(
+            snapshot, analysisRequest, montageRequest, progress, cancellationToken);
+        if (_editorSession.State.Id != snapshot.Id)
+            throw new InvalidOperationException("Проект сменился во время подготовки плана.");
+        var references = result.Manifests.Values.Select(item => new KadrStudio.Core.Domain.MediaAnalysisReference(
+            item.SourceId, item.SourceFingerprint, item.PipelineVersion, item.Model,
+            item.ProfileId, item.ProfileVersion, DateTimeOffset.UtcNow)).ToArray();
+        var commands = new List<IEditCommand>();
+        if (references.Length > 0)
+            commands.Add(new ReplaceAnalysisReferencesCommand(references));
+        commands.Add(new UpsertMontagePlanCommand(result.Plan));
+        ExecuteCoreCommand(
+            "План ИИ-монтажа подготовлен",
+            new EditBatchCommand("Prepare AI montage", commands));
+        return result;
+    }
+
+    public CoreMontagePlan ResolveMontageDecision(
+        CoreMontagePlan plan,
+        Guid decisionId,
+        string answer,
+        KadrStudio.Core.Domain.TimelineTime? resolvedTime = null)
+    {
+        var updated = AiMontageCoordinator.ResolveDecision(
+            _editorSession.State, plan, decisionId, answer, resolvedTime);
+        ExecuteCoreCommand("Уточнение ИИ-плана сохранено", new UpsertMontagePlanCommand(updated));
+        return updated;
+    }
+
     public async Task<CoreMontagePlan> CreateMontagePlanAsync(
         CoreMontageRequest request,
         ImmutableDictionary<Guid, CoreMediaAnalysisManifest> manifests,
         CancellationToken cancellationToken = default)
     {
         var plan = await AiMontageCoordinator.CreatePlanAsync(
-            _editorSession.State, request, manifests, cancellationToken).ConfigureAwait(false);
+            _editorSession.State, request, manifests, cancellationToken);
         ExecuteCoreCommand("План ИИ-монтажа создан", new UpsertMontagePlanCommand(plan));
         return plan;
     }
@@ -673,7 +732,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var revised = await AiMontageCoordinator.RevisePlanAsync(
-            _editorSession.State, plan, revisionRequest, manifests, cancellationToken).ConfigureAwait(false);
+            _editorSession.State, plan, revisionRequest, manifests, cancellationToken);
         ExecuteCoreCommand("План ИИ-монтажа скорректирован", new UpsertMontagePlanCommand(revised));
         return revised;
     }
@@ -1216,22 +1275,20 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ?? throw new EditRejectedException("Выбранный клип больше не существует.");
         var track = state.FindTrack(from.TrackId)
             ?? throw new EditRejectedException("Дорожка выбранного клипа не найдена.");
-        var to = state.MediaClips
-            .Where(item => item.TrackId == from.TrackId && item.Start == from.End)
-            .OrderBy(item => item.Id)
-            .FirstOrDefault()
-            ?? throw new EditRejectedException("Справа должен находиться соседний клип без зазора.");
         if (track.Kind == KadrStudio.Core.Domain.TrackKind.Audio &&
             kind != KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio ||
             track.Kind == KadrStudio.Core.Domain.TrackKind.Visual &&
             kind == KadrStudio.Core.Domain.TransitionKind.ConstantPowerAudio)
             throw new EditRejectedException("Тип перехода не подходит выбранной дорожке.");
         var duration = KadrStudio.Core.Domain.TimelineTime.FromSeconds(Math.Clamp(durationSeconds, 0.04, 30));
-        var half = new KadrStudio.Core.Domain.TimelineTime(duration.Ticks / 2);
-        var transition = new KadrStudio.Core.Domain.TimelineTransition(
-            Guid.NewGuid(), kind, track.Id, from.Id, to.Id, from.End - half, duration);
-        ExecuteCoreCommand("Переход добавлен", new UpsertTransitionCommand(transition), from.Id);
-        return transition.Id;
+        var transitionId = Guid.NewGuid();
+        ExecuteCoreCommand(
+            "Переход добавлен",
+            new CreateTransitionAtEditCommand(
+                transitionId, from.Id, kind, duration,
+                track.Kind == KadrStudio.Core.Domain.TrackKind.Visual ? Guid.NewGuid() : null),
+            from.Id);
+        return transitionId;
     }
 
     public bool DeleteTransition(Guid transitionId)
@@ -1318,7 +1375,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private void AttachProject(ProjectViewState project)
     {
-        foreach (var asset in project.Media)
+        var timelineAssetIds = project.Clips.Select(item => item.AssetId).ToHashSet();
+        foreach (var asset in project.Media.Where(item => timelineAssetIds.Contains(item.Id)))
         {
             QueueTimelineMediaPreparation(asset);
         }

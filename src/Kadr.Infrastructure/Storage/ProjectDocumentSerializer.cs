@@ -54,6 +54,7 @@ internal static class ProjectDocumentSerializer
         public SourceAnnotation[] SourceAnnotations { get; init; } = [];
         public MediaAnalysisReference[] AnalysisReferences { get; init; } = [];
         public MontagePlan[] MontagePlans { get; init; } = [];
+        public AiConversation? AiConversation { get; init; }
         public long? InPointTicks { get; init; }
         public long? OutPointTicks { get; init; }
 
@@ -82,6 +83,7 @@ internal static class ProjectDocumentSerializer
             SourceAnnotations = project.SourceAnnotations.ToArray(),
             AnalysisReferences = project.AnalysisReferences.ToArray(),
             MontagePlans = project.MontagePlans.ToArray(),
+            AiConversation = project.AiConversation,
             InPointTicks = project.InPoint?.Ticks,
             OutPointTicks = project.OutPoint?.Ticks
         };
@@ -106,6 +108,8 @@ internal static class ProjectDocumentSerializer
             SourceAnnotations = SourceAnnotations.ToImmutableArray(),
             AnalysisReferences = AnalysisReferences.ToImmutableArray(),
             MontagePlans = MontagePlans.ToImmutableArray(),
+            AiConversation = (AiConversation ?? KadrStudio.Core.Domain.AiConversation.Create())
+                .RecoverInterruptedOperations(),
             InPoint = InPointTicks is { } inTicks ? new TimelineTime(inTicks) : null,
             OutPoint = OutPointTicks is { } outTicks ? new TimelineTime(outTicks) : null
         };

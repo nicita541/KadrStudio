@@ -13,6 +13,24 @@ public sealed class AnalysisSubtitleIntegrationTests
 {
     private static readonly object EnvironmentLock = new();
 
+    [Fact]
+    public void Anime_fingerprint_similarity_combines_visual_and_audio_recurrence()
+    {
+        var left = new AnimeSectionFingerprint(
+            [0x0011223344556677UL, 0x8899AABBCCDDEEFFUL, 0x0F0F0F0F0F0F0F0FUL,
+             0xAAAAAAAAAAAAAAAAUL, 0x5555555555555555UL, 0x0123456789ABCDEFUL,
+             0xFEDCBA9876543210UL, 0x1111111111111111UL],
+            [10, 30, 60, 100, 180, 220, 140, 50]);
+        var same = left with { AudioEnvelope = [11, 29, 61, 98, 181, 219, 142, 49] };
+        var different = new AnimeSectionFingerprint(
+            Enumerable.Repeat(ulong.MaxValue, 8).ToImmutableArray(),
+            Enumerable.Repeat((byte)255, 8).ToImmutableArray());
+
+        Assert.True(AnimeFingerprintService.Similarity(left, same) > 0.95);
+        Assert.True(AnimeFingerprintService.Similarity(left, different) <
+                    AnimeFingerprintService.Similarity(left, same));
+    }
+
     [Fact(Timeout = 60_000)]
     public async Task Semantic_boundary_cascade_verifies_hard_cut_to_the_exact_source_frame()
     {
@@ -58,6 +76,32 @@ public sealed class AnalysisSubtitleIntegrationTests
             Assert.InRange(Math.Abs(opening.SourceStart - 1), 0, 1d / 24 + 0.001);
             Assert.Contains("кандидаты склеек", opening.Description, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("1 кадр", opening.Description, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task Soft_fade_is_not_reported_as_an_unambiguous_exact_boundary()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var source = Path.Combine(root, "soft-fade.mp4");
+            var create = await new ProcessRunner().RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=white:s=320x180:r=24:d=2",
+                "-vf", "fade=t=out:st=0.5:d=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", source
+            ]);
+            Assert.Equal(0, create.ExitCode);
+
+            var verification = await new VideoAnalysisService(locator, new ProcessRunner())
+                .VerifyBoundaryAsync(source, 1, 0, 2, 24);
+
+            Assert.False(verification.HasUnambiguousCandidate);
         }
         finally { DeleteRoot(root); }
     }

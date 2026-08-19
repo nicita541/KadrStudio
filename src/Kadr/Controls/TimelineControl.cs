@@ -528,6 +528,14 @@ public sealed class TimelineControl : FrameworkElement
                 {
                     minimumDelta = Math.Max(minimumDelta, previous.End - _dragOriginal.Start);
                 }
+                foreach (var (_, linkedOriginal) in _dragLinkedClips)
+                {
+                    minimumDelta = Math.Max(minimumDelta,
+                        Math.Max(-linkedOriginal.SourceStart, -linkedOriginal.Start));
+                    var linkedPrevious = GetPreviousClip(linkedOriginal);
+                    if (linkedPrevious is not null)
+                        minimumDelta = Math.Max(minimumDelta, linkedPrevious.End - linkedOriginal.Start);
+                }
                 var maximumDelta = _dragOriginal.Duration - MinimumClipDuration;
                 var applied = Math.Clamp(SnapDuration(deltaSeconds), minimumDelta, maximumDelta);
                 _dragClip.SourceStart = _dragOriginal.SourceStart + applied;
@@ -544,6 +552,20 @@ public sealed class TimelineControl : FrameworkElement
                 if (next is not null)
                 {
                     maximumDuration = Math.Min(maximumDuration, Math.Max(MinimumClipDuration, next.Start - _dragOriginal.Start));
+                }
+                foreach (var (_, linkedOriginal) in _dragLinkedClips)
+                {
+                    var linkedAsset = _document.FindAsset(linkedOriginal.AssetId);
+                    var linkedMaximum = linkedAsset?.Kind == MediaKind.Image
+                        ? 3600
+                        : Math.Max(MinimumClipDuration,
+                            (linkedAsset?.Duration ?? linkedOriginal.Duration) - linkedOriginal.SourceStart);
+                    var linkedNext = GetNextClip(linkedOriginal);
+                    if (linkedNext is not null)
+                        linkedMaximum = Math.Min(linkedMaximum,
+                            Math.Max(MinimumClipDuration, linkedNext.Start - linkedOriginal.Start));
+                    maximumDuration = Math.Min(maximumDuration,
+                        _dragOriginal.Duration + linkedMaximum - linkedOriginal.Duration);
                 }
                 _dragClip.Duration = Math.Clamp(
                     _dragOriginal.Duration + SnapDuration(deltaSeconds),
@@ -601,21 +623,37 @@ public sealed class TimelineControl : FrameworkElement
         {
             return Math.Max(0, desiredStart);
         }
-        var others = _document.GetTrackClips(moving.Track, moving.TrackIndex)
-            .Where(clip => clip.Id != moving.Id &&
-                           (moving.LinkGroupId is null || clip.LinkGroupId != moving.LinkGroupId))
-            .ToList();
+        var movingIds = _dragLinkedClips.Select(item => item.Clip.Id).Append(moving.Id).ToHashSet();
         var candidate = Math.Max(0, desiredStart);
-        for (var attempt = 0; attempt <= others.Count; attempt++)
+        var memberCount = _dragLinkedClips.Count + 1;
+        for (var attempt = 0; attempt <= Math.Max(4, _document.Clips.Count * memberCount); attempt++)
         {
-            var overlap = others.FirstOrDefault(clip => candidate < clip.End - 0.0001 && candidate + moving.Duration > clip.Start + 0.0001);
-            if (overlap is null)
+            var adjusted = false;
+            var members = new[] { (Clip: moving, Original: _dragOriginal ?? moving) }
+                .Concat(_dragLinkedClips);
+            foreach (var (member, original) in members)
             {
+                var relativeStart = original.Start - (_dragOriginal?.Start ?? moving.Start);
+                var memberStart = candidate + relativeStart;
+                if (memberStart < 0)
+                {
+                    candidate -= memberStart;
+                    adjusted = true;
+                    break;
+                }
+                var others = _document.GetTrackClips(member.Track, member.TrackIndex)
+                    .Where(clip => !movingIds.Contains(clip.Id));
+                var overlap = others.FirstOrDefault(clip =>
+                    memberStart < clip.End - 0.0001 && memberStart + member.Duration > clip.Start + 0.0001);
+                if (overlap is null) continue;
+                candidate = memberStart + member.Duration / 2 < overlap.Start + overlap.Duration / 2
+                    ? overlap.Start - member.Duration - relativeStart
+                    : overlap.End - relativeStart;
+                candidate = Math.Max(0, candidate);
+                adjusted = true;
                 break;
             }
-            candidate = candidate + moving.Duration / 2 < overlap.Start + overlap.Duration / 2
-                ? Math.Max(0, overlap.Start - moving.Duration)
-                : overlap.End;
+            if (!adjusted) break;
         }
         return SnapTime(candidate);
     }

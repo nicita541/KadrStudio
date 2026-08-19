@@ -37,7 +37,74 @@ public enum MontagePlanStatus
     Draft,
     Ready,
     Compiled,
-    Superseded
+    Superseded,
+    NeedsInput
+}
+
+public enum MaterialProfileKind
+{
+    Game,
+    Anime,
+    General
+}
+
+public enum AutomationRecipeKind
+{
+    Highlights,
+    MergeEpisodes
+}
+
+public enum AnalysisStrategyKind
+{
+    TechnicalThenVision
+}
+
+public enum StructuralSegmentKind
+{
+    Unknown,
+    Opening,
+    Ending,
+    Recap,
+    Preview,
+    Credits,
+    Story,
+    PostCreditsStory
+}
+
+public enum StructuralSegmentDisposition
+{
+    Retain,
+    Remove,
+    NeedsInput
+}
+
+public enum BoundaryResolutionStatus
+{
+    Suggested,
+    Verified,
+    UserConfirmed
+}
+
+public enum BoundaryPrecision
+{
+    Coarse,
+    Frame,
+    ExactPresentationTimestamp
+}
+
+public enum MontageDecisionKind
+{
+    SourceOrder,
+    OpeningSelection,
+    SegmentClassification,
+    SegmentStart,
+    SegmentEnd
+}
+
+public enum MontageDecisionStatus
+{
+    Pending,
+    Resolved
 }
 
 public enum MontageRole
@@ -46,7 +113,8 @@ public enum MontageRole
     Setup,
     Development,
     Payoff,
-    Ending
+    Ending,
+    Opening
 }
 
 public enum MontageEvidenceKind
@@ -160,6 +228,63 @@ public sealed record AnalysisSegment(
     double Confidence,
     ImmutableArray<AnalysisEvidence> Evidence);
 
+public sealed record ResolvedBoundary(
+    TimelineTime ProposedTime,
+    TimelineTime ResolvedTime,
+    BoundaryResolutionStatus Status,
+    BoundaryPrecision Precision,
+    double Confidence,
+    ImmutableArray<AnalysisEvidence> Evidence)
+{
+    public bool IsConfirmed => Status is BoundaryResolutionStatus.Verified or BoundaryResolutionStatus.UserConfirmed;
+}
+
+public enum AiChatRole
+{
+    User,
+    Assistant
+}
+
+public enum AiChatMessageKind
+{
+    Text,
+    Progress,
+    Error,
+    Plan,
+    Question,
+    Draft
+}
+
+public enum AiChatOperationState
+{
+    Completed,
+    Running,
+    Failed,
+    Cancelled,
+    Interrupted
+}
+
+public enum AiChatEditCommandKind
+{
+    DeleteRange,
+    SplitAt,
+    DeleteSelected
+}
+
+public sealed record StructuralSegment(
+    Guid Id,
+    Guid SourceId,
+    StructuralSegmentKind Kind,
+    TimeRange SourceRange,
+    StructuralSegmentDisposition Disposition,
+    double Confidence,
+    ResolvedBoundary StartBoundary,
+    ResolvedBoundary EndBoundary,
+    ImmutableArray<AnalysisEvidence> Evidence)
+{
+    public bool HasConfirmedBoundaries => StartBoundary.IsConfirmed && EndBoundary.IsConfirmed;
+}
+
 public sealed record MediaAnalysisManifest(
     Guid SourceId,
     string SourceFingerprint,
@@ -168,7 +293,12 @@ public sealed record MediaAnalysisManifest(
     string ProfileId,
     int ProfileVersion,
     DateTimeOffset CreatedAt,
-    ImmutableArray<AnalysisSegment> Segments);
+    ImmutableArray<AnalysisSegment> Segments,
+    ImmutableArray<StructuralSegment> StructuralSegments = default)
+{
+    public ImmutableArray<StructuralSegment> StructuralSegments { get; init; } =
+        StructuralSegments.IsDefault ? [] : StructuralSegments;
+}
 
 public sealed record MediaAnalysisReference(
     Guid SourceId,
@@ -190,7 +320,40 @@ public sealed record GameEditingProfile(
     double MaximumSegmentSeconds,
     double ContextBeforeSeconds,
     double ContextAfterSeconds,
-    string PlanningGuidance);
+    string PlanningGuidance,
+    MaterialProfileKind Kind = MaterialProfileKind.Game)
+{
+    public string ContentFamily => GameFamily;
+}
+
+public sealed record AutomationPreset(
+    string Id,
+    int Version,
+    string DisplayName,
+    string ProfileId,
+    AutomationRecipeKind Recipe,
+    AnalysisStrategyKind AnalysisStrategy,
+    double RequiredConfidence = 0.85);
+
+public sealed record MontageDecisionOption(
+    string Id,
+    string Label,
+    string Description = "");
+
+public sealed record MontageDecision(
+    Guid Id,
+    MontageDecisionKind Kind,
+    string Prompt,
+    ImmutableArray<MontageDecisionOption> Options,
+    MontageDecisionStatus Status = MontageDecisionStatus.Pending,
+    string Answer = "",
+    Guid? SourceId = null,
+    Guid? SegmentId = null,
+    TimelineTime? SuggestedTime = null,
+    TimelineTime? ResolvedTime = null)
+{
+    public bool IsResolved => Status == MontageDecisionStatus.Resolved;
+}
 
 public sealed record MontageScope(
     MontageScopeKind Kind,
@@ -226,7 +389,8 @@ public sealed record MontageRequest(
     TimelineTime MaximumDuration,
     string Brief,
     GameEditingProfile Profile,
-    ImmutableArray<MontageConstraint> Constraints);
+    ImmutableArray<MontageConstraint> Constraints,
+    AutomationPreset? Preset = null);
 
 public sealed record MontagePlanItem(
     Guid Id,
@@ -260,9 +424,93 @@ public sealed record MontagePlan(
     ImmutableArray<MontagePlanItem> Items,
     ImmutableArray<string> Warnings,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt)
+    DateTimeOffset UpdatedAt,
+    AutomationPreset? PresetSnapshot = null,
+    ImmutableArray<MontageDecision> Decisions = default,
+    ImmutableArray<StructuralSegment> StructuralSegments = default)
 {
+    public ImmutableArray<MontageDecision> Decisions { get; init; } =
+        Decisions.IsDefault ? [] : Decisions;
+    public ImmutableArray<StructuralSegment> StructuralSegments { get; init; } =
+        StructuralSegments.IsDefault ? [] : StructuralSegments;
+
     public TimelineTime Duration => Items.IsDefaultOrEmpty
         ? TimelineTime.Zero
         : new TimelineTime(Items.Sum(item => item.SourceRange.Duration.Ticks));
+}
+
+public sealed record AiPlanCardSnapshot(
+    string Title,
+    string Summary,
+    TimelineTime Duration,
+    ImmutableArray<string> RetainedItems,
+    ImmutableArray<string> RemovedItems,
+    ImmutableArray<string> Warnings,
+    bool CanCreateDraft)
+{
+    public ImmutableArray<string> RetainedItems { get; init; } =
+        RetainedItems.IsDefault ? [] : RetainedItems;
+    public ImmutableArray<string> RemovedItems { get; init; } =
+        RemovedItems.IsDefault ? [] : RemovedItems;
+    public ImmutableArray<string> Warnings { get; init; } =
+        Warnings.IsDefault ? [] : Warnings;
+}
+
+public sealed record AiChatEditCommand(
+    AiChatEditCommandKind Kind,
+    double Start,
+    double End,
+    string Reason);
+
+public sealed record AiChatMessage(
+    Guid Id,
+    AiChatRole Role,
+    AiChatMessageKind Kind,
+    string Text,
+    DateTimeOffset CreatedAt,
+    AiChatOperationState OperationState = AiChatOperationState.Completed,
+    int ProgressPercent = 100,
+    Guid? PlanId = null,
+    Guid? DecisionId = null,
+    Guid? SequenceId = null,
+    string Answer = "",
+    AiPlanCardSnapshot? PlanSnapshot = null,
+    ImmutableArray<AiChatEditCommand> EditCommands = default)
+{
+    public ImmutableArray<AiChatEditCommand> EditCommands { get; init; } =
+        EditCommands.IsDefault ? [] : EditCommands;
+    public bool IsPendingQuestion => Kind == AiChatMessageKind.Question && string.IsNullOrWhiteSpace(Answer);
+}
+
+public sealed record AiConversation(
+    Guid Id,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    ImmutableArray<AiChatMessage> Messages)
+{
+    public ImmutableArray<AiChatMessage> Messages { get; init; } = Messages.IsDefault ? [] : Messages;
+
+    public static AiConversation Create()
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new AiConversation(Guid.NewGuid(), now, now, []);
+    }
+
+    public AiConversation RecoverInterruptedOperations(DateTimeOffset? now = null)
+    {
+        if (Messages.All(message => message.OperationState != AiChatOperationState.Running)) return this;
+        var recoveredAt = now ?? DateTimeOffset.UtcNow;
+        return this with
+        {
+            UpdatedAt = recoveredAt,
+            Messages = Messages.Select(message => message.OperationState == AiChatOperationState.Running
+                ? message with
+                {
+                    Text = "Операция была прервана. Отправьте команду ещё раз.",
+                    Kind = AiChatMessageKind.Error,
+                    OperationState = AiChatOperationState.Interrupted
+                }
+                : message).ToImmutableArray()
+        };
+    }
 }

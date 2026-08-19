@@ -7,6 +7,7 @@ public static class GameEditingProfiles
 {
     public static ImmutableArray<GameEditingProfile> BuiltIn { get; } =
     [
+        CreateUniversal(),
         Create(
             "rust", "Rust", "Survival",
             ["loot", "building", "pvp", "raid", "death", "recovery", "payoff"],
@@ -42,12 +43,13 @@ public static class GameEditingProfiles
             ["kill", "death", "teamfight", "objective", "turnaround", "result"],
             [("teamfight", 1.0), ("turnaround", 1.0), ("objective", 0.88), ("result", 0.9)],
             1.2, 12, 2.5, 2,
-            "Используй быстрый темп, отбирай драки и цели, добавляя минимальный контекст для понимания результата.")
+            "Используй быстрый темп, отбирай драки и цели, добавляя минимальный контекст для понимания результата."),
+        CreateAnime()
     ];
 
     public static GameEditingProfile Get(string id)
         => BuiltIn.FirstOrDefault(item => item.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
-           ?? throw new KeyNotFoundException($"Профиль игры «{id}» не найден.");
+           ?? throw new KeyNotFoundException($"Профиль материала «{id}» не найден.");
 
     public static GameEditingProfile ValidateCustom(GameEditingProfile profile)
     {
@@ -91,4 +93,67 @@ public static class GameEditingProfiles
             before,
             after,
             guidance);
+
+    private static GameEditingProfile CreateAnime()
+        => new(
+            "anime",
+            1,
+            "Аниме",
+            "Anime",
+            ["opening", "ending", "recap", "preview", "credits", "story", "postcredits"],
+            new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["story"] = 1,
+                ["postcredits"] = 0.9,
+                ["opening"] = 0.1,
+                ["ending"] = 0.1,
+                ["recap"] = 0.05,
+                ["preview"] = 0.05,
+                ["credits"] = 0.05
+            }.ToImmutableDictionary(StringComparer.OrdinalIgnoreCase),
+            0.5,
+            300,
+            0,
+            0,
+            "Определи структуру эпизода. Не удаляй сюжетные сцены; служебные блоки помечай отдельно и запрашивай подтверждение при неоднозначности.",
+            MaterialProfileKind.Anime);
+
+    private static GameEditingProfile CreateUniversal()
+        => new(
+            "universal",
+            1,
+            "Универсальный материал",
+            "Any video",
+            ["subject", "action", "speech", "emotion", "context", "change", "result"],
+            new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["result"] = 1,
+                ["change"] = 0.9,
+                ["action"] = 0.85,
+                ["emotion"] = 0.82,
+                ["speech"] = 0.7,
+                ["context"] = 0.62,
+                ["subject"] = 0.55
+            }.ToImmutableDictionary(StringComparer.OrdinalIgnoreCase),
+            1,
+            30,
+            4,
+            4,
+            "Определи тему и цель ролика по запросу пользователя. Сохраняй причинно-следственную связь, " +
+            "важную речь, действия, эмоции и результат; технические паузы и бессодержательные повторы сокращай.",
+            MaterialProfileKind.General);
+}
+
+public static class AutomationPresets
+{
+    public static AutomationPreset AnimeMergeEpisodes { get; } = new(
+        "anime-merge-episodes",
+        1,
+        "Объединить серии",
+        "anime",
+        AutomationRecipeKind.MergeEpisodes,
+        AnalysisStrategyKind.TechnicalThenVision,
+        0.85);
+
+    public static ImmutableArray<AutomationPreset> BuiltIn { get; } = [AnimeMergeEpisodes];
 }

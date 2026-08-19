@@ -12,6 +12,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
     private static readonly Regex SilenceEndRegex = new(@"silence_end:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex FreezeStartRegex = new(@"freeze_start:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex FreezeEndRegex = new(@"freeze_end:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex LumaAverageRegex = new(
+        @"lavfi\.signalstats\.YAVG=(?<value>\d+(?:\.\d+)?)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex PromptRangeRegex = new(
         @"(?<start>\d{1,2}(?::\d{2}){1,2})\s*[-–—]\s*(?<end>\d{1,2}(?::\d{2}){1,2})",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -40,8 +43,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var videoResult = await processRunner.RunAsync(
             locator.FfmpegPath,
             [
-                "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
-                "-filter_complex_threads", "1", "-ss", Format(rangeStart), "-t", Format(rangeDuration),
+                "-hide_banner", "-nostdin", "-ss", Format(rangeStart), "-t", Format(rangeDuration),
                 "-i", request.Asset.Path,
                 "-filter_complex",
                 "[0:v]scale=320:-2,fps=3,split=3[scenein][blackin][freezein];" +
@@ -62,7 +64,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             var audioResult = await processRunner.RunAsync(
                 locator.FfmpegPath,
                 [
-                    "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                    "-hide_banner", "-nostdin",
                     "-ss", Format(rangeStart), "-t", Format(rangeDuration), "-i", request.Asset.Path,
                     "-vn", "-af", "silencedetect=noise=-38dB:d=0.6", "-f", "null", "-"
                 ],
@@ -159,7 +161,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
                 SourceStart = start,
                 Duration = Math.Max(0.1, end - start),
                 Description = description,
-                Confidence = Math.Clamp(range.Confidence + 0.07, 0.05, 0.99)
+                Confidence = Math.Clamp(range.Confidence + 0.07, 0.05, 0.99),
+                StartBoundary = startVerification,
+                EndBoundary = endVerification
             });
         }
 
@@ -198,9 +202,65 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var frameCandidates = await ScanSceneCutsAsync(
             path, fine, minimum, maximum, verificationRadius, 0.012, cancellationToken);
         var verified = frameCandidates.OrderBy(time => Math.Abs(time - fine)).FirstOrDefault(fine);
+        var isSoftTransition = await DetectSoftTransitionAsync(
+            path, verified, minimum, maximum, cancellationToken).ConfigureAwait(false);
         return new BoundaryVerificationResult(
             target, coarse, fine, verified,
-            coarseCandidates.Count, fineCandidates.Count, frameCandidates.Count);
+            coarseCandidates.Count, fineCandidates.Count, frameCandidates.Count,
+            isSoftTransition);
+    }
+
+    private async Task<bool> DetectSoftTransitionAsync(
+        string path,
+        double center,
+        double minimum,
+        double maximum,
+        CancellationToken cancellationToken)
+    {
+        var start = Math.Max(minimum, center - 0.75);
+        var end = Math.Min(maximum, center + 0.75);
+        if (end <= start + 0.25) return false;
+        var lines = new List<string>();
+        var result = await processRunner.RunAsync(locator.FfmpegPath,
+            [
+                "-hide_banner", "-nostdin", "-ss", Format(start), "-t", Format(end - start), "-i", path,
+                "-vf", "fps=12,scale=64:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+                "-an", "-f", "null", "-"
+            ], line => lines.Add(line), cancellationToken).ConfigureAwait(false);
+        if (result.ExitCode != 0) return false;
+        var values = lines.Select(line => LumaAverageRegex.Match(line))
+            .Where(match => match.Success)
+            .Select(match => ParseDouble(match.Groups["value"].Value))
+            .Where(value => value >= 0)
+            .ToArray();
+        if (values.Length < 6) return false;
+
+        var longest = new List<double>();
+        var current = new List<double>();
+        var direction = 0;
+        for (var index = 1; index < values.Length; index++)
+        {
+            var delta = values[index] - values[index - 1];
+            var nextDirection = Math.Abs(delta) < 0.4 ? 0 : Math.Sign(delta);
+            if (nextDirection == 0)
+            {
+                if (current.Count > longest.Count) longest = [.. current];
+                current.Clear();
+                direction = 0;
+                continue;
+            }
+            if (direction != 0 && nextDirection != direction)
+            {
+                if (current.Count > longest.Count) longest = [.. current];
+                current.Clear();
+            }
+            direction = nextDirection;
+            current.Add(Math.Abs(delta));
+        }
+        if (current.Count > longest.Count) longest = current;
+        if (longest.Count < 4) return false;
+        var total = longest.Sum();
+        return total >= 8 && longest.Max() < total * 0.65;
     }
 
     private async Task<IReadOnlyList<double>> ScanSceneCutsAsync(
@@ -218,7 +278,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var lines = new List<string>();
         var scan = await processRunner.RunAsync(locator.FfmpegPath,
             [
-                "-hide_banner", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                "-hide_banner", "-nostdin",
                 "-ss", Format(windowStart), "-t", Format(windowEnd - windowStart), "-i", path,
                 "-vf", $"scale=640:-2,select='gt(scene,{Format(threshold)})',showinfo", "-an", "-f", "null", "-"
             ], line => lines.Add(line), cancellationToken);
@@ -262,7 +322,7 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var genericAnalysis = string.IsNullOrWhiteSpace(query) || query.Contains("анализ") || query.Contains("всё") || query.Contains("все");
         var wantsScenes = genericAnalysis || query.Contains("сцен") || query.Contains("монтаж") || query.Contains("разбей");
         var wantsTechnical = genericAnalysis || query.Contains("тиш") || query.Contains("пауз") || query.Contains("затем") || query.Contains("стоп") || query.Contains("повтор");
-        var wantsAnime = genericAnalysis || query.Contains("аним") || query.Contains("опен") || query.Contains("эндинг") || query.Contains("титр") || query.Contains("следующ");
+        var wantsAnime = query.Contains("аним") || query.Contains("опен") || query.Contains("эндинг") || query.Contains("титр") || query.Contains("следующ");
         var markers = new List<DetectedVideoRange>();
 
         if (wantsScenes)
@@ -573,7 +633,9 @@ public sealed record DetectedVideoRange(
     double Duration,
     string Title,
     string Description,
-    double Confidence);
+    double Confidence,
+    BoundaryVerificationResult? StartBoundary = null,
+    BoundaryVerificationResult? EndBoundary = null);
 
 public sealed record VideoAnalysisProgress(double Percent, string Stage);
 
@@ -584,4 +646,19 @@ public sealed record BoundaryVerificationResult(
     double VerifiedTime,
     int CoarseCandidateCount,
     int FineCandidateCount,
-    int FrameCandidateCount);
+    int FrameCandidateCount,
+    bool IsSoftTransition = false)
+{
+    public bool HasUnambiguousCandidate
+    {
+        get
+        {
+            var nearestPassCount = FrameCandidateCount > 0
+                ? FrameCandidateCount
+                : FineCandidateCount > 0
+                    ? FineCandidateCount
+                    : CoarseCandidateCount;
+            return nearestPassCount == 1 && !IsSoftTransition;
+        }
+    }
+}

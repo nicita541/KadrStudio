@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -27,35 +29,53 @@ namespace KadrStudio.Services;
 public sealed class OllamaVideoAnalysisService : IDisposable
 {
     private const string WorkspaceHost = "127.0.0.1:11435";
-    private static readonly Uri ApiBaseAddress = new($"http://{WorkspaceHost}/");
+    public const string RecommendedLocalModel = "qwen3-vl:4b-instruct";
+    private static readonly Uri LocalApiBaseAddress = new($"http://{WorkspaceHost}/");
     private static readonly Regex EpisodeTitlePattern = new(
         @"(?i)\b(?:сер(?:ия|ии)|эпизод|episode|next|следующ\w*)\b",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private readonly FfmpegLocator _ffmpegLocator;
     private readonly ProcessRunner _processRunner;
     private readonly HttpClient _httpClient;
+    private readonly OllamaServerOptions _serverOptions;
     private readonly SemaphoreSlim _startGate = new(1, 1);
+    private readonly SemaphoreSlim _modelInstallGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, byte> _verifiedModels = new(StringComparer.OrdinalIgnoreCase);
     private Process? _serverProcess;
     private string? _modelRoot;
 
-    public OllamaVideoAnalysisService(FfmpegLocator ffmpegLocator, ProcessRunner processRunner)
+    public OllamaVideoAnalysisService(
+        FfmpegLocator ffmpegLocator,
+        ProcessRunner processRunner,
+        OllamaServerOptions? serverOptions = null,
+        HttpMessageHandler? messageHandler = null)
     {
         _ffmpegLocator = ffmpegLocator;
         _processRunner = processRunner;
-        _httpClient = new HttpClient(new HttpClientHandler { UseProxy = false })
+        _serverOptions = serverOptions ?? OllamaServerOptions.FromEnvironment();
+        _httpClient = new HttpClient(messageHandler ?? new HttpClientHandler { UseProxy = IsRemote })
         {
-            BaseAddress = ApiBaseAddress,
-            Timeout = TimeSpan.FromMinutes(15)
+            BaseAddress = _serverOptions.RemoteEndpoint ?? LocalApiBaseAddress,
+            // Первая локальная инициализация может автоматически скачать модель размером в несколько ГБ.
+            Timeout = TimeSpan.FromHours(2)
         };
+        if (IsRemote && !string.IsNullOrWhiteSpace(_serverOptions.ApiKey))
+            _httpClient.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", _serverOptions.ApiKey);
     }
 
-    public string ModelRoot => _modelRoot ??= ResolveModelRoot();
+    public bool IsRemote => _serverOptions.RemoteEndpoint is not null;
+    public Uri Endpoint => _httpClient.BaseAddress!;
+    public string PreferredModel => _serverOptions.PreferredModel ?? RecommendedLocalModel;
+    public string ModelRoot => IsRemote ? $"удалённый сервер {Endpoint.Host}" : _modelRoot ??= ResolveModelRoot();
 
     public async Task<IReadOnlyList<OllamaModelInfo>> GetModelsAsync(CancellationToken cancellationToken = default)
     {
         await EnsureServerAsync(cancellationToken);
+        if (!IsRemote)
+            await EnsureRecommendedModelAsync(cancellationToken).ConfigureAwait(false);
         using var response = await _httpClient.GetAsync("api/tags", cancellationToken);
-        await EnsureSuccessAsync(response, "Не удалось получить список локальных моделей", cancellationToken);
+        await EnsureSuccessAsync(response, "Не удалось получить список моделей ИИ-сервера", cancellationToken);
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
         if (!document.RootElement.TryGetProperty("models", out var modelsElement))
@@ -78,13 +98,45 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 ? value
                 : 0;
             var capabilities = await GetCapabilitiesAsync(name, cancellationToken);
-            models.Add(new OllamaModelInfo(name, size, capabilities.Contains("vision", StringComparer.OrdinalIgnoreCase)));
+            models.Add(new OllamaModelInfo(
+                name, size, capabilities.Contains("vision", StringComparer.OrdinalIgnoreCase), IsRemote));
         }
 
         return models
-            .OrderByDescending(model => model.SupportsVision)
-            .ThenBy(model => model.SizeBytes)
+            .OrderByDescending(model => model.Name.Equals(PreferredModel, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(model => model.SupportsVision)
+            .ThenByDescending(model => IsRemote ? model.SizeBytes : -model.SizeBytes)
             .ToList();
+    }
+
+    public async Task VerifyModelAsync(string model, CancellationToken cancellationToken = default)
+    {
+        if (_verifiedModels.ContainsKey(model)) return;
+        await EnsureServerAsync(cancellationToken).ConfigureAwait(false);
+        using var response = await _httpClient.PostAsJsonAsync(
+            "api/chat",
+            new
+            {
+                model,
+                stream = false,
+                think = false,
+                format = "json",
+                messages = new object[]
+                {
+                    new { role = "system", content = "Верни только JSON: {\"status\":\"ok\"}." },
+                    new { role = "user", content = "Проверка готовности ИИ для монтажа видео." }
+                },
+                options = new { temperature = 0, num_predict = 32 }
+            },
+            cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, $"ИИ-модель {model} не отвечает", cancellationToken).ConfigureAwait(false);
+        var responseJson = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        using var envelope = JsonDocument.Parse(responseJson);
+        var raw = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+        using var result = JsonDocument.Parse(ExtractJson(raw));
+        if (!GetString(result.RootElement, "status").Equals("ok", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"ИИ-модель {model} не прошла проверку готовности.");
+        _verifiedModels.TryAdd(model, 0);
     }
 
     public async Task<OllamaAnalysisEnhancement> EnhanceAsync(
@@ -168,7 +220,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         }
     }
 
-    public async Task<ImmutableArray<CoreAnalysisSegment>> AnalyzeGameplayAsync(
+    public async Task<ImmutableArray<CoreAnalysisSegment>> AnalyzeMaterialAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
         CoreGameEditingProfile profile,
@@ -207,7 +259,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 {
                     role = "system",
                     content =
-                        "Ты анализатор игрового видео. Верни только JSON без Markdown: " +
+                        "Ты универсальный анализатор видеоматериала. Верни только JSON без Markdown: " +
                         "{\"segments\":[{\"start\":0.0,\"end\":3.0,\"title\":\"событие\",\"description\":\"что видно\"," +
                         "\"confidence\":0.8,\"tags\":{\"tag\":0.9}}]}. " +
                         "start/end — абсолютные секунды исходника. Используй только события, которые видны на кадрах; " +
@@ -217,11 +269,11 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 {
                     role = "user",
                     content =
-                        $"Игра/профиль: {profile.DisplayName} ({profile.GameFamily}).\n" +
+                        $"Профиль материала: {profile.DisplayName} ({profile.ContentFamily}).\n" +
                         $"Искомые теги: {tags}.\nПравила монтажа: {profile.PlanningGuidance}\n" +
                         $"Диапазон: {Format(baseline.SourceStart)}–{Format(baseline.SourceEnd)} сек.\n" +
                         $"Контактные листы:\n{sheetDescription}\n" +
-                        "Отмечай только уверенно распознанные игровые события и интерфейсные признаки.",
+                        "Отмечай только уверенно распознанные события, действия, речь, эмоции и изменения; не выдумывай содержание.",
                     images = images.ToArray()
                 }
             };
@@ -237,7 +289,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                     options = new { temperature = 0.08, num_ctx = 16384, num_predict = 4096 }
                 },
                 cancellationToken);
-            await EnsureSuccessAsync(response, $"Локальная модель {model} не выполнила игровой анализ", cancellationToken);
+            await EnsureSuccessAsync(response, $"ИИ-модель {model} не выполнила анализ материала", cancellationToken);
             var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
             var parsed = ParseGameplaySegments(responseJson, asset.Id, baseline, profile);
             return await RefineGameplayBoundariesAsync(
@@ -278,7 +330,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
 
             progress?.Report(new VideoAnalysisProgress(
                 95 + 5d * completed / Math.Max(1, selected.Count),
-                $"Уточнение игровых границ FFmpeg: {completed + 1}/{selected.Count}"));
+                $"Уточнение границ фрагментов FFmpeg: {completed + 1}/{selected.Count}"));
             var start = await verifier.VerifyBoundaryAsync(
                 asset.Path, segment.SourceRange.Start.TotalSeconds,
                 baseline.SourceStart, baseline.SourceEnd, fps, cancellationToken).ConfigureAwait(false);
@@ -294,7 +346,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
 
             var evidence = segment.Evidence.Add(new CoreAnalysisEvidence(
                 CoreMontageEvidenceKind.Technical,
-                "Границы уточнены плотным FFmpeg-проходом около игрового события.",
+                "Границы уточнены плотным FFmpeg-проходом около выбранного события.",
                 $"start:{start.FrameCandidateCount};end:{end.FrameCandidateCount}"));
             output.Add(segment with
             {
@@ -523,7 +575,8 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                     {
                         role = "system",
                         content =
-                            "Ты режиссёр игрового видео. Ты не меняешь таймлайн, а возвращаешь декларативный план JSON без Markdown: " +
+                            "Ты универсальный режиссёр монтажа. Материал может быть любым: разговор, фильм, аниме, игра, обучение, блог или запись события. " +
+                            "Ты не меняешь таймлайн, а возвращаешь декларативный план JSON без Markdown: " +
                             "{\"summary\":\"...\",\"items\":[{\"segment_id\":\"32 hex\",\"role\":\"hook|setup|development|payoff|ending\"," +
                             "\"reason\":\"почему\",\"transition_after\":\"none|cross_dissolve|dip_to_black\",\"volume\":1.0,\"subtitles\":true}]}. " +
                             "Используй только переданные segment_id, каждый максимум один раз. Обязательные элементы включай всегда. " +
@@ -534,7 +587,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 options = new { temperature = 0.12, num_ctx = 16384, num_predict = 4096 }
             },
             cancellationToken);
-        await EnsureSuccessAsync(response, $"Локальная модель {model} не составила план игрового монтажа", cancellationToken);
+        await EnsureSuccessAsync(response, $"ИИ-модель {model} не составила план монтажа", cancellationToken);
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
         using var envelope = JsonDocument.Parse(responseJson);
         var rawContent = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
@@ -579,7 +632,14 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             items.AddRange(protectedLocked);
         }
         if (items.Count == 0)
-            throw new InvalidOperationException("Локальная модель не выбрала ни одного допустимого фрагмента.");
+            return baseline with
+            {
+                Summary = string.IsNullOrWhiteSpace(summary) ? baseline.Summary : summary,
+                Warnings = baseline.Warnings.Add(
+                    "ИИ не предложил безопасных изменений к подтверждённым диапазонам; сохранён базовый план."),
+                UpdatedAt = DateTimeOffset.UtcNow,
+                Dependencies = baseline.Dependencies with { Model = model }
+            };
         var lockedOrders = protectedLocked.Select(item => item.Order).ToHashSet();
         var nextOrder = 0;
         var normalized = items
@@ -615,6 +675,10 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             {
                 return;
             }
+
+            if (IsRemote)
+                throw new InvalidOperationException(
+                    $"Удалённый ИИ-сервер {Endpoint} недоступен. Проверьте адрес, сеть и API-ключ.");
 
             var executable = FindOllamaExecutable();
             var startInfo = new ProcessStartInfo
@@ -654,10 +718,55 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         }
     }
 
+    private async Task EnsureRecommendedModelAsync(CancellationToken cancellationToken)
+    {
+        if (await IsModelInstalledAsync(PreferredModel, cancellationToken).ConfigureAwait(false))
+            return;
+
+        await _modelInstallGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (await IsModelInstalledAsync(PreferredModel, cancellationToken).ConfigureAwait(false))
+                return;
+
+            using var response = await _httpClient.PostAsJsonAsync(
+                "api/pull",
+                new { model = PreferredModel, stream = false },
+                cancellationToken).ConfigureAwait(false);
+            await EnsureSuccessAsync(
+                response,
+                $"Не удалось автоматически подготовить локальную ИИ-модель {PreferredModel}",
+                cancellationToken).ConfigureAwait(false);
+
+            if (!await IsModelInstalledAsync(PreferredModel, cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException(
+                    $"Локальный ИИ-сервер завершил загрузку, но модель {PreferredModel} не появилась в списке.");
+        }
+        finally
+        {
+            _modelInstallGate.Release();
+        }
+    }
+
+    private async Task<bool> IsModelInstalledAsync(string model, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.GetAsync("api/tags", cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, "Не удалось проверить локальные ИИ-модели", cancellationToken)
+            .ConfigureAwait(false);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+        return document.RootElement.TryGetProperty("models", out var models) &&
+               models.EnumerateArray().Any(item =>
+                   item.TryGetProperty("name", out var name) &&
+                   string.Equals(name.GetString(), model, StringComparison.OrdinalIgnoreCase));
+    }
+
     public void Dispose()
     {
         _httpClient.Dispose();
         _startGate.Dispose();
+        _modelInstallGate.Dispose();
         if (_serverProcess is null)
         {
             return;
@@ -1102,7 +1211,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         {
             var start = baseline.SourceStart + index * window;
             var end = index == count - 1 ? baseline.SourceEnd : Math.Min(baseline.SourceEnd, start + window);
-            specs.Add(new ContactSheetSpec(start, end, duration >= 3 ? 16 : 4, $"игровой обзор {index + 1}"));
+            specs.Add(new ContactSheetSpec(start, end, duration >= 3 ? 16 : 4, $"обзор материала {index + 1}"));
         }
         return specs;
     }
@@ -1116,7 +1225,7 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         using var envelope = JsonDocument.Parse(responseJson);
         if (!envelope.RootElement.TryGetProperty("message", out var message) ||
             !message.TryGetProperty("content", out var contentElement))
-            throw new InvalidOperationException("Локальный ИИ вернул игровой анализ без результата.");
+            throw new InvalidOperationException("ИИ вернул анализ материала без результата.");
         var raw = contentElement.GetString() ?? string.Empty;
         if (!raw.Contains('{') && message.TryGetProperty("thinking", out var thinking) &&
             thinking.ValueKind == JsonValueKind.String)
@@ -1551,21 +1660,32 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             }
         }
 
-        throw new DirectoryNotFoundException(
-            "Не найдена папка моделей проекта .ollama\\models. Она должна лежать рядом с проектом Kadr Studio.");
+        var standardRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
+        if (Directory.Exists(standardRoot))
+            return standardRoot;
+
+        var applicationRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "KadrStudio", "AI", "models");
+        Directory.CreateDirectory(applicationRoot);
+        return applicationRoot;
     }
 
     private static string FindOllamaExecutable()
     {
         var candidates = new List<string>
         {
+            Path.Combine(AppContext.BaseDirectory, "ai", "ollama.exe"),
+            Path.Combine(AppContext.BaseDirectory, "tools", "ollama.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Ollama", "ollama.exe")
         };
         candidates.AddRange((Environment.GetEnvironmentVariable("PATH") ?? string.Empty)
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Select(directory => Path.Combine(directory.Trim(), "ollama.exe")));
         return candidates.FirstOrDefault(File.Exists)
-            ?? throw new FileNotFoundException("Ollama не установлен. Установите Ollama и повторите анализ.");
+            ?? throw new FileNotFoundException(
+                "В сборке Kadr Studio отсутствует локальный ИИ-сервер ai\\ollama.exe. Переустановите приложение.");
     }
 
     private static async Task EnsureSuccessAsync(
@@ -1602,9 +1722,34 @@ public sealed class OllamaVideoAnalysisService : IDisposable
     private sealed record ContactSheetSpec(double Start, double End, int FrameCount, string Label);
 }
 
-public sealed record OllamaModelInfo(string Name, long SizeBytes, bool SupportsVision)
+public sealed record OllamaServerOptions(
+    Uri? RemoteEndpoint = null,
+    string? ApiKey = null,
+    string? PreferredModel = null)
 {
-    public string DisplayName => $"{Name} · {(SupportsVision ? "видит кадры" : "текст")} · {SizeBytes / 1024d / 1024d / 1024d:0.0} ГБ";
+    public static OllamaServerOptions FromEnvironment()
+    {
+        var endpointValue = Environment.GetEnvironmentVariable("KADR_STUDIO_AI_ENDPOINT");
+        var apiKey = Environment.GetEnvironmentVariable("OLLAMA_API_KEY");
+        Uri? endpoint = null;
+        if (!string.IsNullOrWhiteSpace(endpointValue))
+        {
+            if (!Uri.TryCreate(endpointValue.TrimEnd('/') + "/", UriKind.Absolute, out endpoint) ||
+                endpoint.Scheme is not ("http" or "https"))
+                throw new InvalidOperationException("KADR_STUDIO_AI_ENDPOINT должен быть абсолютным HTTP(S)-адресом.");
+        }
+
+        var preferred = Environment.GetEnvironmentVariable("KADR_STUDIO_AI_MODEL");
+        if (string.IsNullOrWhiteSpace(preferred) && endpoint?.Host.Equals("ollama.com", StringComparison.OrdinalIgnoreCase) == true)
+            preferred = "qwen3-vl:235b";
+        return new OllamaServerOptions(endpoint, apiKey, preferred);
+    }
+}
+
+public sealed record OllamaModelInfo(string Name, long SizeBytes, bool SupportsVision, bool IsRemote = false)
+{
+    public string DisplayName => $"{Name} · {(SupportsVision ? "видит кадры" : "текст")} · " +
+                                 $"{(IsRemote ? "облако" : $"{SizeBytes / 1024d / 1024d / 1024d:0.0} ГБ")}";
 }
 
 public sealed record OllamaAnalysisEnhancement(

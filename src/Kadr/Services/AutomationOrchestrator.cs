@@ -74,6 +74,38 @@ public sealed class AutomationOrchestrator(
         return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<VideoAnalysisPipelineResult> EnhanceStructureAsync(
+        MediaAsset asset,
+        VideoAnalysisResult baseline,
+        string query,
+        string model,
+        IProgress<VideoAnalysisProgress>? progress = null,
+        CancellationToken cancellationToken = default,
+        JobPriority priority = JobPriority.UserInitiated)
+    {
+        if (string.IsNullOrWhiteSpace(model))
+            return new VideoAnalysisPipelineResult(baseline, "Для смысловой проверки не выбрана vision-модель.");
+        var snapshot = CopyAsset(asset);
+        var key = JobKey.Create(
+            "structure-analysis", snapshot.Id, Fingerprint(snapshot), baseline.SourceStart,
+            baseline.SourceEnd, query, model);
+        var job = scheduler.Schedule(new JobRequest<VideoAnalysisPipelineResult>(
+            key,
+            JobLane.Analysis,
+            priority,
+            async token =>
+            {
+                var enhancement = await ollama.EnhanceAsync(
+                    snapshot, baseline, query, model, progress, token).ConfigureAwait(false);
+                var merged = MergeEnhancement(baseline, enhancement);
+                var refined = await analysis.RefineSemanticBoundariesAsync(
+                    snapshot, merged, progress, token).ConfigureAwait(false);
+                return new VideoAnalysisPipelineResult(refined, null);
+            },
+            PauseDuringExport: priority >= JobPriority.Background));
+        return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
+    }
+
     private static VideoAnalysisResult MergeEnhancement(
         VideoAnalysisResult baseline,
         OllamaAnalysisEnhancement enhancement)

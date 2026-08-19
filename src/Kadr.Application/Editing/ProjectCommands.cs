@@ -596,6 +596,144 @@ public sealed record ReplaceMarkersCommand(IReadOnlyList<TimelineMarker> Markers
     public ProjectState Apply(ProjectState project) => project with { Markers = Markers.ToImmutableArray() };
 }
 
+public sealed record CreateTransitionAtEditCommand(
+    Guid TransitionId,
+    Guid FromClipId,
+    TransitionKind Kind,
+    TimelineTime RequestedDuration,
+    Guid? CompanionTransitionId = null) : IEditCommand
+{
+    public string Description => "Создать переход на склейке";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        if (TransitionId == Guid.Empty || RequestedDuration <= TimelineTime.Zero)
+            throw new EditRejectedException("Длительность и идентификатор перехода должны быть корректными.");
+        var from = RequireClip(project, FromClipId);
+        var track = project.FindTrack(from.TrackId)
+            ?? throw new EditRejectedException("Дорожка выбранного клипа не найдена.");
+        if (track.Kind == TrackKind.Audio && Kind != TransitionKind.ConstantPowerAudio ||
+            track.Kind == TrackKind.Visual && Kind == TransitionKind.ConstantPowerAudio)
+            throw new EditRejectedException("Тип перехода не подходит выбранной дорожке.");
+        if (track.Kind == TrackKind.Audio && from.LinkGroupId.HasValue)
+            throw new EditRejectedException(
+                "Для связанного видео выберите видеопереход — плавная аудиосклейка добавится автоматически.");
+
+        var to = project.MediaClips
+            .Where(item => item.TrackId == from.TrackId && item.Start == from.End)
+            .OrderBy(item => item.Id)
+            .FirstOrDefault()
+            ?? throw new EditRejectedException(
+                "Справа нужен соседний клип без зазора. Накладывать клипы друг на друга не требуется.");
+        var duration = Min(RequestedDuration, Min(from.Duration, to.Duration));
+        if (duration <= TimelineTime.Zero)
+            throw new EditRejectedException("Клипы слишком короткие для перехода.");
+
+        var beforeCut = from.End;
+        var beforeHalf = new TimelineTime(duration.Ticks / 2);
+        var afterHalf = duration - beforeHalf;
+        var fromSource = project.Sources[from.SourceId];
+        var toSource = project.Sources[to.SourceId];
+        var outgoingHandle = fromSource.Kind == MediaKind.Image
+            ? afterHalf
+            : Max(TimelineTime.Zero, fromSource.Duration - from.SourceIn - from.Duration);
+        var incomingHandle = toSource.Kind == MediaKind.Image ? beforeHalf : to.SourceIn;
+        var missingOutgoing = Max(TimelineTime.Zero, afterHalf - outgoingHandle);
+        var missingIncoming = Max(TimelineTime.Zero, beforeHalf - incomingHandle);
+        if (missingOutgoing >= from.Duration || missingIncoming >= to.Duration)
+            throw new EditRejectedException("Клипы слишком короткие для автоматической подготовки перехода.");
+
+        var fromIds = LinkedIds(project, from);
+        var toIds = LinkedIds(project, to);
+        if (fromIds.Overlaps(toIds))
+            throw new EditRejectedException("Переход нельзя создать внутри одной связанной группы.");
+        var ripple = missingOutgoing + missingIncoming;
+        var affectedIds = fromIds.Concat(toIds).ToHashSet();
+        var affectedTrackIds = project.MediaClips
+            .Where(item => affectedIds.Contains(item.Id))
+            .Select(item => item.TrackId)
+            .ToHashSet();
+        var media = project.MediaClips.Select(item =>
+        {
+            if (fromIds.Contains(item.Id))
+            {
+                var shortened = item.Duration - missingOutgoing;
+                return item with { Duration = shortened, Audio = ClampAudioFades(item.Audio, shortened) };
+            }
+            if (toIds.Contains(item.Id))
+            {
+                var shortened = item.Duration - missingIncoming;
+                var source = project.Sources[item.SourceId];
+                return item with
+                {
+                    Start = item.Start - missingOutgoing,
+                    SourceIn = source.Kind == MediaKind.Image ? item.SourceIn : item.SourceIn + missingIncoming,
+                    Duration = shortened,
+                    Audio = ClampAudioFades(item.Audio, shortened)
+                };
+            }
+            return ripple > TimelineTime.Zero && affectedTrackIds.Contains(item.TrackId) && item.Start >= beforeCut
+                ? item with { Start = item.Start - ripple }
+                : item;
+        }).ToImmutableArray();
+
+        var transitions = project.Transitions
+            .Where(item => !affectedIds.Contains(item.FromClipId) && !affectedIds.Contains(item.ToClipId))
+            .Where(item => !affectedTrackIds.Contains(item.TrackId) || ripple <= TimelineTime.Zero ||
+                           item.End <= beforeCut || item.Start >= beforeCut)
+            .Select(item => ripple > TimelineTime.Zero && affectedTrackIds.Contains(item.TrackId) && item.Start >= beforeCut
+                ? item with { Start = item.Start - ripple }
+                : item)
+            .ToImmutableArray();
+        var prepared = project with
+        {
+            MediaClips = media,
+            Transitions = transitions,
+            InPoint = ShiftPoint(project.InPoint, beforeCut, ripple),
+            OutPoint = ShiftPoint(project.OutPoint, beforeCut, ripple)
+        };
+
+        var preparedFrom = prepared.FindMediaClip(from.Id)!;
+        var preparedTo = prepared.FindMediaClip(to.Id)!;
+        var cut = preparedFrom.End;
+        if (preparedTo.Start != cut)
+            throw new EditRejectedException("Не удалось безопасно подготовить соседние клипы для перехода.");
+        var primary = new TimelineTransition(
+            TransitionId, Kind, track.Id, preparedFrom.Id, preparedTo.Id,
+            cut - beforeHalf, duration);
+        prepared = new UpsertTransitionCommand(primary).Apply(prepared);
+
+        if (track.Kind == TrackKind.Visual && CompanionTransitionId is { } companionId &&
+            FindLinkedAudio(prepared, preparedFrom) is { } fromAudio &&
+            FindLinkedAudio(prepared, preparedTo) is { } toAudio &&
+            fromAudio.TrackId == toAudio.TrackId && fromAudio.End == toAudio.Start)
+        {
+            var companion = new TimelineTransition(
+                companionId, TransitionKind.ConstantPowerAudio, fromAudio.TrackId,
+                fromAudio.Id, toAudio.Id, cut - beforeHalf, duration);
+            prepared = new UpsertTransitionCommand(companion).Apply(prepared);
+        }
+        return prepared;
+    }
+
+    private static HashSet<Guid> LinkedIds(ProjectState project, MediaClip clip)
+        => clip.LinkGroupId is { } group
+            ? project.MediaClips.Where(item => item.LinkGroupId == group).Select(item => item.Id).ToHashSet()
+            : new HashSet<Guid> { clip.Id };
+
+    private static MediaClip? FindLinkedAudio(ProjectState project, MediaClip clip)
+        => clip.LinkGroupId is { } group
+            ? project.MediaClips.FirstOrDefault(item => item.LinkGroupId == group &&
+                project.FindTrack(item.TrackId)?.Kind == TrackKind.Audio)
+            : null;
+
+    private static TimelineTime? ShiftPoint(TimelineTime? point, TimelineTime cut, TimelineTime delta)
+        => point is { } value && delta > TimelineTime.Zero && value >= cut ? value - delta : point;
+
+    private static TimelineTime Min(TimelineTime left, TimelineTime right) => left <= right ? left : right;
+    private static TimelineTime Max(TimelineTime left, TimelineTime right) => left >= right ? left : right;
+}
+
 public sealed record UpsertTransitionCommand(TimelineTransition Transition) : IEditCommand
 {
     public string Description => "Upsert transition";

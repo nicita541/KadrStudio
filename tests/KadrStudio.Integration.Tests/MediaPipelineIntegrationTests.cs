@@ -1,4 +1,5 @@
 using KadrStudio.Application.Rendering;
+using KadrStudio.Application.Editing;
 using KadrStudio.Playback;
 using KadrStudio.Services;
 using KadrStudio.Application.Media;
@@ -12,6 +13,43 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class MediaPipelineIntegrationTests
 {
+    [Fact(Timeout = 120_000)]
+    public async Task Full_length_adjacent_imports_get_real_rendered_transition_without_manual_overlap()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            locator.EnsureAvailable();
+            var red = Path.Combine(root, "full-red.mp4");
+            var blue = Path.Combine(root, "full-blue.mp4");
+            await CreateColorSourceAsync(locator, red, "red", 440);
+            await CreateColorSourceAsync(locator, blue, "blue", 880);
+            var project = CreateFullLengthTransitionProject(red, blue);
+            var from = project.MediaClips.Single(item => item.Video is not null && item.Start == TimelineTime.Zero);
+            var session = new EditorSession(project);
+            var result = session.Execute(new EditTransaction(
+                "automatic transition",
+                new CreateTransitionAtEditCommand(
+                    Guid.NewGuid(), from.Id, TransitionKind.CrossDissolve,
+                    TimelineTime.FromSeconds(1), Guid.NewGuid())));
+            var output = Path.Combine(root, "auto-transition.mp4");
+
+            await using var scheduler = new BackgroundJobScheduler();
+            var engine = new FfmpegRenderEngine(locator.FfmpegPath, new FfmpegRenderCommandBuilder(), scheduler);
+            await engine.RenderAsync(new RenderPlanBuilder().Build(result.State), new RenderOutputOptions(
+                RenderPurpose.Export, output, 320, 240, VideoQuality: 30));
+
+            var probe = await new ProcessRunner().RunAsync(locator.FfprobePath,
+                ["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "default=nw=1", output]);
+            Assert.Equal(0, probe.ExitCode);
+            Assert.Contains("codec_type=video", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("codec_type=audio", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("duration=5.", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { DeleteRoot(root); }
+    }
+
     [Theory(Timeout = 120_000)]
     [InlineData(TransitionKind.CrossDissolve)]
     [InlineData(TransitionKind.DipToBlack)]
@@ -380,6 +418,40 @@ public sealed class MediaPipelineIntegrationTests
                     TimelineTime.FromSeconds(1.5), TimelineTime.FromSeconds(1)),
                 new TimelineTransition(Guid.NewGuid(), TransitionKind.ConstantPowerAudio, audio.Id, a1.Id, a2.Id,
                     TimelineTime.FromSeconds(1.5), TimelineTime.FromSeconds(1))
+            ]
+        };
+    }
+
+    private static ProjectState CreateFullLengthTransitionProject(string firstPath, string secondPath)
+    {
+        var project = ProjectState.CreateNew("Automatic full transition", new FrameRate(24)) with
+        {
+            Sequence = new SequenceSettings(320, 240, new FrameRate(24), 48_000)
+        };
+        var firstSource = new MediaSource(Guid.NewGuid(), firstPath, "red.mp4", KadrStudio.Core.Domain.MediaKind.Video,
+            TimelineTime.FromSeconds(3), true, 320, 240, new FrameRate(24), "h264", "aac",
+            new FileInfo(firstPath).Length, Fingerprint: "full-red-source");
+        var secondSource = new MediaSource(Guid.NewGuid(), secondPath, "blue.mp4", KadrStudio.Core.Domain.MediaKind.Video,
+            TimelineTime.FromSeconds(3), true, 320, 240, new FrameRate(24), "h264", "aac",
+            new FileInfo(secondPath).Length, Fingerprint: "full-blue-source");
+        var visual = project.Tracks.Single(item => item.Kind == KadrStudio.Core.Domain.TrackKind.Visual && item.Index == 0);
+        var audio = project.Tracks.Single(item => item.Kind == KadrStudio.Core.Domain.TrackKind.Audio && item.Index == 0);
+        var firstGroup = Guid.NewGuid();
+        var secondGroup = Guid.NewGuid();
+        return project with
+        {
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty
+                .Add(firstSource.Id, firstSource).Add(secondSource.Id, secondSource),
+            MediaClips =
+            [
+                new MediaClip(Guid.NewGuid(), firstSource.Id, visual.Id, TimelineTime.Zero,
+                    TimelineTime.Zero, firstSource.Duration, firstGroup, Video: new VideoParameters()),
+                new MediaClip(Guid.NewGuid(), firstSource.Id, audio.Id, TimelineTime.Zero,
+                    TimelineTime.Zero, firstSource.Duration, firstGroup, Audio: new AudioParameters()),
+                new MediaClip(Guid.NewGuid(), secondSource.Id, visual.Id, firstSource.Duration,
+                    TimelineTime.Zero, secondSource.Duration, secondGroup, Video: new VideoParameters()),
+                new MediaClip(Guid.NewGuid(), secondSource.Id, audio.Id, firstSource.Duration,
+                    TimelineTime.Zero, secondSource.Duration, secondGroup, Audio: new AudioParameters())
             ]
         };
     }

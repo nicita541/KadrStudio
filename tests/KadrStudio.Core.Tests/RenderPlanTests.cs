@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using KadrStudio.Application.Editing;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
 using KadrStudio.Infrastructure.Rendering;
@@ -219,6 +220,47 @@ public sealed class RenderPlanTests
         Assert.Equal(TimelineTime.FromSeconds(2), transition.Duration);
     }
 
+    [Fact]
+    public void Transition_at_full_length_edit_prepares_handles_and_linked_audio_atomically()
+    {
+        var project = CreateFullLengthTransitionProject();
+        var from = project.MediaClips.Single(item => item.Video is not null && item.Start == TimelineTime.Zero);
+        var transitionId = Guid.NewGuid();
+        var audioTransitionId = Guid.NewGuid();
+        var session = new EditorSession(project);
+
+        var result = session.Execute(new EditTransaction(
+            "auto transition",
+            new CreateTransitionAtEditCommand(
+                transitionId, from.Id, TransitionKind.CrossDissolve,
+                TimelineTime.FromSeconds(2), audioTransitionId)));
+
+        Assert.Equal(2, result.State.Transitions.Length);
+        var videoTransition = result.State.Transitions.Single(item => item.Id == transitionId);
+        Assert.Equal(TimelineTime.FromSeconds(8), videoTransition.Start);
+        Assert.Equal(TimelineTime.FromSeconds(2), videoTransition.Duration);
+        var visual = result.State.MediaClips.Where(item => item.Video is not null).OrderBy(item => item.Start).ToArray();
+        Assert.Equal(TimelineTime.FromSeconds(9), visual[0].End);
+        Assert.Equal(visual[0].End, visual[1].Start);
+        Assert.Equal(TimelineTime.FromSeconds(1), visual[1].SourceIn);
+        Assert.Equal(TimelineTime.FromSeconds(18), result.State.Duration);
+        Assert.Contains(result.State.MediaClips, item => item.LinkGroupId is null &&
+            item.Start == TimelineTime.FromSeconds(12));
+        Assert.All(result.State.MediaClips.GroupBy(item => item.LinkGroupId), group =>
+        {
+            var first = group.First();
+            Assert.All(group, item =>
+            {
+                Assert.Equal(first.Start, item.Start);
+                Assert.Equal(first.SourceIn, item.SourceIn);
+                Assert.Equal(first.Duration, item.Duration);
+            });
+        });
+        var renderPlan = new RenderPlanBuilder().Build(result.State);
+        Assert.Single(renderPlan.VideoTransitions);
+        Assert.Single(renderPlan.AudioTransitions);
+    }
+
     private static ProjectState CreateProject()
     {
         var project = ProjectState.CreateNew("Render plan", FrameRate.Fps23976);
@@ -275,6 +317,38 @@ public sealed class RenderPlanTests
                     TimelineTime.FromSeconds(4), TimelineTime.FromSeconds(2)),
                 new TimelineTransition(Guid.NewGuid(), TransitionKind.ConstantPowerAudio, audio.Id, a1.Id, a2.Id,
                     TimelineTime.FromSeconds(4), TimelineTime.FromSeconds(2))
+            ]
+        };
+    }
+
+    private static ProjectState CreateFullLengthTransitionProject()
+    {
+        var project = ProjectState.CreateNew("Full clips transition", new FrameRate(24));
+        var firstSource = new MediaSource(Guid.NewGuid(), "F:\\media\\first.mp4", "first.mp4", MediaKind.Video,
+            TimelineTime.FromSeconds(10), true, 320, 180, new FrameRate(24), Fingerprint: "first");
+        var secondSource = new MediaSource(Guid.NewGuid(), "F:\\media\\second.mp4", "second.mp4", MediaKind.Video,
+            TimelineTime.FromSeconds(10), true, 320, 180, new FrameRate(24), Fingerprint: "second");
+        var visual = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var audio = project.Tracks.Single(item => item.Kind == TrackKind.Audio && item.Index == 0);
+        var overlay = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 1);
+        var firstGroup = Guid.NewGuid();
+        var secondGroup = Guid.NewGuid();
+        return project with
+        {
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty
+                .Add(firstSource.Id, firstSource).Add(secondSource.Id, secondSource),
+            MediaClips =
+            [
+                new MediaClip(Guid.NewGuid(), firstSource.Id, visual.Id, TimelineTime.Zero,
+                    TimelineTime.Zero, firstSource.Duration, firstGroup, Video: new VideoParameters()),
+                new MediaClip(Guid.NewGuid(), firstSource.Id, audio.Id, TimelineTime.Zero,
+                    TimelineTime.Zero, firstSource.Duration, firstGroup, Audio: new AudioParameters()),
+                new MediaClip(Guid.NewGuid(), secondSource.Id, visual.Id, firstSource.Duration,
+                    TimelineTime.Zero, secondSource.Duration, secondGroup, Video: new VideoParameters()),
+                new MediaClip(Guid.NewGuid(), secondSource.Id, audio.Id, firstSource.Duration,
+                    TimelineTime.Zero, secondSource.Duration, secondGroup, Audio: new AudioParameters()),
+                new MediaClip(Guid.NewGuid(), secondSource.Id, overlay.Id, TimelineTime.FromSeconds(12),
+                    TimelineTime.Zero, TimelineTime.FromSeconds(2), Video: new VideoParameters())
             ]
         };
     }

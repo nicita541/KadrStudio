@@ -167,7 +167,7 @@ public sealed class EvidenceMontagePlanningProvider : IMontagePlanningProvider
         return new MontagePlan(
             Guid.NewGuid(),
             request.Id,
-            request.TargetFormat == MontageTargetFormat.Shorts ? "Shorts — черновик ИИ" : "YouTube — черновик ИИ",
+            request.TargetFormat == MontageTargetFormat.Shorts ? "Вертикальный монтаж — черновик ИИ" : "Монтаж — черновик ИИ",
             "План построен только из подтверждённых диапазонов анализа и обязательных меток.",
             MontagePlanStatus.Ready,
             request.TargetFormat,
@@ -273,7 +273,7 @@ public sealed class EvidenceMontagePlanningProvider : IMontagePlanningProvider
         if (!string.IsNullOrWhiteSpace(segment.Transcript))
             return $"Речь: {Trim(segment.Transcript, 100)}";
         return string.IsNullOrWhiteSpace(strongest.Key)
-            ? "Технически заметный игровой момент"
+            ? "Технически заметный фрагмент"
             : $"Событие: {strongest.Key}";
     }
 

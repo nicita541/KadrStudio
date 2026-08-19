@@ -4,6 +4,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:controls="clr-namespace:KadrStudio.Controls"
+        xmlns:domain="clr-namespace:KadrStudio.Core.Domain;assembly=KadrStudio.Core"
         mc:Ignorable="d"
         Title="Kadr Studio"
         Width="1500"
@@ -88,7 +89,7 @@
                         <Button.ContextMenu>
                             <ContextMenu>
                                 <MenuItem Header="Медиатека" Click="ShowMedia_Click" />
-                                <MenuItem Header="Анализ" Click="ShowAnalysis_Click" />
+                                <MenuItem Header="ИИ" Click="ShowAnalysis_Click" />
                                 <MenuItem Header="История версий" Click="ShowHistory_Click" />
                                 <Separator Margin="4,2" />
                                 <MenuItem Header="Обработка звука…" Click="OpenAudioWorkspace_Click" />
@@ -158,10 +159,10 @@
                         <TextBlock Text="Медиа" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
-                <Button x:Name="AnalysisNavButton" Style="{StaticResource NavButton}" ToolTip="Локальный анализ видео" Click="ShowAnalysis_Click">
+                <Button x:Name="AnalysisNavButton" Style="{StaticResource NavButton}" ToolTip="Чат ИИ-монтажа" Click="ShowAnalysis_Click">
                     <StackPanel>
                         <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M3,18 L7,14 L10,16 L14,8 L18,12 L21,5" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/><Path Data="M3,21 L21,21" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.5"/></Canvas></Viewbox>
-                        <TextBlock Text="Анализ" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
+                        <TextBlock Text="ИИ" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
                 <Button x:Name="HistoryNavButton" Style="{StaticResource NavButton}" ToolTip="История версий проекта" Click="ShowHistory_Click">
@@ -287,11 +288,165 @@
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <StackPanel Grid.Row="0" Margin="2,2,0,10">
                     <TextBlock Text="ИИ-монтаж" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Анализ → редактируемый план → отдельный вариант таймлайна"
+                    <TextBlock Text="Опишите результат обычными словами"
                                Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,0" />
                 </StackPanel>
 
-                <TabControl x:Name="AiMontageTabControl" Grid.Row="1" Background="Transparent" BorderThickness="0">
+                <Grid x:Name="AiChatPanel" Grid.Row="1" Margin="0,0,0,4">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <ListBox x:Name="AiChatMessagesListBox"
+                             Grid.Row="0"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             Padding="0,2,3,8"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             HorizontalContentAlignment="Stretch">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Padding" Value="0"/>
+                                <Setter Property="Margin" Value="0,0,0,8"/>
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                                <Setter Property="Focusable" Value="False"/>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border HorizontalAlignment="{Binding BubbleAlignment}"
+                                        Background="{Binding BubbleBrush}"
+                                        BorderBrush="{Binding BorderBrush}"
+                                        BorderThickness="1"
+                                        CornerRadius="9"
+                                        Padding="10"
+                                        MaxWidth="410">
+                                    <StackPanel>
+                                        <TextBlock Text="{Binding Author}" FontWeight="SemiBold" FontSize="10"
+                                                   Foreground="{Binding AuthorBrush}" Margin="0,0,0,5"/>
+                                        <TextBlock Text="{Binding Text}" TextWrapping="Wrap"/>
+
+                                        <StackPanel Visibility="{Binding IsProgressVisible, Converter={StaticResource BoolToVisibility}}"
+                                                    Margin="0,8,0,0">
+                                            <ProgressBar Height="5" Minimum="0" Maximum="100" Value="{Binding ProgressPercent, Mode=OneWay}"
+                                                         Foreground="{StaticResource AccentBrush}"/>
+                                            <TextBlock Text="{Binding ProgressLabel}" FontSize="9"
+                                                       Foreground="{StaticResource MutedTextBrush}" Margin="0,4,0,0"/>
+                                        </StackPanel>
+
+                                        <StackPanel Visibility="{Binding IsPlanVisible, Converter={StaticResource BoolToVisibility}}"
+                                                    Margin="0,9,0,0">
+                                            <TextBlock Text="{Binding PlanDurationLabel}" FontWeight="SemiBold"/>
+                                            <TextBlock Text="Сохраняется" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
+                                            <ItemsControl ItemsSource="{Binding RetainedItems}">
+                                                <ItemsControl.ItemTemplate><DataTemplate>
+                                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"/>
+                                                </DataTemplate></ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <StackPanel Visibility="{Binding HasRemovedItems, Converter={StaticResource BoolToVisibility}}">
+                                                <TextBlock Text="Исключается" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
+                                                <ItemsControl ItemsSource="{Binding RemovedItems}">
+                                                    <ItemsControl.ItemTemplate><DataTemplate>
+                                                        <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"
+                                                                   Foreground="{StaticResource MutedTextBrush}"/>
+                                                    </DataTemplate></ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                            <ItemsControl ItemsSource="{Binding Warnings}" Margin="0,6,0,0">
+                                                <ItemsControl.ItemTemplate><DataTemplate>
+                                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Foreground="#F0C674" Margin="0,2"/>
+                                                </DataTemplate></ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <Button Style="{StaticResource AccentButton}" Content="Создать черновик"
+                                                    Tag="{Binding Id}" Click="AiChatCreateDraft_Click" Padding="10,7" Margin="0,9,0,0"
+                                                    IsEnabled="{Binding CanCreateDraft}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Visibility="{Binding IsQuestionVisible, Converter={StaticResource BoolToVisibility}}"
+                                                    Margin="0,9,0,0">
+                                            <ItemsControl ItemsSource="{Binding Options}"
+                                                          Visibility="{Binding IsOptionQuestionVisible, Converter={StaticResource BoolToVisibility}}">
+                                                <ItemsControl.ItemTemplate><DataTemplate>
+                                                    <Button Style="{StaticResource ButtonBase}" Tag="{Binding}"
+                                                            Click="AiChatQuestionOption_Click" Padding="9,7" Margin="0,0,0,5"
+                                                            HorizontalContentAlignment="Left" IsEnabled="{Binding IsEnabled}">
+                                                        <StackPanel>
+                                                            <TextBlock Text="{Binding Label}" FontWeight="SemiBold"/>
+                                                            <TextBlock Text="{Binding Description}" TextWrapping="Wrap" FontSize="9"
+                                                                       Foreground="{StaticResource MutedTextBrush}" Margin="0,2,0,0"/>
+                                                        </StackPanel>
+                                                    </Button>
+                                                </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <StackPanel Visibility="{Binding IsBoundaryQuestionVisible, Converter={StaticResource BoolToVisibility}}">
+                                                <Border Height="142" Background="#101117" BorderBrush="{StaticResource BorderBrush}"
+                                                        BorderThickness="1" CornerRadius="5">
+                                                    <Image Source="{Binding BoundaryFrame}" Stretch="Uniform"/>
+                                                </Border>
+                                                <TextBlock Text="{Binding BoundaryTimeLabel}" HorizontalAlignment="Center"
+                                                           FontFamily="Consolas" FontSize="10" Margin="0,6"/>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                                    <Button Style="{StaticResource ButtonBase}" Content="−1 кадр" Tag="{Binding Id}"
+                                                            Click="AiChatPreviousFrame_Click" Padding="7"/>
+                                                    <Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="+1 кадр" Tag="{Binding Id}"
+                                                            Click="AiChatNextFrame_Click" Padding="7"/>
+                                                </Grid>
+                                                <Button Style="{StaticResource AccentButton}" Content="Подтвердить этот кадр" Tag="{Binding Id}"
+                                                        Click="AiChatConfirmFrame_Click" Padding="9,7" Margin="0,5,0,0"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{Binding AnswerLabel}" FontWeight="SemiBold" Foreground="#CBB8FF"
+                                                       Visibility="{Binding HasAnswer, Converter={StaticResource BoolToVisibility}}"/>
+                                        </StackPanel>
+
+                                        <Grid Visibility="{Binding IsDraftVisible, Converter={StaticResource BoolToVisibility}}" Margin="0,9,0,0">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                            <Button Style="{StaticResource ButtonBase}" Content="Открыть" Tag="{Binding Id}" Click="AiChatOpenDraft_Click" Padding="7"/>
+                                            <Button Grid.Column="2" Style="{StaticResource AccentButton}" Content="Принять" Tag="{Binding Id}" Click="AiChatAcceptDraft_Click" Padding="7"/>
+                                            <Button Grid.ColumnSpan="3" Style="{StaticResource ButtonBase}" Content="Удалить черновик" Tag="{Binding Id}"
+                                                    Click="AiChatDeleteDraft_Click" Padding="7" Margin="0,38,0,0"/>
+                                        </Grid>
+
+                                        <TextBlock Text="{Binding TimeLabel}" FontSize="8" Foreground="{StaticResource MutedTextBrush}"
+                                                   HorizontalAlignment="Right" Margin="0,6,0,0"/>
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Border Grid.Row="1" Background="{StaticResource PanelRaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1" CornerRadius="9" Padding="8">
+                        <StackPanel>
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <ComboBox x:Name="AiChatContextComboBox" SelectedIndex="0" ToolTip="Материал для команды"/>
+                                <ComboBox x:Name="AiChatScenarioComboBox" Grid.Column="2" SelectedIndex="0" ToolTip="Сценарий монтажа">
+                                    <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
+                                </ComboBox>
+                            </Grid>
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBox x:Name="AiChatPromptTextBox" AcceptsReturn="True" TextWrapping="Wrap"
+                                         MinHeight="48" MaxHeight="110" VerticalScrollBarVisibility="Auto"
+                                         PreviewKeyDown="AiChatPrompt_PreviewKeyDown"/>
+                                <Button x:Name="AiChatSendButton" Grid.Column="2" Style="{StaticResource AccentButton}"
+                                        Content="Отправить" Click="AiChatSend_Click" MinWidth="76" Padding="9,7"/>
+                            </Grid>
+                            <WrapPanel x:Name="AiChatSuggestionsPanel" Margin="0,6,0,0">
+                                <Button Style="{StaticResource ButtonBase}" Content="Объединить серии" Tag="Объедини серии: оставь один опенинг в начале и убери эндинги, рекапы и превью."
+                                        Click="AiChatSuggestion_Click" Padding="7,4" Margin="0,0,5,4"/>
+                                <Button Style="{StaticResource ButtonBase}" Content="Лучшие моменты" Tag="Собери монтаж из лучших моментов."
+                                        Click="AiChatSuggestion_Click" Padding="7,4" Margin="0,0,5,4"/>
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <TabControl x:Name="AiMontageTabControl" Grid.Row="1" Background="Transparent" BorderThickness="0" Visibility="Collapsed">
                     <TabItem Header="Материал">
                         <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
                             <TextBlock Text="Область материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
@@ -305,8 +460,14 @@
                             <ListBox x:Name="AiSourceListBox" ItemsSource="{Binding Project.Media}" SelectionMode="Extended" Height="112" Margin="0,0,0,9">
                                 <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" Margin="5,3"/></DataTemplate></ListBox.ItemTemplate>
                             </ListBox>
-                            <TextBlock Text="Профиль игры" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <ComboBox x:Name="AiGameProfileComboBox" DisplayMemberPath="DisplayName" Margin="0,4,0,8"/>
+                            <TextBlock Text="Профиль материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <ComboBox x:Name="AiGameProfileComboBox" Margin="0,4,0,8" SelectionChanged="AiMaterialProfile_Changed">
+                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
+                            </ComboBox>
+                            <TextBlock Text="Сценарий монтажа" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
+                            <ComboBox x:Name="AiScenarioComboBox" Margin="0,4,0,8">
+                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
+                            </ComboBox>
                             <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                 <StackPanel><TextBlock Text="Формат" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
                                     <ComboBox x:Name="AiTargetFormatComboBox" SelectedIndex="0" Margin="0,4,0,0" SelectionChanged="AiTargetFormat_Changed">
@@ -316,8 +477,10 @@
                                     <TextBox x:Name="AiTargetDurationTextBox" Text="720" Margin="0,4,0,0"/></StackPanel>
                             </Grid>
                             <TextBlock Text="Задание режиссёру" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <TextBox x:Name="AnalysisPromptTextBox" Text="Собери понятную историю из лучших игровых моментов"
+                            <TextBox x:Name="AnalysisPromptTextBox" Text="Собери понятную историю из лучших фрагментов материала"
                                      AcceptsReturn="True" TextWrapping="Wrap" Height="72" Margin="0,4,0,8"/>
+                            <Button x:Name="AiPreparePlanButton" Style="{StaticResource AccentButton}" Click="AiPreparePlan_Click"
+                                    Content="Подготовить план" Padding="10,8" Margin="0,0,0,10"/>
                             <TextBlock Text="Точный диапазон выбранного исходника" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
                             <Grid Margin="0,4,0,5"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                 <TextBox x:Name="AnalysisStartTextBox" Text="0:00"/><TextBox x:Name="AnalysisEndTextBox" Grid.Column="2" Text="0:00"/>
@@ -334,9 +497,11 @@
 
                     <TabItem Header="Анализ">
                         <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
-                            <CheckBox x:Name="UseLocalAiCheckBox" IsChecked="True" Content="Глубокий игровой анализ Ollama Vision" FontWeight="SemiBold"/>
+                            <CheckBox x:Name="UseLocalAiCheckBox" IsChecked="True" Content="Точный смысловой анализ Ollama Vision" FontWeight="SemiBold"/>
                             <Grid Margin="0,7,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <ComboBox x:Name="LocalAiModelComboBox" DisplayMemberPath="DisplayName" MinWidth="150"/>
+                                <ComboBox x:Name="LocalAiModelComboBox" MinWidth="150">
+                                    <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
+                                </ComboBox>
                                 <Button x:Name="RefreshLocalAiModelsButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="RefreshLocalAiModels_Click" Content="Обновить" Padding="8,5"/>
                             </Grid>
                             <TextBlock x:Name="LocalAiStatusTextBlock" Text="Проверка локальной модели…" Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,5,0,8"/>
@@ -366,13 +531,33 @@
                         <Grid Margin="3,10,3,6"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                             <StackPanel Grid.Row="0"><Button x:Name="AiGeneratePlanButton" Style="{StaticResource AccentButton}" Click="AiGeneratePlan_Click" Content="Составить план монтажа" Padding="10,8"/>
                                 <TextBlock x:Name="AiPlanSummaryTextBlock" Text="Сначала проанализируйте материал." Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,6,0,6"/></StackPanel>
-                            <ListBox x:Name="AiPlanItemsListBox" Grid.Row="1" MinHeight="180" SelectionChanged="AiPlanSelection_Changed">
-                                <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
-                                    <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Grid.Column="1" Text="{Binding LockLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
-                                        <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/><TextBlock Text="{Binding Reason}" TextWrapping="Wrap" FontSize="9" MaxHeight="36"/></StackPanel>
-                                </Border></DataTemplate></ListBox.ItemTemplate>
-                            </ListBox>
+                            <Grid Grid.Row="1"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                                <ListBox x:Name="AiPlanItemsListBox" MinHeight="120" SelectionChanged="AiPlanSelection_Changed">
+                                    <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
+                                        <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Grid.Column="1" Text="{Binding LockLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
+                                            <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/><TextBlock Text="{Binding Reason}" TextWrapping="Wrap" FontSize="9" MaxHeight="36"/></StackPanel>
+                                    </Border></DataTemplate></ListBox.ItemTemplate>
+                                </ListBox>
+                                <Expander Grid.Row="1" Header="Исключаемые блоки" IsExpanded="False" Margin="0,6,0,0">
+                                    <ListBox x:Name="AiExcludedSegmentsListBox" MaxHeight="120">
+                                        <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
+                                            <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                                <TextBlock Text="{Binding Title}" FontWeight="SemiBold"/><TextBlock Grid.Column="1" Text="{Binding ConfidenceLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
+                                                <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/>
+                                                <TextBlock Text="{Binding Evidence}" TextWrapping="Wrap" FontSize="9" MaxHeight="34"/>
+                                            </StackPanel>
+                                        </Border></DataTemplate></ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Expander>
+                                <TextBlock x:Name="AiDecisionsTitle" Grid.Row="2" Text="Требуется уточнение" FontWeight="SemiBold" Margin="0,7,0,4" Visibility="Collapsed"/>
+                                <Grid x:Name="AiDecisionsPanel" Grid.Row="3" Visibility="Collapsed"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                                    <ListBox x:Name="AiDecisionsListBox" MaxHeight="100">
+                                        <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Prompt}" TextWrapping="Wrap" FontSize="9" Margin="5,4"/></DataTemplate></ListBox.ItemTemplate>
+                                    </ListBox>
+                                    <Button Grid.Row="1" Style="{StaticResource ButtonBase}" Click="AiResolveDecision_Click" Content="Уточнить выбранное" Padding="7" Margin="0,5,0,0"/>
+                                </Grid>
+                            </Grid>
                             <StackPanel Grid.Row="2" Margin="0,7,0,0">
                                 <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                     <Button Style="{StaticResource ButtonBase}" Content="↑" Click="AiPlanMoveUp_Click"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="↓" Click="AiPlanMoveDown_Click"/><Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Замок" Click="AiPlanToggleLock_Click"/><Button Grid.Column="6" Style="{StaticResource ButtonBase}" Content="Убрать" Click="AiPlanRemove_Click"/>
@@ -404,7 +589,7 @@
                     </TabItem>
                 </TabControl>
 
-                <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                <StackPanel Grid.Row="2" Margin="0,8,0,0" Visibility="Collapsed">
                     <ProgressBar x:Name="AnalysisProgressBar" Height="5" Minimum="0" Maximum="100" Foreground="{StaticResource AccentBrush}" Visibility="Collapsed"/>
                     <TextBlock x:Name="AnalysisSummaryTextBlock" Text="Выберите материал и профиль игры." Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,5,0,0"/>
                 </StackPanel>
@@ -465,24 +650,29 @@
                 Visibility="Collapsed">
             <ScrollViewer VerticalScrollBarVisibility="Auto">
                 <StackPanel Margin="14">
-                    <TextBlock Text="Текст и субтитры" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Текст отображается в плеере и попадает в экспорт"
+                    <TextBlock Text="Текст" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="Добавьте текст и настройте его прямо в плеере"
                                Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,12" />
                     <Grid Margin="0,0,0,8">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                        <Button Style="{StaticResource AccentButton}" Click="CreateTextOverlay_Click" Content="Добавить текст" Padding="8,7" />
-                        <Button x:Name="AutoSubtitlesButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="AutoSubtitles_Click" Content="Автосубтитры" Padding="8,7" />
+                        <Button Style="{StaticResource AccentButton}" Click="CreateTextOverlay_Click" Content="+ Текст" Padding="8,7" />
+                        <Button x:Name="AutoSubtitlesButton" Grid.Column="2" Style="{StaticResource ButtonBase}"
+                                Click="TopMenuButton_Click" Content="Субтитры  ▾" Padding="8,7">
+                            <Button.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="Создать автоматически" Click="AutoSubtitles_Click" />
+                                    <MenuItem Header="Импортировать SRT…" Click="ImportSrt_Click" />
+                                    <Separator />
+                                    <MenuItem Header="Настроить whisper.cpp…" Click="ConfigureWhisper_Click" />
+                                </ContextMenu>
+                            </Button.ContextMenu>
+                        </Button>
                     </Grid>
-                    <TextBlock x:Name="WhisperStatusText"
-                               Foreground="{StaticResource MutedTextBrush}"
-                               FontSize="9"
-                               TextWrapping="Wrap"
-                               Margin="0,0,0,8" />
-                    <Button Style="{StaticResource ButtonBase}" Click="ImportSrt_Click" Content="Импортировать SRT…" Padding="8,7" Margin="0,0,0,10" />
 
                     <ListBox x:Name="TextOverlayList"
                              ItemsSource="{Binding Project.TextOverlays}"
-                             Height="105"
+                             MaxHeight="150"
+                             MinHeight="56"
                              SelectionChanged="TextOverlayList_SelectionChanged"
                              Margin="0,0,0,12">
                         <ListBox.ItemTemplate>
@@ -496,7 +686,10 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <StackPanel x:Name="TextPropertiesPanel">
+                    <TextBlock x:Name="TextEmptyState" Text="Выберите текст для редактирования"
+                               Foreground="{StaticResource MutedTextBrush}" TextAlignment="Center"
+                               TextWrapping="Wrap" Margin="12,22" />
+                    <StackPanel x:Name="TextPropertiesPanel" Visibility="Collapsed">
                     <TextBlock Text="Содержимое" Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
                     <TextBox Text="{Binding Text, UpdateSourceTrigger=PropertyChanged}"
                              AcceptsReturn="True" TextWrapping="Wrap" Height="58"
@@ -507,21 +700,16 @@
                         <StackPanel Grid.Column="2"><TextBlock Text="Длительность, сек." FontSize="9" Foreground="{StaticResource MutedTextBrush}"/><TextBox Text="{Binding Duration, UpdateSourceTrigger=LostFocus, StringFormat=0.00}" LostKeyboardFocus="TextOverlayEdit_End"/></StackPanel>
                     </Grid>
                     <Grid Margin="0,0,0,10">
-                        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="90"/></Grid.ColumnDefinitions>
-                        <ComboBox SelectedValue="{Binding FontFamily}" SelectedValuePath="Content" DropDownClosed="TextOverlayCombo_Closed">
-                            <ComboBoxItem Content="Segoe UI"/><ComboBoxItem Content="Arial"/><ComboBoxItem Content="Impact"/><ComboBoxItem Content="Times New Roman"/>
-                        </ComboBox>
-                        <TextBox Grid.Column="2" Text="{Binding FontSize, UpdateSourceTrigger=LostFocus, StringFormat=0}" ToolTip="Размер шрифта" LostKeyboardFocus="TextOverlayEdit_End" />
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="90"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <StackPanel><TextBlock Text="Размер" FontSize="9" Foreground="{StaticResource MutedTextBrush}"/>
+                            <TextBox Text="{Binding FontSize, UpdateSourceTrigger=LostFocus, StringFormat=0}" LostKeyboardFocus="TextOverlayEdit_End" /></StackPanel>
+                        <StackPanel Grid.Column="2"><TextBlock Text="Цвет" FontSize="9" Foreground="{StaticResource MutedTextBrush}"/>
+                            <ComboBox SelectedValue="{Binding Color}" SelectedValuePath="Tag" DropDownClosed="TextOverlayCombo_Closed">
+                                <ComboBoxItem Content="Белый" Tag="#FFFFFF"/><ComboBoxItem Content="Жёлтый" Tag="#FFE66D"/><ComboBoxItem Content="Голубой" Tag="#7DD3FC"/><ComboBoxItem Content="Розовый" Tag="#F9A8D4"/><ComboBoxItem Content="Зелёный" Tag="#86EFAC"/>
+                            </ComboBox></StackPanel>
                     </Grid>
-                    <TextBlock Text="Положение по горизонтали" FontSize="9" Foreground="{StaticResource MutedTextBrush}" />
-                    <Slider Minimum="0" Maximum="1" Value="{Binding X}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
-                    <TextBlock Text="Положение по вертикали" FontSize="9" Foreground="{StaticResource MutedTextBrush}" Margin="0,5,0,0" />
-                    <Slider Minimum="0" Maximum="1" Value="{Binding Y}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" />
-                    <TextBlock Text="Поворот" FontSize="9" Foreground="{StaticResource MutedTextBrush}" Margin="0,5,0,0" />
-                    <Slider Minimum="-180" Maximum="180" Value="{Binding Rotation}" PreviewMouseLeftButtonUp="TextOverlayEdit_End" Margin="0,0,0,10" />
-                    <ComboBox SelectedValue="{Binding Color}" SelectedValuePath="Tag" DropDownClosed="TextOverlayCombo_Closed" Margin="0,0,0,10">
-                        <ComboBoxItem Content="Белый" Tag="#FFFFFF"/><ComboBoxItem Content="Жёлтый" Tag="#FFE66D"/><ComboBoxItem Content="Голубой" Tag="#7DD3FC"/><ComboBoxItem Content="Розовый" Tag="#F9A8D4"/><ComboBoxItem Content="Зелёный" Tag="#86EFAC"/>
-                    </ComboBox>
+                    <TextBlock Text="Положение и размер меняются рамкой в плеере"
+                               Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,0,0,10" />
                     </StackPanel>
                     <Button Style="{StaticResource ButtonBase}" Click="DeleteTextOverlay_Click" Content="Удалить выбранный текст" Foreground="#FFBBC2" BorderBrush="#70404A" Padding="8,7" />
                 </StackPanel>
@@ -535,27 +723,53 @@
                 BorderBrush="{StaticResource BorderBrush}"
                 BorderThickness="0,0,1,0"
                 Visibility="Collapsed">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <StackPanel Margin="14">
                 <TextBlock Text="Переходы" FontSize="18" FontWeight="SemiBold" />
-                <TextBlock Text="Выберите левый клип у склейки. Переход использует доступные края исходников."
-                           Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,14" />
-                <TextBlock Text="Тип" Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
-                <ComboBox x:Name="TransitionKindComboBox" SelectedIndex="0" Margin="0,4,0,10">
-                    <ComboBoxItem Content="Перекрёстное растворение" Tag="CrossDissolve" />
-                    <ComboBoxItem Content="Затемнение в чёрный" Tag="DipToBlack" />
-                    <ComboBoxItem Content="Затемнение в белый" Tag="DipToWhite" />
-                    <ComboBoxItem Content="Вытеснение" Tag="Wipe" />
-                    <ComboBoxItem Content="Сдвиг" Tag="Slide" />
-                    <ComboBoxItem Content="Плавный аудиопереход" Tag="ConstantPowerAudio" />
-                </ComboBox>
+                <TextBlock Text="Наведите на карточку, чтобы посмотреть эффект"
+                           Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,12" />
+                <UniformGrid Columns="2" Margin="-4,0,-4,10">
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}" IsChecked="True"
+                                 Tag="{x:Static domain:TransitionKind.CrossDissolve}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="CrossDissolve" Height="58"/><TextBlock Text="Растворение" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}"
+                                 Tag="{x:Static domain:TransitionKind.DipToBlack}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="DipToBlack" Height="58"/><TextBlock Text="В чёрный" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}"
+                                 Tag="{x:Static domain:TransitionKind.DipToWhite}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="DipToWhite" Height="58"/><TextBlock Text="В белый" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}"
+                                 Tag="{x:Static domain:TransitionKind.Wipe}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="Wipe" Height="58"/><TextBlock Text="Вытеснение" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}"
+                                 Tag="{x:Static domain:TransitionKind.Slide}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="Slide" Height="58"/><TextBlock Text="Сдвиг" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                    <RadioButton GroupName="TransitionPreset" Style="{StaticResource TransitionCard}"
+                                 Tag="{x:Static domain:TransitionKind.ConstantPowerAudio}" Click="TransitionPreset_Click">
+                        <StackPanel><controls:TransitionPreviewControl Kind="ConstantPowerAudio" Height="58"/><TextBlock Text="Аудио" FontSize="10" Margin="2,5,2,0"/></StackPanel>
+                    </RadioButton>
+                </UniformGrid>
                 <TextBlock Text="Длительность, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="10" />
                 <TextBox x:Name="TransitionDurationTextBox" Text="1.0" Margin="0,4,0,12" />
                 <Button Style="{StaticResource AccentButton}" Click="AddTransition_Click" Content="Добавить на выбранную склейку" Padding="8,8" />
                 <TextBlock x:Name="TransitionStatusText" Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,10,0,12" />
                 <TextBlock Text="Переходы проекта" FontWeight="SemiBold" Margin="0,0,0,6" />
-                <ListBox x:Name="TransitionListBox" Height="180" DisplayMemberPath="Label" Margin="0,0,0,10" />
+                <ListBox x:Name="TransitionListBox" MaxHeight="160" MinHeight="52" Margin="0,0,0,10">
+                    <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,2">
+                        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <StackPanel><TextBlock Text="{Binding Title}" FontWeight="SemiBold"/><TextBlock Text="{Binding Details}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/></StackPanel>
+                            <TextBlock Grid.Column="1" Text="{Binding TrackLabel}" Foreground="#CBB8FF" FontSize="9" Margin="8,0,0,0"/>
+                        </Grid>
+                    </Border></DataTemplate></ListBox.ItemTemplate>
+                </ListBox>
                 <Button Style="{StaticResource ButtonBase}" Click="DeleteTransition_Click" Content="Удалить выбранный переход" Foreground="#FFBBC2" BorderBrush="#70404A" Padding="8,7" />
             </StackPanel>
+            </ScrollViewer>
         </Border>
 
         <GridSplitter Grid.Row="1"

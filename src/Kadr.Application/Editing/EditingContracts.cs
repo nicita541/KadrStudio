@@ -13,10 +13,12 @@ public sealed record EditTransaction(
     string Description,
     IReadOnlyList<IEditCommand> Commands,
     bool CreateCheckpoint = false,
-    string? CheckpointName = null)
+    string? CheckpointName = null,
+    bool RecordInHistory = true,
+    bool SynchronizeActiveSequence = true)
 {
     public EditTransaction(string description, params IEditCommand[] commands)
-        : this(description, commands, false, null)
+        : this(description, commands, false, null, true, true)
     {
     }
 }

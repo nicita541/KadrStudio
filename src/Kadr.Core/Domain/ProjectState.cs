@@ -236,6 +236,7 @@ public sealed record ProjectState
     public ImmutableArray<SourceAnnotation> SourceAnnotations { get; init; } = [];
     public ImmutableArray<MediaAnalysisReference> AnalysisReferences { get; init; } = [];
     public ImmutableArray<MontagePlan> MontagePlans { get; init; } = [];
+    public AiConversation AiConversation { get; init; } = AiConversation.Create();
     public TimelineTime? InPoint { get; init; }
     public TimelineTime? OutPoint { get; init; }
 

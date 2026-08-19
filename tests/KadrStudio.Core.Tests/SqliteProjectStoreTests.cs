@@ -43,8 +43,9 @@ public sealed class SqliteProjectStoreTests
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM text_clips;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM markers;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM transitions;"));
-        Assert.Equal(4L, await ScalarInt64Async(connection,
+        Assert.Equal(5L, await ScalarInt64Async(connection,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM ai_conversation;"));
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
         Assert.Equal(0L, await ScalarInt64Async(connection,
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='project_state';"));
@@ -179,7 +180,7 @@ public sealed class SqliteProjectStoreTests
     }
 
     [Fact]
-    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v4()
+    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v5()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "v2.kadr");
@@ -195,6 +196,8 @@ public sealed class SqliteProjectStoreTests
                 DROP TABLE video_clip_details;
                 DROP TABLE media_source_details;
                 DROP TABLE sequence_settings;
+                DROP TABLE ai_chat_messages;
+                DROP TABLE ai_conversation;
                 UPDATE metadata SET value='2' WHERE key='schema_version';
                 """;
             await command.ExecuteNonQueryAsync();
@@ -211,10 +214,36 @@ public sealed class SqliteProjectStoreTests
         await store.SaveAsync(path, loaded);
         await using var migrated = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
         await migrated.OpenAsync();
-        Assert.Equal(4L, await ScalarInt64Async(migrated,
+        Assert.Equal(5L, await ScalarInt64Async(migrated,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(1L, await ScalarInt64Async(migrated,
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transitions';"));
+    }
+
+    [Fact]
+    public async Task Ai_conversation_roundtrips_and_running_operation_becomes_interrupted()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "chat.kadr");
+        var store = new SqliteProjectStore();
+        var project = CreateProject();
+        var now = DateTimeOffset.UtcNow;
+        var conversation = new AiConversation(Guid.NewGuid(), now, now,
+        [
+            new AiChatMessage(Guid.NewGuid(), AiChatRole.User, AiChatMessageKind.Text, "Объедини серии", now),
+            new AiChatMessage(Guid.NewGuid(), AiChatRole.Assistant, AiChatMessageKind.Progress,
+                "Анализ…", now, AiChatOperationState.Running, 42)
+        ]);
+
+        await store.SaveAsync(path, project with { AiConversation = conversation });
+        var loaded = await store.LoadAsync(path);
+
+        Assert.Equal(conversation.Id, loaded.AiConversation.Id);
+        Assert.Equal(2, loaded.AiConversation.Messages.Length);
+        Assert.Equal("Объедини серии", loaded.AiConversation.Messages[0].Text);
+        Assert.Equal(AiChatMessageKind.Error, loaded.AiConversation.Messages[1].Kind);
+        Assert.Equal(AiChatOperationState.Interrupted, loaded.AiConversation.Messages[1].OperationState);
+        Assert.Contains("прервана", loaded.AiConversation.Messages[1].Text, StringComparison.OrdinalIgnoreCase);
     }
 
     private static ProjectState CreateProject()
@@ -294,6 +323,8 @@ public sealed class SqliteProjectStoreTests
         Assert.True(expected.TextClips.SequenceEqual(actual.TextClips));
         Assert.True(expected.Transitions.SequenceEqual(actual.Transitions));
         Assert.True(expected.Markers.SequenceEqual(actual.Markers));
+        Assert.Equal(expected.AiConversation.Id, actual.AiConversation.Id);
+        Assert.True(expected.AiConversation.Messages.SequenceEqual(actual.AiConversation.Messages));
         Assert.Equal(expected.InPoint, actual.InPoint);
         Assert.Equal(expected.OutPoint, actual.OutPoint);
     }

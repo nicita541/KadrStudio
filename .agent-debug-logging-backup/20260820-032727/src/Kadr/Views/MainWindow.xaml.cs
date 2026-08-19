@@ -13,7 +13,6 @@ using System.Windows.Threading;
 using KadrStudio.Controls;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Automation.Agent;
-using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Editing;
 using KadrStudio.Models;
@@ -1364,32 +1363,12 @@ public partial class MainWindow : Window
         }
 
         var activeTask = _viewModel.CurrentAgentTask;
-
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "user_message",
-            activeTask?.Id,
-            activeTask?.Phase.ToString(),
-            Message: prompt,
-            Details:
-                $"source_sequence_id={activeTask?.SourceSequenceId.ToString() ?? _viewModel.CoreState.ActiveSequenceId.ToString()}\n" +
-                $"draft_sequence_id={activeTask?.DraftSequenceId?.ToString() ?? "null"}"));
-
         if (activeTask is { IsTerminal: false } &&
             activeTask.Phase is not (
                 AgentTaskPhase.WaitingForUserInput or
                 AgentTaskPhase.WaitingForApproval or
                 AgentTaskPhase.Approved))
         {
-            _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-                DateTimeOffset.UtcNow,
-                "chat_ui",
-                "message_rejected",
-                activeTask.Id,
-                activeTask.Phase.ToString(),
-                Message: "User tried to send a message while the agent was not paused."));
-
             AppendAiChatError(
                 "Агент уже выполняет задачу. Дождитесь паузы или остановите её.");
             return;
@@ -1521,16 +1500,6 @@ public partial class MainWindow : Window
         catch (Exception exception)
         {
             var task = _viewModel.CurrentAgentTask;
-
-            _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-                DateTimeOffset.UtcNow,
-                "chat_ui",
-                "unhandled_agent_exception",
-                task?.Id,
-                task?.Phase.ToString(),
-                Message: exception.Message,
-                Exception: exception.ToString()));
-
             if (task is { IsTerminal: false })
             {
                 task = _viewModel.AiAgentOrchestrator.Fail(exception.Message);
@@ -1538,7 +1507,7 @@ public partial class MainWindow : Window
 
             CompleteChatProgress(
                 progressMessage.Id,
-                WithAgentDebugLog(exception.Message),
+                exception.Message,
                 KadrStudio.Core.Domain.AiChatMessageKind.Error,
                 KadrStudio.Core.Domain.AiChatOperationState.Failed);
 
@@ -1586,8 +1555,7 @@ public partial class MainWindow : Window
             case AgentTaskPhase.Failed:
                 CompleteChatProgress(
                     progressMessageId,
-                    WithAgentDebugLog(
-                        state.FailureMessage ?? "Агент не смог подготовить план."),
+                    state.FailureMessage ?? "Агент не смог подготовить план.",
                     KadrStudio.Core.Domain.AiChatMessageKind.Error,
                     KadrStudio.Core.Domain.AiChatOperationState.Failed);
                 break;
@@ -1633,8 +1601,7 @@ public partial class MainWindow : Window
             case AgentTaskPhase.Failed:
                 CompleteChatProgress(
                     progressMessageId,
-                    WithAgentDebugLog(
-                        state.FailureMessage ?? "Агент остановился из-за ошибки."),
+                    state.FailureMessage ?? "Агент остановился из-за ошибки.",
                     KadrStudio.Core.Domain.AiChatMessageKind.Error,
                     KadrStudio.Core.Domain.AiChatOperationState.Failed);
                 if (state.DraftSequenceId is not null)
@@ -1691,15 +1658,6 @@ public partial class MainWindow : Window
             AgentQuestionId: question.Id);
 
         SaveAiConversation(_aiChatCoordinator.Append(conversation, message));
-
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "assistant_question",
-            task.Id,
-            task.Phase.ToString(),
-            Message: text,
-            Details: $"question_id={question.Id}"));
     }
 
     private void AppendAgentPlan(AgentTaskState task)
@@ -1742,19 +1700,6 @@ public partial class MainWindow : Window
             AgentPlanVersion: plan.Version);
 
         SaveAiConversation(_aiChatCoordinator.Append(conversation, message));
-
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "assistant_plan",
-            task.Id,
-            task.Phase.ToString(),
-            Message: plan.Summary,
-            Details:
-                $"version={plan.Version}\n" +
-                $"objective={plan.Objective}\n" +
-                $"constraints={string.Join(" | ", plan.Constraints)}\n" +
-                $"steps={string.Join(" | ", steps)}"));
     }
 
     private void AppendAgentDraftMessage(
@@ -1786,15 +1731,6 @@ public partial class MainWindow : Window
             AgentPlanVersion: task.Plan?.Version);
 
         SaveAiConversation(_aiChatCoordinator.Append(conversation, message));
-
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "assistant_draft",
-            task.Id,
-            task.Phase.ToString(),
-            Message: text,
-            Details: $"sequence_id={sequenceId}"));
     }
 
     private KadrStudio.Core.Domain.AiConversation DisableAgentPlanCards(
@@ -2100,16 +2036,6 @@ public partial class MainWindow : Window
             OperationState = state,
             ProgressPercent = 100
         }));
-
-        var task = _viewModel.CurrentAgentTask;
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "assistant_message_completed",
-            existing.AgentTaskId ?? task?.Id,
-            task?.Phase.ToString(),
-            Message: text,
-            Details: $"kind={kind}; operation_state={state}; message_id={messageId}"));
     }
 
     private void SetAiChatBusy(bool busy)
@@ -2596,31 +2522,11 @@ public partial class MainWindow : Window
 
     private void AppendAiChatError(string text)
     {
-        var task = _viewModel.CurrentAgentTask;
-        var displayText = WithAgentDebugLog(text);
-
-        _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "chat_ui",
-            "assistant_error",
-            task?.Id,
-            task?.Phase.ToString(),
-            Message: text));
-
         var message = new KadrStudio.Core.Domain.AiChatMessage(
             Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
-            KadrStudio.Core.Domain.AiChatMessageKind.Error, displayText, DateTimeOffset.UtcNow,
-            KadrStudio.Core.Domain.AiChatOperationState.Failed,
-            AgentTaskId: task?.Id);
+            KadrStudio.Core.Domain.AiChatMessageKind.Error, text, DateTimeOffset.UtcNow,
+            KadrStudio.Core.Domain.AiChatOperationState.Failed);
         SaveAiConversation(_aiChatCoordinator.Append(_viewModel.GetAiConversation(), message));
-    }
-
-    private string WithAgentDebugLog(string text)
-    {
-        var path = _viewModel.AgentDebugLogPath;
-        return string.IsNullOrWhiteSpace(path)
-            ? text
-            : $"{text}\n\nDebug log: {path}";
     }
 
     private static string FormatBoundaryTime(KadrStudio.Core.Domain.TimelineTime time)

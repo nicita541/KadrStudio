@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Text.Json;
-using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Tools;
 
 namespace KadrStudio.Application.Automation.Agent.Runtime;
@@ -19,7 +18,6 @@ public sealed class AgentExecutionLoop
     private readonly AgentExecutionLoopOptions _options;
     private readonly Func<ImmutableArray<AgentConversationContextMessage>> _conversationProvider;
     private readonly Func<ImmutableArray<AgentModelObservation>> _seedObservationProvider;
-    private readonly IAgentDebugLog _debugLog;
     private readonly SemaphoreSlim _runGate = new(1, 1);
 
     private readonly List<AgentModelObservation> _observations = [];
@@ -37,8 +35,7 @@ public sealed class AgentExecutionLoop
         IAgentModel model,
         AgentExecutionLoopOptions? options = null,
         Func<ImmutableArray<AgentConversationContextMessage>>? conversationProvider = null,
-        Func<ImmutableArray<AgentModelObservation>>? seedObservationProvider = null,
-        IAgentDebugLog? debugLog = null)
+        Func<ImmutableArray<AgentModelObservation>>? seedObservationProvider = null)
     {
         _orchestrator = orchestrator ?? throw new ArgumentNullException(nameof(orchestrator));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
@@ -49,7 +46,6 @@ public sealed class AgentExecutionLoop
             conversationProvider ?? (() => ImmutableArray<AgentConversationContextMessage>.Empty);
         _seedObservationProvider =
             seedObservationProvider ?? (() => ImmutableArray<AgentModelObservation>.Empty);
-        _debugLog = debugLog ?? NullAgentDebugLog.Instance;
         _options.Validate();
     }
 
@@ -72,11 +68,6 @@ public sealed class AgentExecutionLoop
         {
             var task = RequireCurrentTask();
             EnsureMemoryFor(task.Id);
-
-            Log(
-                task,
-                "run_started",
-                message: "Execution/verification loop started or resumed.");
 
             if (task.IsTerminal ||
                 task.Phase == AgentTaskPhase.WaitingForUserInput)
@@ -113,38 +104,19 @@ public sealed class AgentExecutionLoop
                 AgentModelDecision decision;
                 try
                 {
-                    var tools = GetExecutionToolDescriptors();
-                    var observations = GetObservationContext();
-                    var conversation = GetConversationContext();
-                    var mode = task.Phase == AgentTaskPhase.Verifying
-                        ? AgentModelTurnMode.Verification
-                        : AgentModelTurnMode.Execution;
-
-                    Log(
-                        task,
-                        "model_turn_requested",
-                        turn,
-                        $"Preparing {mode} model turn {turn}.",
-                        $"tools={tools.Length}; observations={observations.Length}; conversation_messages={conversation.Length}");
-
                     var request = new AgentModelTurnRequest(
                         task,
-                        tools,
-                        observations,
-                        conversation,
+                        GetExecutionToolDescriptors(),
+                        GetObservationContext(),
+                        GetConversationContext(),
                         turn,
-                        mode);
+                        task.Phase == AgentTaskPhase.Verifying
+                            ? AgentModelTurnMode.Verification
+                            : AgentModelTurnMode.Execution);
 
                     decision = await _model.DecideAsync(
                         request,
                         cancellationToken);
-
-                    Log(
-                        task,
-                        "model_decision",
-                        turn,
-                        $"Model selected action '{decision.Action}'.",
-                        DescribeDecision(decision));
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -152,13 +124,6 @@ public sealed class AgentExecutionLoop
                 }
                 catch (Exception exception)
                 {
-                    LogException(
-                        task,
-                        "model_turn_failed",
-                        turn,
-                        exception,
-                        "Execution/verification model turn failed before a valid decision was produced.");
-
                     return FailTask(
                         $"Agent model failed while executing the approved plan: {exception.Message}");
                 }
@@ -540,81 +505,9 @@ public sealed class AgentExecutionLoop
     private AgentTaskState FailTask(string message)
     {
         var task = RequireCurrentTask();
-        if (task.IsTerminal)
-        {
-            return task;
-        }
-
-        Log(
-            task,
-            "task_failed",
-            message: message);
-
-        return _orchestrator.Fail(LimitText(message, 4_000));
-    }
-
-    private void Log(
-        AgentTaskState task,
-        string eventName,
-        int? turn = null,
-        string? message = null,
-        string? details = null)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "execution_loop",
-            eventName,
-            task.Id,
-            task.Phase.ToString(),
-            turn,
-            message,
-            details));
-    }
-
-    private void LogException(
-        AgentTaskState task,
-        string eventName,
-        int? turn,
-        Exception exception,
-        string? message = null)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "execution_loop",
-            eventName,
-            task.Id,
-            task.Phase.ToString(),
-            turn,
-            message ?? exception.Message,
-            Exception: exception.ToString()));
-    }
-
-    private static string DescribeDecision(AgentModelDecision decision)
-    {
-        var toolArguments = decision.ToolArguments.ValueKind == JsonValueKind.Object
-            ? decision.ToolArguments.GetRawText()
-            : "{}";
-
-        return
-            $"action={decision.Action}; " +
-            $"progress={LimitTextForLog(decision.Progress, 2_000)}; " +
-            $"tool_name={decision.ToolName}; " +
-            $"tool_arguments={LimitTextForLog(toolArguments, 12_000)}; " +
-            $"question={LimitTextForLog(decision.Question, 4_000)}; " +
-            $"completion={LimitTextForLog(decision.CompletionSummary, 4_000)}";
-    }
-
-    private static string LimitTextForLog(string? value, int maximumCharacters)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var normalized = value.Trim();
-        return normalized.Length <= maximumCharacters
-            ? normalized
-            : normalized[..maximumCharacters] + "…";
+        return task.IsTerminal
+            ? task
+            : _orchestrator.Fail(LimitText(message, 4_000));
     }
 
     private static string LimitText(string value, int maximumCharacters)

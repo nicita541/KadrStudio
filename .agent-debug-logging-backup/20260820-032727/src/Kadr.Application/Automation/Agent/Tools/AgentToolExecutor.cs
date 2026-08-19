@@ -1,5 +1,3 @@
-using KadrStudio.Application.Automation.Agent.Diagnostics;
-
 namespace KadrStudio.Application.Automation.Agent.Tools;
 
 /// <summary>
@@ -23,18 +21,15 @@ public sealed class AgentToolExecutor
     private readonly AgentToolRegistry _registry;
     private readonly AgentToolExecutorOptions _options;
     private readonly Func<DateTimeOffset> _utcNow;
-    private readonly IAgentDebugLog _debugLog;
 
     public AgentToolExecutor(
         AgentToolRegistry registry,
         AgentToolExecutorOptions? options = null,
-        Func<DateTimeOffset>? utcNow = null,
-        IAgentDebugLog? debugLog = null)
+        Func<DateTimeOffset>? utcNow = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _options = options ?? AgentToolExecutorOptions.Default;
         _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
-        _debugLog = debugLog ?? NullAgentDebugLog.Instance;
 
         if (_options.MaxObservationCharacters <= 0)
         {
@@ -54,19 +49,9 @@ public sealed class AgentToolExecutor
 
         var startedAt = _utcNow();
 
-        _debugLog.Write(new AgentDebugLogEntry(
-            startedAt,
-            "tool_executor",
-            "tool_call_requested",
-            task.Id,
-            task.Phase.ToString(),
-            Message: call.ToolName,
-            Details: SafeJson(call.Arguments)));
-
         if (call.TaskId != task.Id)
         {
             return Rejected(
-                task,
                 call,
                 "task_mismatch",
                 "Tool call does not belong to the active agent task.",
@@ -76,7 +61,6 @@ public sealed class AgentToolExecutor
         if (task.IsTerminal)
         {
             return Rejected(
-                task,
                 call,
                 "task_terminal",
                 "Tools cannot run after the agent task has finished.",
@@ -86,7 +70,6 @@ public sealed class AgentToolExecutor
         if (!AllowedReadPhases.Contains(task.Phase))
         {
             return Rejected(
-                task,
                 call,
                 "phase_not_executable",
                 $"Tools cannot run while the agent task is in phase '{task.Phase}'.",
@@ -96,7 +79,6 @@ public sealed class AgentToolExecutor
         if (!_registry.TryGet(call.ToolName, out var tool) || tool is null)
         {
             return Rejected(
-                task,
                 call,
                 "tool_not_found",
                 $"Agent tool '{call.ToolName}' is not registered.",
@@ -108,7 +90,6 @@ public sealed class AgentToolExecutor
             if (task.Phase is not (AgentTaskPhase.Executing or AgentTaskPhase.Verifying))
             {
                 return Rejected(
-                    task,
                     call,
                     "editing_phase_required",
                     "Editing tools are available only while executing or verifying an approved agent draft.",
@@ -119,7 +100,6 @@ public sealed class AgentToolExecutor
                 draftSequenceId == task.SourceSequenceId)
             {
                 return Rejected(
-                    task,
                     call,
                     "draft_required",
                     "Editing tools require a separate agent draft sequence.",
@@ -140,7 +120,6 @@ public sealed class AgentToolExecutor
             if (string.IsNullOrWhiteSpace(output.Summary))
             {
                 return Failed(
-                    task,
                     call,
                     "invalid_tool_output",
                     "Tool returned an empty summary.",
@@ -151,14 +130,13 @@ public sealed class AgentToolExecutor
             if (rawData.Length > _options.MaxObservationCharacters)
             {
                 return Rejected(
-                    task,
                     call,
                     "observation_too_large",
                     $"Tool observation exceeded the {_options.MaxObservationCharacters} character limit.",
                     startedAt);
             }
 
-            var result = new AgentToolResult(
+            return new AgentToolResult(
                 call.Id,
                 tool.Descriptor.Name,
                 AgentToolResultStatus.Succeeded,
@@ -167,9 +145,6 @@ public sealed class AgentToolExecutor
                 null,
                 startedAt,
                 _utcNow());
-
-            LogResult(task, result);
-            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -178,7 +153,6 @@ public sealed class AgentToolExecutor
         catch (AgentToolInputException exception)
         {
             return Rejected(
-                task,
                 call,
                 "invalid_arguments",
                 exception.Message,
@@ -187,7 +161,6 @@ public sealed class AgentToolExecutor
         catch (AgentToolRejectedException exception)
         {
             return Rejected(
-                task,
                 call,
                 exception.ErrorCode,
                 exception.Message,
@@ -195,18 +168,7 @@ public sealed class AgentToolExecutor
         }
         catch (Exception exception)
         {
-            _debugLog.Write(new AgentDebugLogEntry(
-                _utcNow(),
-                "tool_executor",
-                "tool_exception",
-                task.Id,
-                task.Phase.ToString(),
-                Message: call.ToolName,
-                Details: SafeJson(call.Arguments),
-                Exception: exception.ToString()));
-
             return Failed(
-                task,
                 call,
                 "tool_failed",
                 exception.Message,
@@ -215,13 +177,11 @@ public sealed class AgentToolExecutor
     }
 
     private AgentToolResult Rejected(
-        AgentTaskState task,
         AgentToolCall call,
         string errorCode,
         string summary,
         DateTimeOffset startedAt)
-    {
-        var result = new AgentToolResult(
+        => new(
             call.Id,
             call.ToolName,
             AgentToolResultStatus.Rejected,
@@ -231,18 +191,12 @@ public sealed class AgentToolExecutor
             startedAt,
             _utcNow());
 
-        LogResult(task, result);
-        return result;
-    }
-
     private AgentToolResult Failed(
-        AgentTaskState task,
         AgentToolCall call,
         string errorCode,
         string summary,
         DateTimeOffset startedAt)
-    {
-        var result = new AgentToolResult(
+        => new(
             call.Id,
             call.ToolName,
             AgentToolResultStatus.Failed,
@@ -251,43 +205,4 @@ public sealed class AgentToolExecutor
             errorCode,
             startedAt,
             _utcNow());
-
-        LogResult(task, result);
-        return result;
-    }
-
-    private static string SafeJson(System.Text.Json.JsonElement value)
-    {
-        try
-        {
-            return value.ValueKind == System.Text.Json.JsonValueKind.Undefined
-                ? "<undefined>"
-                : value.GetRawText();
-        }
-        catch
-        {
-            return "<unavailable>";
-        }
-    }
-
-    private void LogResult(
-        AgentTaskState task,
-        AgentToolResult result)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            result.CompletedAt,
-            "tool_executor",
-            "tool_result",
-            task.Id,
-            task.Phase.ToString(),
-            Message:
-                $"{result.ToolName}: {result.Status}" +
-                (string.IsNullOrWhiteSpace(result.ErrorCode)
-                    ? string.Empty
-                    : $" ({result.ErrorCode})"),
-            Details:
-                $"summary={result.Summary}\n" +
-                $"duration_ms={result.Duration.TotalMilliseconds:0.###}\n" +
-                $"data={(result.Data is { } data ? data.GetRawText() : "null")}"));
-    }
 }

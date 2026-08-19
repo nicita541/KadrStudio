@@ -7,6 +7,7 @@ using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Automation.Agent;
+using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.Editing;
@@ -101,6 +102,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             AiMontageAnalysisService,
             new OllamaMontagePlanningProvider(OllamaVideoAnalysisService));
 
+        AgentDebugLog = new FileAgentDebugLog();
         AiAgentOrchestrator = new AiAgentOrchestrator();
         var agentRangeInspector = new AgentMediaRangeInspector(
             AutomationOrchestrator,
@@ -117,23 +119,38 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AgentEditingToolSet.RegisterDefaults(
             AgentToolRegistry,
             AgentEditingToolBackend);
-        AgentToolExecutor = new AgentToolExecutor(AgentToolRegistry);
-        AgentModel = new OllamaAgentModel(OllamaVideoAnalysisService);
+        AgentToolExecutor = new AgentToolExecutor(
+            AgentToolRegistry,
+            debugLog: AgentDebugLog);
+        AgentModel = new OllamaAgentModel(
+            OllamaVideoAnalysisService,
+            AgentDebugLog);
         AgentPlanningLoop = new AgentPlanningLoop(
             AiAgentOrchestrator,
             AgentToolRegistry,
             AgentToolExecutor,
             AgentModel,
-            conversationProvider: BuildAgentConversationContext);
+            conversationProvider: BuildAgentConversationContext,
+            debugLog: AgentDebugLog);
         AgentExecutionLoop = new AgentExecutionLoop(
             AiAgentOrchestrator,
             AgentToolRegistry,
             AgentToolExecutor,
             AgentModel,
             conversationProvider: BuildAgentConversationContext,
-            seedObservationProvider: () => AgentPlanningLoop.Observations);
-        AiAgentOrchestrator.TaskChanged += (_, _) =>
+            seedObservationProvider: () => AgentPlanningLoop.Observations,
+            debugLog: AgentDebugLog);
+        AiAgentOrchestrator.TaskChanged += (_, args) =>
         {
+            AgentDebugLog.Write(new AgentDebugLogEntry(
+                DateTimeOffset.UtcNow,
+                "orchestrator",
+                "task_changed",
+                args.State.Id,
+                args.State.Phase.ToString(),
+                Message: args.State.UserRequest,
+                Details: DescribeAgentTaskForDebug(args.State)));
+
             OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
             OnPropertyChanged(nameof(CurrentAgentTask));
         };
@@ -154,6 +171,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public AiMontageAnalysisService AiMontageAnalysisService { get; }
     public IAiMontageCoordinator AiMontageCoordinator { get; }
+    public IAgentDebugLog AgentDebugLog { get; }
+    public string? AgentDebugLogPath => AgentDebugLog.CurrentLogPath;
     public AiAgentOrchestrator AiAgentOrchestrator { get; }
     public KadrAgentReadOnlyToolBackend AgentReadOnlyToolBackend { get; }
     public KadrAgentEditingToolBackend AgentEditingToolBackend { get; }
@@ -702,6 +721,25 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public KadrStudio.Core.Domain.AiConversation GetAiConversation()
         => _editorSession.State.AiConversation;
+
+    private static string DescribeAgentTaskForDebug(AgentTaskState task)
+    {
+        var plan = task.Plan is null
+            ? "none"
+            : $"v{task.Plan.Version}; approved={task.Plan.ApprovedAt is not null}; " +
+              $"objective={task.Plan.Objective}; steps={task.Plan.Steps.Length}";
+
+        return
+            $"project_id={task.ProjectId}\n" +
+            $"source_sequence_id={task.SourceSequenceId}\n" +
+            $"source_sequence_revision={task.SourceSequenceRevision?.ToString() ?? "null"}\n" +
+            $"draft_sequence_id={task.DraftSequenceId?.ToString() ?? "null"}\n" +
+            $"resume_phase={task.ResumePhase?.ToString() ?? "null"}\n" +
+            $"questions={task.Questions.Length}\n" +
+            $"plan={plan}\n" +
+            $"failure={task.FailureMessage ?? string.Empty}\n" +
+            $"completion={task.CompletionSummary ?? string.Empty}";
+    }
 
     private ImmutableArray<AgentConversationContextMessage> BuildAgentConversationContext()
     {

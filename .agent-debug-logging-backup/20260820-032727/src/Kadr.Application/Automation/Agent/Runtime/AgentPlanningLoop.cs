@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Text.Json;
-using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Tools;
 
 namespace KadrStudio.Application.Automation.Agent.Runtime;
@@ -21,7 +20,6 @@ public sealed class AgentPlanningLoop
     private readonly IAgentModel _model;
     private readonly AgentPlanningLoopOptions _options;
     private readonly Func<ImmutableArray<AgentConversationContextMessage>> _conversationProvider;
-    private readonly IAgentDebugLog _debugLog;
     private readonly SemaphoreSlim _runGate = new(1, 1);
 
     private readonly List<AgentModelObservation> _observations = [];
@@ -37,8 +35,7 @@ public sealed class AgentPlanningLoop
         AgentToolExecutor toolExecutor,
         IAgentModel model,
         AgentPlanningLoopOptions? options = null,
-        Func<ImmutableArray<AgentConversationContextMessage>>? conversationProvider = null,
-        IAgentDebugLog? debugLog = null)
+        Func<ImmutableArray<AgentConversationContextMessage>>? conversationProvider = null)
     {
         _orchestrator = orchestrator ?? throw new ArgumentNullException(nameof(orchestrator));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
@@ -47,7 +44,6 @@ public sealed class AgentPlanningLoop
         _options = options ?? AgentPlanningLoopOptions.Default;
         _conversationProvider =
             conversationProvider ?? (() => ImmutableArray<AgentConversationContextMessage>.Empty);
-        _debugLog = debugLog ?? NullAgentDebugLog.Instance;
         _options.Validate();
     }
 
@@ -70,11 +66,6 @@ public sealed class AgentPlanningLoop
         {
             var task = RequireCurrentTask();
             EnsureMemoryFor(task);
-
-            Log(
-                task,
-                "run_started",
-                message: "Planning loop started or resumed.");
 
             if (task.IsTerminal ||
                 task.Phase is AgentTaskPhase.WaitingForUserInput or
@@ -111,35 +102,17 @@ public sealed class AgentPlanningLoop
                 AgentModelDecision decision;
                 try
                 {
-                    var tools = GetPlanningToolDescriptors();
-                    var observations = GetObservationContext();
-                    var conversation = GetConversationContext();
-
-                    Log(
-                        task,
-                        "model_turn_requested",
-                        turn,
-                        $"Preparing planning model turn {turn}.",
-                        $"tools={tools.Length}; observations={observations.Length}; conversation_messages={conversation.Length}");
-
                     var request = new AgentModelTurnRequest(
                         task,
-                        tools,
-                        observations,
-                        conversation,
+                        GetPlanningToolDescriptors(),
+                        GetObservationContext(),
+                        GetConversationContext(),
                         turn,
                         AgentModelTurnMode.Planning);
 
                     decision = await _model.DecideAsync(
                         request,
                         cancellationToken).ConfigureAwait(false);
-
-                    Log(
-                        task,
-                        "model_decision",
-                        turn,
-                        $"Model selected action '{decision.Action}'.",
-                        DescribeDecision(decision));
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -147,13 +120,6 @@ public sealed class AgentPlanningLoop
                 }
                 catch (Exception exception)
                 {
-                    LogException(
-                        task,
-                        "model_turn_failed",
-                        turn,
-                        exception,
-                        "Planning model turn failed before a valid decision was produced.");
-
                     return FailTask(
                         $"Agent model failed while preparing the plan: {exception.Message}");
                 }
@@ -446,81 +412,7 @@ public sealed class AgentPlanningLoop
             return current;
         }
 
-        Log(
-            current,
-            "task_failed",
-            message: message);
-
         return _orchestrator.Fail(message);
-    }
-
-    private void Log(
-        AgentTaskState task,
-        string eventName,
-        int? turn = null,
-        string? message = null,
-        string? details = null)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "planning_loop",
-            eventName,
-            task.Id,
-            task.Phase.ToString(),
-            turn,
-            message,
-            details));
-    }
-
-    private void LogException(
-        AgentTaskState task,
-        string eventName,
-        int? turn,
-        Exception exception,
-        string? message = null)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "planning_loop",
-            eventName,
-            task.Id,
-            task.Phase.ToString(),
-            turn,
-            message ?? exception.Message,
-            Exception: exception.ToString()));
-    }
-
-    private static string DescribeDecision(AgentModelDecision decision)
-    {
-        var toolArguments = decision.ToolArguments.ValueKind == JsonValueKind.Object
-            ? decision.ToolArguments.GetRawText()
-            : "{}";
-
-        var plan = decision.Plan is null
-            ? string.Empty
-            : $"plan_objective={decision.Plan.Objective}; plan_steps={decision.Plan.Steps.Length}; ";
-
-        return
-            $"action={decision.Action}; " +
-            $"progress={LimitTextForLog(decision.Progress, 2_000)}; " +
-            $"tool_name={decision.ToolName}; " +
-            $"tool_arguments={LimitTextForLog(toolArguments, 12_000)}; " +
-            $"question={LimitTextForLog(decision.Question, 4_000)}; " +
-            plan +
-            $"completion={LimitTextForLog(decision.CompletionSummary, 4_000)}";
-    }
-
-    private static string LimitTextForLog(string? value, int maximumCharacters)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var normalized = value.Trim();
-        return normalized.Length <= maximumCharacters
-            ? normalized
-            : normalized[..maximumCharacters] + "…";
     }
 
     private static string LimitText(

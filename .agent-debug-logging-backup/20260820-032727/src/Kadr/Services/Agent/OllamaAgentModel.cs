@@ -2,7 +2,6 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Unicode;
 using KadrStudio.Application.Automation.Agent;
-using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 
@@ -13,7 +12,8 @@ namespace KadrStudio.Services.Agent;
 /// The model chooses exactly one externally visible action per turn and never
 /// receives direct access to project objects.
 /// </summary>
-public sealed class OllamaAgentModel : IAgentModel
+public sealed class OllamaAgentModel(
+    OllamaVideoAnalysisService ollama) : IAgentModel
 {
     private const int MaximumPlanConstraints = 24;
     private const int MaximumPlanSteps = 24;
@@ -83,16 +83,8 @@ public sealed class OllamaAgentModel : IAgentModel
         }
         """);
 
-    private readonly OllamaVideoAnalysisService _ollama;
-    private readonly IAgentDebugLog _debugLog;
-
-    public OllamaAgentModel(
-        OllamaVideoAnalysisService ollama,
-        IAgentDebugLog? debugLog = null)
-    {
-        _ollama = ollama ?? throw new ArgumentNullException(nameof(ollama));
-        _debugLog = debugLog ?? NullAgentDebugLog.Instance;
-    }
+    private readonly OllamaVideoAnalysisService _ollama =
+        ollama ?? throw new ArgumentNullException(nameof(ollama));
 
     public async ValueTask<AgentModelDecision> DecideAsync(
         AgentModelTurnRequest request,
@@ -100,83 +92,13 @@ public sealed class OllamaAgentModel : IAgentModel
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        var systemPrompt = BuildSystemPrompt(request.Mode);
-        var turnPayload = BuildTurnPayload(request);
-        var startedAt = DateTimeOffset.UtcNow;
+        var raw = await _ollama.RunAgentStructuredTurnAsync(
+            DecisionSchema,
+            BuildSystemPrompt(request.Mode),
+            BuildTurnPayload(request),
+            cancellationToken).ConfigureAwait(false);
 
-        _debugLog.Write(new AgentDebugLogEntry(
-            startedAt,
-            "ollama_agent_model",
-            "request",
-            request.Task.Id,
-            request.Task.Phase.ToString(),
-            request.TurnIndex,
-            $"Sending {request.Mode} turn to Ollama.",
-            $"system_prompt:\n{systemPrompt}\n\nturn_payload:\n{turnPayload}"));
-
-        try
-        {
-            var raw = await _ollama.RunAgentStructuredTurnAsync(
-                DecisionSchema,
-                systemPrompt,
-                turnPayload,
-                cancellationToken).ConfigureAwait(false);
-
-            _debugLog.Write(new AgentDebugLogEntry(
-                DateTimeOffset.UtcNow,
-                "ollama_agent_model",
-                "response",
-                request.Task.Id,
-                request.Task.Phase.ToString(),
-                request.TurnIndex,
-                $"Ollama returned a structured response in {(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds:0} ms.",
-                raw));
-
-            try
-            {
-                return ParseDecision(raw);
-            }
-            catch (Exception parseException)
-            {
-                _debugLog.Write(new AgentDebugLogEntry(
-                    DateTimeOffset.UtcNow,
-                    "ollama_agent_model",
-                    "response_parse_failed",
-                    request.Task.Id,
-                    request.Task.Phase.ToString(),
-                    request.TurnIndex,
-                    parseException.Message,
-                    raw,
-                    parseException.ToString()));
-                throw;
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            _debugLog.Write(new AgentDebugLogEntry(
-                DateTimeOffset.UtcNow,
-                "ollama_agent_model",
-                "cancelled",
-                request.Task.Id,
-                request.Task.Phase.ToString(),
-                request.TurnIndex,
-                "Ollama agent turn was cancelled."));
-            throw;
-        }
-        catch (Exception exception)
-        {
-            _debugLog.Write(new AgentDebugLogEntry(
-                DateTimeOffset.UtcNow,
-                "ollama_agent_model",
-                "request_failed",
-                request.Task.Id,
-                request.Task.Phase.ToString(),
-                request.TurnIndex,
-                exception.Message,
-                $"turn_payload:\n{turnPayload}",
-                exception.ToString()));
-            throw;
-        }
+        return ParseDecision(raw);
     }
 
     private static string BuildSystemPrompt(AgentModelTurnMode mode)

@@ -10,108 +10,6 @@ namespace KadrStudio.Core.Tests;
 public sealed class AiMontageTests
 {
     [Fact]
-    public void Anime_merge_plan_keeps_one_opening_first_and_removes_confirmed_service_blocks()
-    {
-        var fixture = CreateAnimeFixture(uncertainEndingStart: false);
-
-        var plan = new AnimeEpisodeMergePlanner().CreatePlan(
-            fixture.Project, fixture.Request, fixture.Manifests);
-        var validation = new MontagePlanValidator().Validate(fixture.Project, plan);
-
-        Assert.Equal(MontagePlanStatus.Ready, plan.Status);
-        Assert.True(validation.IsValid, string.Join("; ", validation.Validation.Errors.Select(item => item.Message)));
-        var opening = Assert.Single(plan.Items, item => item.Role == MontageRole.Opening);
-        Assert.Equal(plan.Items.OrderBy(item => item.Order).First().Id, opening.Id);
-        Assert.Null(opening.TransitionAfter);
-        Assert.All(plan.Items, item => Assert.Null(item.TransitionAfter));
-        Assert.All(fixture.Project.Sources.Keys, sourceId =>
-            Assert.Contains(plan.Items, item => item.SourceId == sourceId && item.Role != MontageRole.Opening));
-        foreach (var removed in plan.StructuralSegments.Where(item =>
-                     item.Kind == StructuralSegmentKind.Opening ||
-                     item.Disposition == StructuralSegmentDisposition.Remove))
-            Assert.DoesNotContain(plan.Items, item => item.Role != MontageRole.Opening &&
-                item.SourceId == removed.SourceId && item.SourceRange.Overlaps(removed.SourceRange));
-        foreach (var story in plan.StructuralSegments.Where(item => item.Kind == StructuralSegmentKind.PostCreditsStory))
-            Assert.Contains(plan.Items, item => item.SourceId == story.SourceId && item.SourceRange.Overlaps(story.SourceRange));
-        var firstEpisodeBody = plan.Items.First(item => item.Role != MontageRole.Opening);
-        Assert.Equal("episode-01.mp4", fixture.Project.Sources[firstEpisodeBody.SourceId].Name);
-    }
-
-    [Fact]
-    public void Ambiguous_episode_order_and_equivalent_openings_create_explicit_questions()
-    {
-        var fixture = CreateAnimeFixture(uncertainEndingStart: false);
-        var ids = fixture.Request.Scope.SourceIds;
-        var project = fixture.Project with
-        {
-            Sources = fixture.Project.Sources
-                .SetItem(ids[0], fixture.Project.Sources[ids[0]] with { Name = "zeta.mp4" })
-                .SetItem(ids[1], fixture.Project.Sources[ids[1]] with { Name = "alpha.mp4" })
-        };
-        var manifests = fixture.Manifests.ToImmutableDictionary(
-            pair => pair.Key,
-            pair => pair.Value with
-            {
-                StructuralSegments = pair.Value.StructuralSegments.Select(item =>
-                    item.Kind == StructuralSegmentKind.Opening ? item with { Confidence = 0.9 } : item).ToImmutableArray()
-            });
-
-        var plan = new AnimeEpisodeMergePlanner().CreatePlan(project, fixture.Request, manifests);
-
-        Assert.Equal(MontagePlanStatus.NeedsInput, plan.Status);
-        Assert.Contains(plan.Decisions, item => item.Kind == MontageDecisionKind.SourceOrder && !item.IsResolved);
-        Assert.Contains(plan.Decisions, item => item.Kind == MontageDecisionKind.OpeningSelection && !item.IsResolved);
-    }
-
-    [Fact]
-    public void Uncertain_anime_boundary_blocks_compilation_until_user_confirms_exact_frame()
-    {
-        var fixture = CreateAnimeFixture(uncertainEndingStart: true);
-        var planner = new AnimeEpisodeMergePlanner();
-        var plan = planner.CreatePlan(fixture.Project, fixture.Request, fixture.Manifests);
-        var decision = Assert.Single(plan.Decisions.Where(item =>
-            !item.IsResolved && item.Kind == MontageDecisionKind.SegmentStart));
-
-        Assert.Equal(MontagePlanStatus.NeedsInput, plan.Status);
-        Assert.Contains(new MontagePlanValidator().Validate(fixture.Project, plan).Validation.Errors,
-            item => item.Code == "anime.boundary");
-        Assert.Throws<InvalidOperationException>(() => new MontagePlanCompiler().Compile(fixture.Project, plan));
-
-        var resolved = planner.ResolveDecision(
-            fixture.Project, plan, decision.Id, "90.000", TimelineTime.FromSeconds(90));
-
-        Assert.Equal(MontagePlanStatus.Ready, resolved.Status);
-        Assert.True(new MontagePlanValidator().Validate(fixture.Project, resolved).IsValid);
-        Assert.DoesNotContain(resolved.Decisions, item => !item.IsResolved);
-        Assert.Equal(BoundaryResolutionStatus.UserConfirmed,
-            resolved.StructuralSegments.Single(item => item.Id == decision.SegmentId).StartBoundary.Status);
-    }
-
-    [Fact]
-    public async Task Needs_input_plan_is_valid_in_sqlite_schema_v5()
-    {
-        var fixture = CreateAnimeFixture(uncertainEndingStart: true);
-        var plan = new AnimeEpisodeMergePlanner().CreatePlan(
-            fixture.Project, fixture.Request, fixture.Manifests);
-        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "needs-input-tests", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
-        try
-        {
-            var path = Path.Combine(root, "needs-input.kadr");
-            var store = new SqliteProjectStore();
-            await store.SaveAsync(path, fixture.Project with { MontagePlans = [plan] });
-
-            var restored = await store.LoadAsync(path);
-
-            Assert.Equal(MontagePlanStatus.NeedsInput, Assert.Single(restored.MontagePlans).Status);
-        }
-        finally
-        {
-            try { Directory.Delete(root, recursive: true); } catch { }
-        }
-    }
-
-    [Fact]
     public void Legacy_game_profile_json_defaults_to_game_material_kind()
     {
         const string json = """
@@ -375,81 +273,6 @@ public sealed class AiMontageTests
             ImmutableDictionary<Guid, MediaAnalysisManifest>.Empty.Add(source.Id, manifest));
     }
 
-    private static AnimeFixture CreateAnimeFixture(bool uncertainEndingStart)
-    {
-        var project = ProjectState.CreateNew("Anime merge");
-        var episode2 = new MediaSource(
-            Guid.NewGuid(), "F:\\media\\episode-02.mp4", "episode-02.mp4", MediaKind.Video,
-            TimelineTime.FromSeconds(120), true, 1920, 1080, FrameRate.Fps24,
-            "h264", "aac", 2000, 3000, FastFingerprint: "ep2", VerifiedFingerprint: "episode-2");
-        var episode1 = episode2 with
-        {
-            Id = Guid.NewGuid(), Path = "F:\\media\\episode-01.mp4", Name = "episode-01.mp4",
-            FastFingerprint = "ep1", VerifiedFingerprint = "episode-1"
-        };
-        project = (project with
-        {
-            Sources = ImmutableDictionary<Guid, MediaSource>.Empty
-                .Add(episode2.Id, episode2)
-                .Add(episode1.Id, episode1)
-        }).EnsureSequenceContainer();
-        var profile = GameEditingProfiles.Get("anime");
-        var evidence = ImmutableArray.Create(new AnalysisEvidence(
-            MontageEvidenceKind.Vision, "Подтверждено кадрами", "anime-test"));
-
-        ImmutableArray<StructuralSegment> Structure(MediaSource source, double openingConfidence, bool uncertain)
-            =>
-            [
-                Segment(source, StructuralSegmentKind.Recap, 0, 8, 0.95, StructuralSegmentDisposition.Remove, evidence),
-                Segment(source, StructuralSegmentKind.Opening, 8, 12, openingConfidence, StructuralSegmentDisposition.Remove, evidence),
-                Segment(source, StructuralSegmentKind.Ending, 90, 10, 0.96, StructuralSegmentDisposition.Remove, evidence,
-                    uncertainStart: uncertain),
-                Segment(source, StructuralSegmentKind.PostCreditsStory, 100, 5, 0.95, StructuralSegmentDisposition.Retain, evidence),
-                Segment(source, StructuralSegmentKind.Preview, 105, 5, 0.95, StructuralSegmentDisposition.Remove, evidence)
-            ];
-
-        var firstManifest = new MediaAnalysisManifest(
-            episode1.Id, "episode-1", "content-analysis-v2", "vision-test",
-            profile.Id, profile.Version, DateTimeOffset.UtcNow, [], Structure(episode1, 0.99, uncertainEndingStart));
-        var secondManifest = new MediaAnalysisManifest(
-            episode2.Id, "episode-2", "content-analysis-v2", "vision-test",
-            profile.Id, profile.Version, DateTimeOffset.UtcNow, [], Structure(episode2, 0.88, false));
-        var manifests = ImmutableDictionary<Guid, MediaAnalysisManifest>.Empty
-            .Add(episode1.Id, firstManifest)
-            .Add(episode2.Id, secondManifest);
-        var request = new MontageRequest(
-            Guid.NewGuid(),
-            new MontageScope(MontageScopeKind.SelectedSources, [episode2.Id, episode1.Id]),
-            MontageTargetFormat.Source,
-            TimelineTime.FromSeconds(1), TimelineTime.FromSeconds(240), TimelineTime.FromSeconds(240),
-            "Объедини серии", profile, [], AutomationPresets.AnimeMergeEpisodes);
-        return new AnimeFixture(project, request, manifests);
-    }
-
-    private static StructuralSegment Segment(
-        MediaSource source,
-        StructuralSegmentKind kind,
-        double start,
-        double duration,
-        double confidence,
-        StructuralSegmentDisposition disposition,
-        ImmutableArray<AnalysisEvidence> evidence,
-        bool uncertainStart = false)
-    {
-        var sourceRange = Range(start, duration);
-        var startBoundary = new ResolvedBoundary(
-            sourceRange.Start, sourceRange.Start,
-            uncertainStart ? BoundaryResolutionStatus.Suggested : BoundaryResolutionStatus.Verified,
-            uncertainStart ? BoundaryPrecision.Coarse : BoundaryPrecision.Frame,
-            uncertainStart ? 0.6 : confidence, evidence);
-        var endBoundary = new ResolvedBoundary(
-            sourceRange.End, sourceRange.End, BoundaryResolutionStatus.Verified,
-            BoundaryPrecision.Frame, confidence, evidence);
-        return new StructuralSegment(
-            Guid.NewGuid(), source.Id, kind, sourceRange, disposition,
-            confidence, startBoundary, endBoundary, evidence);
-    }
-
     private static TimeRange Range(double start, double duration)
         => new(TimelineTime.FromSeconds(start), TimelineTime.FromSeconds(duration));
 
@@ -458,11 +281,6 @@ public sealed class AiMontageTests
         MediaSource Source,
         GameEditingProfile Profile,
         MontagePlan Plan,
-        ImmutableDictionary<Guid, MediaAnalysisManifest> Manifests);
-
-    private sealed record AnimeFixture(
-        ProjectState Project,
-        MontageRequest Request,
         ImmutableDictionary<Guid, MediaAnalysisManifest> Manifests);
 
     private sealed class StubAnalysisPipeline : IMediaAnalysisPipeline

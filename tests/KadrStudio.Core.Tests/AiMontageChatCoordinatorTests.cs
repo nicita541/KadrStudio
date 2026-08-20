@@ -7,21 +7,8 @@ namespace KadrStudio.Core.Tests;
 public sealed class AiMontageChatCoordinatorTests
 {
     [Fact]
-    public void Explicit_scenario_wins_and_auto_detects_anime_and_timeline_commands()
+    public void Universal_profile_is_available_without_a_keyword_router()
     {
-        var coordinator = new AiMontageChatCoordinator();
-
-        var explicitRoute = coordinator.Route(
-            "удали фрагмент", AutomationPresets.AnimeMergeEpisodes.Id);
-        var animeRoute = coordinator.Route("Объедини серии без опенингов и эндингов", null);
-        var timelineRoute = coordinator.Route("вырежи с 0:10 до 0:20", null);
-
-        Assert.Equal(AiChatIntentKind.PresetMontage, explicitRoute.Intent);
-        Assert.Equal(AutomationPresets.AnimeMergeEpisodes.Id, explicitRoute.Preset?.Id);
-        Assert.Equal(AiChatIntentKind.PresetMontage, animeRoute.Intent);
-        Assert.Equal(AiChatIntentKind.TimelineCommand, timelineRoute.Intent);
-        Assert.Equal(AiChatIntentKind.MontagePlan,
-            coordinator.Route("Собери спокойное интервью с понятной историей", null).Intent);
         Assert.Equal(MaterialProfileKind.General, GameEditingProfiles.Get("universal").Kind);
     }
 

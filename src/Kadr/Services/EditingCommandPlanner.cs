@@ -20,27 +20,6 @@ public static partial class EditingCommandPlanner
         }
 
         var deleteIntent = query.Contains("удал") || query.Contains("выреж") || query.Contains("убер");
-        if (deleteIntent && TryFindMarkerKind(query, out var markerKind))
-        {
-            var markers = project.Markers
-                .Where(marker => marker.Kind == markerKind)
-                .OrderByDescending(marker => marker.Confidence)
-                .ThenBy(marker => marker.Start)
-                .ToList();
-            if (markers.Count > 0)
-            {
-                var marker = markers[0];
-                plan = new EditCommandPlan(
-                    $"Удалить «{marker.Title}» ({FormatTime(marker.Start)}–{FormatTime(marker.End)}) и сдвинуть последующий монтаж влево.",
-                    [new EditCommand(
-                        EditCommandType.DeleteRange,
-                        marker.Start.TotalSeconds,
-                        marker.End.TotalSeconds,
-                        marker.Title)]);
-                return true;
-            }
-        }
-
         if (deleteIntent && TryParseRange(query, out var rangeStart, out var rangeEnd))
         {
             rangeStart = Math.Clamp(rangeStart, 0, project.Duration.TotalSeconds);
@@ -85,28 +64,6 @@ public static partial class EditingCommandPlanner
         return false;
     }
 
-    private static bool TryFindMarkerKind(string query, out MarkerKind kind)
-    {
-        var mappings = new (string[] Terms, MarkerKind Kind)[]
-        {
-            (["опенинг", "opening"], MarkerKind.Opening),
-            (["после титров", "postcredits", "post-credits"], MarkerKind.PostCredits),
-            (["эндинг", "ending", "титры"], MarkerKind.Ending),
-            (["превью", "следующей серии", "preview"], MarkerKind.Preview),
-            (["рекап", "повтор", "recap"], MarkerKind.Recap)
-        };
-        foreach (var mapping in mappings)
-        {
-            if (mapping.Terms.Any(query.Contains))
-            {
-                kind = mapping.Kind;
-                return true;
-            }
-        }
-        kind = default;
-        return false;
-    }
-
     private static bool TryParseRange(string value, out double start, out double end)
     {
         start = 0;
@@ -137,8 +94,6 @@ public static partial class EditingCommandPlanner
         seconds = values.Length == 2 ? values[0] * 60 + values[1] : values[0] * 3600 + values[1] * 60 + values[2];
         return true;
     }
-
-    private static string FormatTime(TimelineTime time) => FormatTime(time.TotalSeconds);
 
     private static string FormatTime(double seconds)
         => TimeSpan.FromSeconds(Math.Max(0, seconds)).ToString(seconds >= 3600 ? @"h\:mm\:ss\.f" : @"m\:ss\.f");

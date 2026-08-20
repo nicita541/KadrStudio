@@ -6,11 +6,15 @@ public sealed record AiServerOptions
 {
     public const string DefaultPublicModelAlias = "kadr-vision:latest";
     public const string DefaultBackendModel = "qwen3-vl:4b-instruct";
+    public const string DefaultPlannerPublicModelAlias = "kadr-planner:latest";
+    public const string DefaultPlannerBackendModel = "qwen3.5:9b";
     public const string DefaultListenUrls = "http://127.0.0.1:5080";
 
     public required Uri OllamaEndpoint { get; init; }
     public required string BackendModel { get; init; }
     public required string PublicModelAlias { get; init; }
+    public string PlannerBackendModel { get; init; } = DefaultPlannerBackendModel;
+    public string PlannerPublicModelAlias { get; init; } = DefaultPlannerPublicModelAlias;
     public required string ModelsRoot { get; init; }
     public string? ApiKey { get; init; }
     public string? OllamaExecutable { get; init; }
@@ -32,6 +36,10 @@ public sealed record AiServerOptions
 
         var backendModel = ReadNonEmpty("KADR_AI_MODEL") ?? DefaultBackendModel;
         var publicAlias = ReadNonEmpty("KADR_AI_PUBLIC_MODEL") ?? DefaultPublicModelAlias;
+        var plannerBackendModel =
+            ReadNonEmpty("KADR_AI_PLANNER_MODEL") ?? DefaultPlannerBackendModel;
+        var plannerPublicAlias =
+            ReadNonEmpty("KADR_AI_PLANNER_PUBLIC_MODEL") ?? DefaultPlannerPublicModelAlias;
         var modelsRoot = ReadNonEmpty("KADR_AI_MODELS_ROOT") ?? ResolveDefaultModelsRoot();
         var apiKey = ReadNonEmpty("KADR_AI_API_KEY");
         var ollamaExecutable = ReadNonEmpty("KADR_AI_OLLAMA_EXE");
@@ -48,6 +56,8 @@ public sealed record AiServerOptions
             OllamaEndpoint = endpoint,
             BackendModel = backendModel,
             PublicModelAlias = publicAlias,
+            PlannerBackendModel = plannerBackendModel,
+            PlannerPublicModelAlias = plannerPublicAlias,
             ModelsRoot = Path.GetFullPath(Environment.ExpandEnvironmentVariables(modelsRoot)),
             ApiKey = apiKey,
             OllamaExecutable = ollamaExecutable,
@@ -66,7 +76,39 @@ public sealed record AiServerOptions
         => OllamaEndpoint.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
            (OllamaEndpoint.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
             System.Net.IPAddress.TryParse(OllamaEndpoint.Host, out var address) &&
-            System.Net.IPAddress.IsLoopback(address));
+           System.Net.IPAddress.IsLoopback(address));
+
+    public AiServerModelRoute ResolveModel(string? publicAlias)
+    {
+        var alias = string.IsNullOrWhiteSpace(publicAlias)
+            ? PublicModelAlias
+            : publicAlias.Trim();
+        if (alias.Equals(PlannerPublicModelAlias, StringComparison.OrdinalIgnoreCase))
+        {
+            return new AiServerModelRoute(
+                PlannerPublicModelAlias,
+                PlannerBackendModel,
+                RequiresVision: false,
+                Role: "planner");
+        }
+
+        if (alias.Equals(PublicModelAlias, StringComparison.OrdinalIgnoreCase))
+        {
+            return new AiServerModelRoute(
+                PublicModelAlias,
+                BackendModel,
+                RequiresVision: true,
+                Role: "vision");
+        }
+
+        throw new InvalidOperationException($"Unknown public AI model alias '{alias}'.");
+    }
+
+    public IReadOnlyList<AiServerModelRoute> ConfiguredModels =>
+    [
+        ResolveModel(PlannerPublicModelAlias),
+        ResolveModel(PublicModelAlias)
+    ];
 
     private static Uri ParseHttpUri(string? raw, Uri fallback, string environmentVariable)
     {
@@ -145,27 +187,16 @@ public sealed record AiServerOptions
 
     private static string ResolveDefaultModelsRoot()
     {
-        if (OperatingSystem.IsWindows())
-        {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (!string.IsNullOrWhiteSpace(localAppData))
-            {
-                return Path.Combine(localAppData, "KadrStudio", "AiServer", "ollama-models");
-            }
-        }
-
-        var xdgDataHome = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
-        if (!string.IsNullOrWhiteSpace(xdgDataHome))
-        {
-            return Path.Combine(xdgDataHome, "KadrStudio", "AiServer", "ollama-models");
-        }
-
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrWhiteSpace(home))
-        {
-            return Path.Combine(home, ".local", "share", "KadrStudio", "AiServer", "ollama-models");
-        }
-
-        return Path.Combine(Path.GetTempPath(), "KadrStudio", "AiServer", "ollama-models");
+        return Path.Combine(
+            AppContext.BaseDirectory,
+            "LocalData",
+            "AiServer",
+            "ollama-models");
     }
 }
+
+public sealed record AiServerModelRoute(
+    string PublicAlias,
+    string BackendModel,
+    bool RequiresVision,
+    string Role);

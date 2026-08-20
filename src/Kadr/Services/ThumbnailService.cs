@@ -39,7 +39,7 @@ public sealed class ThumbnailService : IAsyncDisposable
         if (cached is not null) return cached;
 
         var seek = Math.Min(5, Math.Max(0, asset.Duration * 0.12));
-        var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.jpg");
+        var temporary = Path.Combine(KadrLocalDataPaths.TempRoot, "artifacts", $"{Guid.NewGuid():N}.jpg");
         Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
         try
         {
@@ -71,11 +71,7 @@ public sealed class ThumbnailService : IAsyncDisposable
 
     internal static string CreateCacheDirectory(string childName)
     {
-        var path = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio",
-            "Cache",
-            childName);
+        var path = Path.Combine(KadrLocalDataPaths.CacheRoot, childName);
         Directory.CreateDirectory(path);
         return path;
     }
@@ -92,9 +88,7 @@ public sealed class ThumbnailService : IAsyncDisposable
         return new MediaCacheKey(asset.Id, fingerprint, kind, level, segment, formatVersion);
     }
 
-    internal static string DefaultArtifactRoot() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Kadr Studio", "Artifacts");
+    internal static string DefaultArtifactRoot() => KadrLocalDataPaths.ArtifactsRoot;
 
     private static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
 

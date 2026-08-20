@@ -12,7 +12,7 @@
         MinWidth="900"
         MinHeight="640"
         WindowStartupLocation="CenterScreen"
-        KeyDown="Window_KeyDown"
+        PreviewKeyDown="Window_KeyDown"
         Closing="Window_Closing"
         Loaded="Window_Loaded">
     <Window.Resources>
@@ -70,8 +70,9 @@
                                 <MenuItem Header="Отменить" InputGestureText="Ctrl+Z" Click="Undo_Click" />
                                 <MenuItem Header="Повторить" InputGestureText="Ctrl+Y" Click="Redo_Click" />
                                 <Separator Margin="4,2" />
-                                <MenuItem Header="Разрезать" InputGestureText="S" Click="Split_Click" />
+                                <MenuItem Header="Разрезать по курсору" InputGestureText="Ctrl+K" Click="Split_Click" />
                                 <MenuItem Header="Удалить клип" InputGestureText="Delete" Click="DeleteClip_Click" />
+                                <MenuItem Header="Удалить со сдвигом" InputGestureText="Shift+Delete" Click="RippleDeleteClip_Click" />
                                 <Separator Margin="4,2" />
                                 <MenuItem Header="Кэш медиа">
                                     <MenuItem Header="Перенести…" Click="MoveMediaCache_Click" />
@@ -337,6 +338,10 @@
                                                        Foreground="{StaticResource MutedTextBrush}" Margin="0,4,0,0"/>
                                         </StackPanel>
 
+                                        <Button Style="{StaticResource ButtonBase}" Content="Безопасно повторить"
+                                                Tag="{Binding Id}" Click="AiChatRetryAgent_Click" Padding="9,7" Margin="0,8,0,0"
+                                                Visibility="{Binding CanRetryFailedPlanning, Converter={StaticResource BoolToVisibility}}"/>
+
                                         <StackPanel Visibility="{Binding IsPlanVisible, Converter={StaticResource BoolToVisibility}}"
                                                     Margin="0,9,0,0">
                                             <TextBlock Text="{Binding PlanDurationLabel}" FontWeight="SemiBold" TextWrapping="Wrap"/>
@@ -445,12 +450,6 @@
                                 <Button x:Name="AiChatSendButton" Grid.Column="4" Style="{StaticResource AccentButton}"
                                         Content="Отправить" Click="AiChatSend_Click" MinWidth="76" Padding="9,7"/>
                             </Grid>
-                            <WrapPanel x:Name="AiChatSuggestionsPanel" Margin="0,6,0,0">
-                                <Button Style="{StaticResource ButtonBase}" Content="Объединить серии" Tag="Объедини серии: оставь один опенинг в начале и убери эндинги, рекапы и превью."
-                                        Click="AiChatSuggestion_Click" Padding="7,4" Margin="0,0,5,4"/>
-                                <Button Style="{StaticResource ButtonBase}" Content="Лучшие моменты" Tag="Собери монтаж из лучших моментов."
-                                        Click="AiChatSuggestion_Click" Padding="7,4" Margin="0,0,5,4"/>
-                            </WrapPanel>
                         </StackPanel>
                     </Border>
                 </Grid>
@@ -470,11 +469,7 @@
                                 <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" Margin="5,3"/></DataTemplate></ListBox.ItemTemplate>
                             </ListBox>
                             <TextBlock Text="Профиль материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <ComboBox x:Name="AiGameProfileComboBox" Margin="0,4,0,8" SelectionChanged="AiMaterialProfile_Changed">
-                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
-                            </ComboBox>
-                            <TextBlock Text="Сценарий монтажа" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <ComboBox x:Name="AiScenarioComboBox" Margin="0,4,0,8">
+                            <ComboBox x:Name="AiGameProfileComboBox" Margin="0,4,0,8">
                                 <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
                             </ComboBox>
                             <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -488,8 +483,6 @@
                             <TextBlock Text="Задание режиссёру" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
                             <TextBox x:Name="AnalysisPromptTextBox" Text="Собери понятную историю из лучших фрагментов материала"
                                      AcceptsReturn="True" TextWrapping="Wrap" Height="72" Margin="0,4,0,8"/>
-                            <Button x:Name="AiPreparePlanButton" Style="{StaticResource AccentButton}" Click="AiPreparePlan_Click"
-                                    Content="Подготовить план" Padding="10,8" Margin="0,0,0,10"/>
                             <TextBlock Text="Точный диапазон выбранного исходника" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
                             <Grid Margin="0,4,0,5"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                 <TextBox x:Name="AnalysisStartTextBox" Text="0:00"/><TextBox x:Name="AnalysisEndTextBox" Grid.Column="2" Text="0:00"/>
@@ -949,11 +942,25 @@
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0">
-                        <Button Style="{StaticResource IconButton}" Click="Split_Click" ToolTip="Разрезать (S)" Content="&#xE8C6;" Margin="0,0,6,0" />
+                        <ToggleButton x:Name="RazorToolButton" Style="{StaticResource ToggleIconButton}" Click="RazorTool_Click"
+                                      ToolTip="Ножницы / Razor (C)" Margin="0,0,6,0">
+                            <Viewbox Width="20" Height="20"><Canvas Width="24" Height="24">
+                                <Path Data="M5,4 A3,3 0 1 0 5,10 A3,3 0 1 0 5,4 M5,14 A3,3 0 1 0 5,20 A3,3 0 1 0 5,14 M7.5,8.5 L20,18 M7.5,15.5 L20,6"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}" StrokeThickness="1.8" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round" />
+                            </Canvas></Viewbox>
+                        </ToggleButton>
+                        <ToggleButton x:Name="SnappingToggleButton" Style="{StaticResource ToggleIconButton}" IsChecked="True"
+                                      Click="SnappingToggle_Click" ToolTip="Привязка краёв / Snapping (S)" Margin="0,0,6,0">
+                            <Viewbox Width="19" Height="19"><Canvas Width="24" Height="24">
+                                <Path Data="M4,3 L9,3 L9,12 C9,16 15,16 15,12 L15,3 L20,3 L20,12 C20,23 4,23 4,12 Z"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}" StrokeThickness="1.8" Fill="Transparent" StrokeLineJoin="Round" />
+                                <Path Data="M4,7 L9,7 M15,7 L20,7" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}" StrokeThickness="1.8" />
+                            </Canvas></Viewbox>
+                        </ToggleButton>
                         <Button Style="{StaticResource IconButton}" Click="DeleteClip_Click" ToolTip="Удалить (Delete)" Content="&#xE74D;" />
-                        <Button Style="{StaticResource IconButton}" Click="SetInPoint_Click" ToolTip="Поставить точку входа (I)" Content="I" Margin="10,0,5,0" />
-                        <Button Style="{StaticResource IconButton}" Click="SetOutPoint_Click" ToolTip="Поставить точку выхода (O)" Content="O" Margin="0,0,5,0" />
-                        <Button Style="{StaticResource IconButton}" Click="ClearInOut_Click" ToolTip="Очистить точки In/Out" Content="×" />
+                        <Button Style="{StaticResource IconButton}" FontFamily="Segoe UI" FontWeight="Bold" Click="SetInPoint_Click" ToolTip="Поставить точку входа (I)" Content="I" Margin="10,0,5,0" />
+                        <Button Style="{StaticResource IconButton}" FontFamily="Segoe UI" FontWeight="Bold" Click="SetOutPoint_Click" ToolTip="Поставить точку выхода (O)" Content="O" Margin="0,0,5,0" />
+                        <Button Style="{StaticResource IconButton}" FontFamily="Segoe UI" FontSize="20" Click="ClearInOut_Click" ToolTip="Очистить точки In/Out" Content="×" />
                     </StackPanel>
                     <TextBlock Grid.Column="1" Text="Таймлайн" FontWeight="SemiBold" HorizontalAlignment="Center" />
                     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">

@@ -36,11 +36,12 @@ if (-not $models.models -or $models.models.Count -lt 1) {
     throw 'AI server returned no public model aliases.'
 }
 
-$modelAlias = [string]$models.models[0].id
-if ([string]::IsNullOrWhiteSpace($modelAlias)) {
-    throw 'AI server returned an empty public model alias.'
+$planner = $models.models | Where-Object { $_.role -eq 'planner' } | Select-Object -First 1
+$vision = $models.models | Where-Object { $_.role -eq 'vision' } | Select-Object -First 1
+if (-not $planner -or -not $vision) {
+    throw 'AI server must expose both planner and vision model roles.'
 }
-Write-Host "v1/models: $modelAlias" -ForegroundColor Green
+Write-Host "v1/models: planner=$($planner.id), vision=$($vision.id)" -ForegroundColor Green
 
 if (-not $SkipInference) {
     $schema = @{
@@ -54,11 +55,14 @@ if (-not $SkipInference) {
         required = @('status')
         additionalProperties = $false
     }
-    $payload = @{
+    $payloadData = @{
+        model = [string]$planner.id
+        think = $true
         schema = $schema
         systemPrompt = 'Return only JSON that follows the supplied schema.'
         userPrompt = 'Kadr AI Server readiness check. Return status ok.'
-    } | ConvertTo-Json -Depth 12 -Compress
+    }
+    $payload = $payloadData | ConvertTo-Json -Depth 12 -Compress
 
     $turn = Invoke-RestMethod `
         -Method Post `
@@ -84,6 +88,21 @@ if (-not $SkipInference) {
     }
 
     Write-Host 'v1/inference/structured: inference OK' -ForegroundColor Green
+
+    $payloadData.model = [string]$vision.id
+    $payloadData.think = $false
+    $visionPayload = $payloadData | ConvertTo-Json -Depth 12 -Compress
+    $visionTurn = Invoke-RestMethod `
+        -Method Post `
+        -Uri "$base/v1/inference/structured" `
+        -Headers $headers `
+        -ContentType 'application/json; charset=utf-8' `
+        -Body $visionPayload `
+        -TimeoutSec 7200
+    if ([string]::IsNullOrWhiteSpace([string]$visionTurn.content)) {
+        throw 'Vision role structured inference returned empty content.'
+    }
+    Write-Host 'v1/inference/structured: vision role OK' -ForegroundColor Green
 }
 
 $readyAfter = Invoke-RestMethod -Method Get -Uri "$base/health/ready" -Headers $headers -TimeoutSec 10

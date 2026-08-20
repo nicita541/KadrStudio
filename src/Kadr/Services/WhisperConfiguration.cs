@@ -33,8 +33,8 @@ public sealed record WhisperConfiguration(string ExecutablePath, string ModelPat
     }
 
     private static string SettingsPath() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "KadrStudio", "settings", "whisper.json");
+        KadrLocalDataPaths.SettingsRoot,
+        "whisper.json");
 }
 
 public sealed record WhisperAvailability(

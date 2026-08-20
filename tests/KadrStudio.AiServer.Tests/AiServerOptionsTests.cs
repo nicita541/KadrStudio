@@ -18,6 +18,22 @@ public sealed class AiServerOptionsTests
         Assert.Equal(expected, options.CanManageConfiguredBackend());
     }
 
+    [Fact]
+    public void PublicModelAliasesResolveToIsolatedPlannerAndVisionRoles()
+    {
+        var options = CreateOptions(new Uri("http://127.0.0.1:11436/"));
+
+        var planner = options.ResolveModel(AiServerOptions.DefaultPlannerPublicModelAlias);
+        var vision = options.ResolveModel(options.PublicModelAlias);
+
+        Assert.Equal("planner", planner.Role);
+        Assert.False(planner.RequiresVision);
+        Assert.Equal(AiServerOptions.DefaultPlannerBackendModel, planner.BackendModel);
+        Assert.Equal("vision", vision.Role);
+        Assert.True(vision.RequiresVision);
+        Assert.Throws<InvalidOperationException>(() => options.ResolveModel("unmanaged-model"));
+    }
+
     private static AiServerOptions CreateOptions(Uri endpoint)
         => new()
         {

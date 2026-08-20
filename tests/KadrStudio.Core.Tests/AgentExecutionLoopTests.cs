@@ -9,6 +9,42 @@ namespace KadrStudio.Core.Tests;
 public sealed class AgentExecutionLoopTests
 {
     [Fact]
+    public async Task Interpreted_plan_is_executed_once_by_runner_then_verified_automatically()
+    {
+        var orchestrator = new AiAgentOrchestrator();
+        var sourceId = Guid.NewGuid();
+        orchestrator.StartTask(Guid.NewGuid(), sourceId, "Выполни утверждённую задачу.");
+        orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Выполнить одно изменение",
+            "Активная последовательность"));
+        orchestrator.BeginPlanning();
+        orchestrator.PublishPlan(CreatePlanDraft());
+        orchestrator.ApprovePlan();
+        orchestrator.BeginExecution(Guid.NewGuid());
+
+        var edit = new CountingTool("fake_edit", AgentToolAccess.Editing);
+        var editLog = new CountingTool("inspect_agent_edits", AgentToolAccess.ReadOnly);
+        var integrity = new CountingTool("inspect_timeline_integrity", AgentToolAccess.ReadOnly);
+        var compare = new CountingTool("compare_sequences", AgentToolAccess.ReadOnly);
+        var registry = CreateRegistry(edit, editLog, integrity, compare);
+        var model = new QueueAgentModel(
+            AgentModelDecision.CompleteTask("Утверждённое действие выполнено и проверено."));
+
+        var completed = await new AgentExecutionLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model).RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
+        Assert.Equal(1, edit.ExecutionCount);
+        Assert.Equal(1, editLog.ExecutionCount);
+        Assert.Equal(1, integrity.ExecutionCount);
+        Assert.Equal(1, compare.ExecutionCount);
+    }
+
+    [Fact]
     public async Task Approved_plan_executes_on_draft_then_requires_verification()
     {
         var orchestrator = CreateExecutingTask();
@@ -67,7 +103,7 @@ public sealed class AgentExecutionLoopTests
     }
 
     [Fact]
-    public async Task Corrective_edit_during_verification_forces_reverification()
+    public async Task Approved_edit_cannot_execute_twice_during_verification()
     {
         var orchestrator = CreateExecutingTask();
         var editingTool = new CountingTool(
@@ -118,14 +154,14 @@ public sealed class AgentExecutionLoopTests
 
         Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
         Assert.Equal(
-            "Исправление повторно проверено.",
+            "Нельзя завершать до повторной проверки.",
             completed.CompletionSummary);
-        Assert.Equal(2, editingTool.ExecutionCount);
-        Assert.Equal(2, editLogTool.ExecutionCount);
-        Assert.Equal(2, readTool.ExecutionCount);
+        Assert.Equal(1, editingTool.ExecutionCount);
+        Assert.Equal(1, editLogTool.ExecutionCount);
+        Assert.Equal(1, readTool.ExecutionCount);
         Assert.Contains(
             loop.Observations,
-            item => item.ErrorCode == "verification_edit_log_required");
+            item => item.ErrorCode == "editing_arguments_not_approved");
     }
 
     [Fact]
@@ -299,6 +335,66 @@ public sealed class AgentExecutionLoopTests
         Assert.Equal(2, loop.Observations.Count(item => item.ErrorCode == "successful_edit_required"));
     }
 
+    [Fact]
+    public async Task Editing_arguments_must_exactly_match_the_approved_step()
+    {
+        var orchestrator = CreateExecutingTask();
+        var editingTool = new CountingTool("fake_edit", AgentToolAccess.Editing);
+        var registry = CreateRegistry(editingTool);
+        var model = new QueueAgentModel(
+            AgentModelDecision.UseTool(
+                "fake_edit",
+                AgentToolJson.ParseObject("{\"clip_id\":\"00000000-0000-0000-0000-000000000001\"}")),
+            AgentModelDecision.AskUser(
+                "Нужно пересмотреть план.",
+                "Аргументы действия изменились."));
+        var loop = new AgentExecutionLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var waiting = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, waiting.Phase);
+        Assert.Equal(0, editingTool.ExecutionCount);
+        Assert.Contains(
+            loop.Observations,
+            observation => observation.ErrorCode == "editing_arguments_not_approved");
+    }
+
+    [Fact]
+    public async Task Production_verification_requires_timeline_integrity_tool()
+    {
+        var orchestrator = CreateExecutingTask();
+        var registry = CreateRegistry(
+            new CountingTool("fake_edit", AgentToolAccess.Editing),
+            new CountingTool("inspect_agent_edits", AgentToolAccess.ReadOnly),
+            new CountingTool("inspect_timeline", AgentToolAccess.ReadOnly),
+            new CountingTool("inspect_timeline_integrity", AgentToolAccess.ReadOnly));
+        var model = new QueueAgentModel(
+            AgentModelDecision.UseTool("fake_edit", AgentToolJson.EmptyObject()),
+            AgentModelDecision.BeginVerification(),
+            AgentModelDecision.UseTool("inspect_agent_edits", AgentToolJson.EmptyObject()),
+            AgentModelDecision.UseTool("inspect_timeline", AgentToolJson.EmptyObject()),
+            AgentModelDecision.CompleteTask("Проверка якобы завершена."),
+            AgentModelDecision.CompleteTask("Проверка якобы завершена."));
+        var loop = new AgentExecutionLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var failed = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("gaps", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(
+            2,
+            loop.Observations.Count(observation =>
+                observation.ErrorCode == "verification_integrity_required"));
+    }
+
     private static AiAgentOrchestrator CreateExecutingTask()
     {
         var orchestrator = new AiAgentOrchestrator();
@@ -328,7 +424,9 @@ public sealed class AgentExecutionLoopTests
             {
                 new AgentPlanStepDraft(
                     "Выполнить изменение",
-                    "Использовать безопасные editing tools."),
+                    "Использовать безопасные editing tools.",
+                    "fake_edit",
+                    ExpectedEditingArguments: AgentToolJson.EmptyObject()),
                 new AgentPlanStepDraft(
                     "Проверить",
                     "Сверить фактический результат read-only tools.")

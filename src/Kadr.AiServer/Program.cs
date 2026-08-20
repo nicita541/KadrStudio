@@ -7,14 +7,29 @@ using KadrStudio.AiServer.Inference;
 var builder = WebApplication.CreateBuilder(args);
 var options = AiServerOptions.FromEnvironment();
 
+// The server is distributed as an interactive, self-contained console process.
+// The default Windows host also registers EventLogLoggerProvider, whose native
+// EventLog handle can be disposed before a cancelling BackgroundService finishes.
+// Keeping a single console provider both avoids that shutdown race and makes the
+// installed runtime logs visible to the operator who launched it.
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(consoleOptions =>
+{
+    consoleOptions.SingleLine = true;
+    consoleOptions.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+});
+
 var configuredUrls = builder.Configuration["urls"];
+var effectiveListenUrls = configuredUrls;
 if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("KADR_AI_URLS")))
 {
     builder.WebHost.UseUrls(options.ListenUrls);
+    effectiveListenUrls = options.ListenUrls;
 }
 else if (string.IsNullOrWhiteSpace(configuredUrls))
 {
     builder.WebHost.UseUrls(AiServerOptions.DefaultListenUrls);
+    effectiveListenUrls = AiServerOptions.DefaultListenUrls;
 }
 
 builder.WebHost.ConfigureKestrel(serverOptions =>
@@ -38,9 +53,21 @@ builder.Services.AddSingleton(_ =>
     };
 });
 builder.Services.AddSingleton<OllamaRuntime>();
+builder.Services.AddSingleton<IInferenceChatRuntime>(serviceProvider =>
+    serviceProvider.GetRequiredService<OllamaRuntime>());
+builder.Services.AddSingleton<StructuredInferencePipeline>();
 builder.Services.AddHostedService<OllamaWarmupService>();
 
 var app = builder.Build();
+
+if (ExistingAiServerProbe.IsStandaloneExecutable() &&
+    await ExistingAiServerProbe.FindAsync(
+        effectiveListenUrls ?? AiServerOptions.DefaultListenUrls) is { } runningServer)
+{
+    Console.WriteLine($"Kadr AI Server is already running at {runningServer}.");
+    Console.WriteLine("Start KadrStudio.exe; do not launch a second server instance.");
+    return;
+}
 
 app.UseMiddleware<KadrApiAuthorizationMiddleware>();
 

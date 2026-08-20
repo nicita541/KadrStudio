@@ -27,6 +27,7 @@ public enum AgentModelActionKind
     UseTool,
     AskUser,
     PublishPlan,
+    CompleteReadOnly,
     BeginVerification,
     CompleteTask
 }
@@ -62,6 +63,32 @@ public sealed record AgentModelTurnRequest(
     ImmutableArray<AgentConversationContextMessage> Conversation,
     int TurnIndex,
     AgentModelTurnMode Mode = AgentModelTurnMode.Planning);
+
+public sealed record AgentTaskUnderstanding(
+    AgentTaskBrief Brief,
+    ImmutableArray<AgentQuestion> Questions);
+
+public sealed record AgentPlanReviewRequest(
+    AgentTaskState Task,
+    AgentPlanDraft Plan,
+    ImmutableArray<AgentModelObservation> Observations,
+    ImmutableArray<AgentConversationContextMessage> Conversation,
+    int TurnIndex);
+
+public sealed record AgentPlanReview(
+    bool Accepted,
+    string Summary,
+    ImmutableArray<string> Issues);
+
+public sealed record AgentVerificationReportRequest(
+    AgentTaskState Task,
+    ImmutableArray<AgentModelObservation> VerificationObservations,
+    int TurnIndex);
+
+public sealed record AgentVerificationReport(
+    bool Accepted,
+    string Summary,
+    ImmutableArray<string> Issues);
 
 public sealed record AgentModelDecision(
     AgentModelActionKind Action,
@@ -125,6 +152,19 @@ public sealed record AgentModelDecision(
             string.Empty,
             null,
             string.Empty);
+
+    public static AgentModelDecision CompleteReadOnly(
+        string summary,
+        string progress = "")
+        => new(
+            AgentModelActionKind.CompleteReadOnly,
+            progress ?? string.Empty,
+            string.Empty,
+            AgentToolJson.EmptyObject(),
+            string.Empty,
+            string.Empty,
+            null,
+            summary ?? string.Empty);
 
     public static AgentModelDecision CompleteTask(
         string summary,

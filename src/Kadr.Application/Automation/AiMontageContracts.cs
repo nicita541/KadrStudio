@@ -115,12 +115,10 @@ public sealed class AiMontageCoordinator(
     IMediaAnalysisPipeline analysis,
     IMontagePlanningProvider planning,
     IMontagePlanValidator? validator = null,
-    IMontagePlanCompiler? compiler = null,
-    AnimeEpisodeMergePlanner? animePlanner = null) : IAiMontageCoordinator
+    IMontagePlanCompiler? compiler = null) : IAiMontageCoordinator
 {
     private readonly IMontagePlanValidator _validator = validator ?? new MontagePlanValidator();
     private readonly IMontagePlanCompiler _compiler = compiler ?? new MontagePlanCompiler();
-    private readonly AnimeEpisodeMergePlanner _animePlanner = animePlanner ?? new AnimeEpisodeMergePlanner();
 
     public async Task<MontagePreparationResult> PreparePlanAsync(
         ProjectState project,
@@ -135,9 +133,11 @@ public sealed class AiMontageCoordinator(
         var manifests = await analysis.AnalyzeSourcesAsync(
             project, analysisRequest, analysisProgress, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
-        var plan = montageRequest.Preset?.Recipe == AutomationRecipeKind.MergeEpisodes
-            ? _animePlanner.CreatePlan(project, montageRequest, manifests)
-            : await CreatePlanAsync(project, montageRequest, manifests, cancellationToken).ConfigureAwait(false);
+        var plan = await CreatePlanAsync(
+            project,
+            montageRequest,
+            manifests,
+            cancellationToken).ConfigureAwait(false);
         progress?.Report(1);
         var pending = plan.Decisions.IsDefault
             ? ImmutableArray<MontageDecision>.Empty
@@ -158,8 +158,7 @@ public sealed class AiMontageCoordinator(
         ImmutableDictionary<Guid, MediaAnalysisManifest> manifests,
         CancellationToken cancellationToken = default)
     {
-        if (request.Preset?.Recipe == AutomationRecipeKind.MergeEpisodes)
-            return _animePlanner.CreatePlan(project, request, manifests);
+        RejectLegacyPreset(request.Preset);
         var plan = await planning.CreatePlanAsync(
             new MontagePlanningContext(project, request, manifests), cancellationToken).ConfigureAwait(false);
         return EnsureSafeOrConflict(project, plan);
@@ -200,9 +199,8 @@ public sealed class AiMontageCoordinator(
         Guid decisionId,
         string answer,
         TimelineTime? resolvedTime = null)
-        => plan.PresetSnapshot?.Recipe == AutomationRecipeKind.MergeEpisodes
-            ? _animePlanner.ResolveDecision(project, plan, decisionId, answer, resolvedTime)
-            : throw new InvalidOperationException("Текущий сценарий не содержит интерактивных решений.");
+        => throw new InvalidOperationException(
+            "Старые сценарные решения больше не выполняются. Постройте новый универсальный AI-план.");
 
     public MontageDraftCompilation CreateDraft(
         ProjectState project,
@@ -234,6 +232,16 @@ public sealed class AiMontageCoordinator(
         {
             if (!after.Items.Any(item => item.Id == locked.Id && item == locked))
                 throw new InvalidOperationException("ИИ попытался изменить заблокированный пункт плана.");
+        }
+    }
+
+    private static void RejectLegacyPreset(AutomationPreset? preset)
+    {
+        if (preset?.Recipe == AutomationRecipeKind.MergeEpisodes)
+        {
+            throw new InvalidOperationException(
+                "Сохранённый сценарий «Объединить серии» доступен только для чтения. " +
+                "Опишите задачу универсальному AI-агенту и постройте новый план.");
         }
     }
 }

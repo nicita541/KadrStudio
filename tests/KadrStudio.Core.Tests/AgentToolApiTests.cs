@@ -15,10 +15,18 @@ public sealed class AgentToolApiTests
         Assert.Equal(
             new[]
             {
+                "compare_media_ranges",
+                "compare_sequences",
+                "inspect_boundary",
+                "inspect_editor_context",
                 "inspect_media",
+                "inspect_objects",
                 "inspect_project",
                 "inspect_range",
-                "inspect_timeline"
+                "inspect_sequence_overview",
+                "inspect_timeline",
+                "inspect_timeline_integrity",
+                "search_timeline"
             },
             registry.Descriptors.Select(item => item.Name).ToArray());
 

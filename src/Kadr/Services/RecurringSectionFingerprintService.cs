@@ -7,14 +7,14 @@ using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Services;
 
-public sealed class AnimeFingerprintService(
+public sealed class RecurringSectionFingerprintService(
     FfmpegLocator locator,
     ProcessRunner processRunner,
     IArtifactStore artifacts)
 {
     private const int FormatVersion = 1;
 
-    public async Task<AnimeSectionFingerprint> CreateAsync(
+    public async Task<RecurringSectionFingerprint> CreateAsync(
         MediaSource source,
         TimeRange range,
         CancellationToken cancellationToken = default)
@@ -29,12 +29,12 @@ public sealed class AnimeFingerprintService(
         var cached = await artifacts.TryGetAsync(key, cancellationToken).ConfigureAwait(false);
         if (cached is { } payload)
         {
-            var restored = JsonSerializer.Deserialize<AnimeSectionFingerprint>(payload.Span);
+            var restored = JsonSerializer.Deserialize<RecurringSectionFingerprint>(payload.Span);
             if (restored is not null) return restored;
         }
 
         locator.EnsureAvailable();
-        var root = Path.Combine(Path.GetTempPath(), "KadrStudio", "anime-fingerprint", Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(KadrLocalDataPaths.TempRoot, "recurring-section-fingerprint", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         var videoPath = Path.Combine(root, "video.gray");
         var audioPath = Path.Combine(root, "audio.pcm");
@@ -68,7 +68,7 @@ public sealed class AnimeFingerprintService(
                 if (audio.ExitCode != 0) TryDelete(audioPath);
             }
 
-            var result = new AnimeSectionFingerprint(
+            var result = new RecurringSectionFingerprint(
                 BuildVisualHashes(await File.ReadAllBytesAsync(videoPath, cancellationToken).ConfigureAwait(false)),
                 File.Exists(audioPath)
                     ? BuildAudioEnvelope(await File.ReadAllBytesAsync(audioPath, cancellationToken).ConfigureAwait(false))
@@ -85,7 +85,7 @@ public sealed class AnimeFingerprintService(
         }
     }
 
-    public static double Similarity(AnimeSectionFingerprint left, AnimeSectionFingerprint right)
+    public static double Similarity(RecurringSectionFingerprint left, RecurringSectionFingerprint right)
     {
         var visual = SequenceSimilarity(left.VisualHashes, right.VisualHashes, static (a, b) =>
             1 - BitOperations.PopCount(a ^ b) / 64d, maximumOffset: 5);
@@ -165,6 +165,6 @@ public sealed class AnimeFingerprintService(
     }
 }
 
-public sealed record AnimeSectionFingerprint(
+public sealed record RecurringSectionFingerprint(
     ImmutableArray<ulong> VisualHashes,
     ImmutableArray<byte> AudioEnvelope);

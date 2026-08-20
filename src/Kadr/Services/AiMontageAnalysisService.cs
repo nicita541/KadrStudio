@@ -13,8 +13,7 @@ public sealed class AiMontageAnalysisService(
     AutomationOrchestrator orchestrator,
     AutoSubtitleService subtitles,
     AiVideoAnalysisService aiServer,
-    IArtifactStore artifacts,
-    AnimeFingerprintService fingerprintService) : IMediaAnalysisPipeline
+    IArtifactStore artifacts) : IMediaAnalysisPipeline
 {
     public const string PipelineVersion = "content-analysis-v2";
     private const int CacheFormatVersion = 2;
@@ -42,68 +41,7 @@ public sealed class AiMontageAnalysisService(
             progress?.Report((index + 1d) / Math.Max(1, ids.Length));
         }
         var manifests = result.ToImmutable();
-        return request.Profile.Kind == MaterialProfileKind.Anime && manifests.Count > 1
-            ? await CorrelateRepeatedSectionsAsync(project, manifests, cancellationToken).ConfigureAwait(false)
-            : manifests;
-    }
-
-    private async Task<ImmutableDictionary<Guid, MediaAnalysisManifest>> CorrelateRepeatedSectionsAsync(
-        ProjectState project,
-        ImmutableDictionary<Guid, MediaAnalysisManifest> manifests,
-        CancellationToken cancellationToken)
-    {
-        var candidates = manifests.Values
-            .SelectMany(manifest => (manifest.StructuralSegments.IsDefault
-                    ? ImmutableArray<StructuralSegment>.Empty
-                    : manifest.StructuralSegments)
-                .Where(segment => segment.Kind is StructuralSegmentKind.Opening or StructuralSegmentKind.Ending))
-            .ToArray();
-        var fingerprints = new Dictionary<Guid, AnimeSectionFingerprint>();
-        foreach (var candidate in candidates)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!project.Sources.TryGetValue(candidate.SourceId, out var source)) continue;
-            try
-            {
-                fingerprints[candidate.Id] = await fingerprintService.CreateAsync(
-                    source, candidate.SourceRange, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-                // Fingerprint correlation is corroborating evidence. Vision and
-                // frame-boundary review remain available when extraction fails.
-            }
-        }
-
-        var correlated = manifests;
-        foreach (var candidate in candidates)
-        {
-            if (!fingerprints.TryGetValue(candidate.Id, out var fingerprint)) continue;
-            var best = candidates
-                .Where(other => other.Id != candidate.Id && other.SourceId != candidate.SourceId &&
-                                other.Kind == candidate.Kind && fingerprints.ContainsKey(other.Id))
-                .Select(other => AnimeFingerprintService.Similarity(fingerprint, fingerprints[other.Id]))
-                .DefaultIfEmpty(0)
-                .Max();
-            if (best < 0.72) continue;
-            var evidence = new AnalysisEvidence(
-                MontageEvidenceKind.Technical,
-                $"Повторяющийся блок подтверждён визуально-звуковым отпечатком другой серии ({best:P0}).",
-                $"anime-fingerprint:{best:0.000}");
-            var manifest = correlated[candidate.SourceId];
-            var segments = manifest.StructuralSegments.Select(segment => segment.Id == candidate.Id
-                ? segment with
-                {
-                    Confidence = Math.Clamp(segment.Confidence + best * 0.12, 0, 0.99),
-                    Disposition = segment.HasConfirmedBoundaries
-                        ? StructuralSegmentDisposition.Remove
-                        : segment.Disposition,
-                    Evidence = segment.Evidence.Add(evidence)
-                }
-                : segment).ToImmutableArray();
-            correlated = correlated.SetItem(candidate.SourceId, manifest with { StructuralSegments = segments });
-        }
-        return correlated;
+        return manifests;
     }
 
     private async Task<MediaAnalysisManifest> AnalyzeSourceAsync(
@@ -135,29 +73,10 @@ public sealed class AiMontageAnalysisService(
         if (request.DeepAnalysis && !string.IsNullOrWhiteSpace(request.Model))
         {
             var technicalResult = RestoreTechnicalResult(source, baseline.Segments);
-            if (request.Profile.Kind == MaterialProfileKind.Anime)
-            {
-                var enhanced = await orchestrator.EnhanceStructureAsync(
-                    asset,
-                    technicalResult,
-                    BuildBaselineQuery(request.Profile),
-                    request.Model,
-                    progress,
-                    cancellationToken,
-                    request.IsBackground ? JobPriority.Background : JobPriority.UserInitiated).ConfigureAwait(false);
-                structural = BuildStructuralSegments(
-                    source, enhanced.Result.Ranges, hasVisionEvidence: enhanced.Warning is null);
-                segments.AddRange(enhanced.Result.Ranges
-                    .Where(range => IsStructural(range.Kind))
-                    .Select(range => ToAnalysisSegment(source.Id, range, MontageEvidenceKind.Vision)));
-            }
-            else
-            {
-                var semantic = await aiServer.AnalyzeMaterialAsync(
-                    asset, technicalResult, request.Profile, request.Model, progress, cancellationToken)
-                    .ConfigureAwait(false);
-                segments.AddRange(semantic);
-            }
+            var semantic = await aiServer.AnalyzeMaterialAsync(
+                asset, technicalResult, request.Profile, request.Model, progress, cancellationToken)
+                .ConfigureAwait(false);
+            segments.AddRange(semantic);
         }
 
         if (segments.Count == 0)
@@ -193,7 +112,7 @@ public sealed class AiMontageAnalysisService(
         IProgress<VideoAnalysisProgress> progress,
         CancellationToken cancellationToken)
     {
-        var baselineFingerprint = string.Join('|', fingerprint, PipelineVersion, "technical-whisper", request.Profile.Kind);
+        var baselineFingerprint = string.Join('|', fingerprint, PipelineVersion, "technical-whisper");
         var key = new MediaCacheKey(
             source.Id, baselineFingerprint, MediaArtifactKind.AnalysisManifest, 0, 0, CacheFormatVersion);
         var cached = await artifacts.TryGetAsync(key, cancellationToken).ConfigureAwait(false);
@@ -256,9 +175,7 @@ public sealed class AiMontageAnalysisService(
             source.Id, fingerprint, PipelineVersion, "technical+whisper", "technical", 1,
             DateTimeOffset.UtcNow,
             segments.OrderBy(item => item.SourceRange.Start).ThenBy(item => item.Id).ToImmutableArray(),
-            request.Profile.Kind == MaterialProfileKind.Anime
-                ? BuildStructuralSegments(source, pipeline.Result.Ranges, hasVisionEvidence: false)
-                : []);
+            []);
         await artifacts.PutAsync(key, JsonSerializer.SerializeToUtf8Bytes(baseline), cancellationToken)
             .ConfigureAwait(false);
         return baseline;
@@ -292,9 +209,10 @@ public sealed class AiMontageAnalysisService(
     }
 
     private static string BuildBaselineQuery(GameEditingProfile? profile = null)
-        => profile?.Kind == MaterialProfileKind.Anime
-            ? "Аниме: найди опенинг, эндинг, титры, рекап и превью следующей серии; сохрани сюжетные сцены."
-            : "Универсальный анализ видеоматериала: сцены, действия, движение, речь, эмоции, тишина и результат.";
+    {
+        _ = profile; // Compatibility preset may tune technical thresholds outside the AI prompt.
+        return "Универсальный технический анализ видеоматериала: смены сцен, движение, речь, звук, тишина, чёрные и замершие кадры.";
+    }
 
     private static AnalysisSegment ToAnalysisSegment(
         Guid sourceId,
@@ -319,96 +237,6 @@ public sealed class AiMontageAnalysisService(
             range.Confidence,
             [new AnalysisEvidence(evidenceKind, range.Description, range.Title)]);
     }
-
-    private static ImmutableArray<StructuralSegment> BuildStructuralSegments(
-        MediaSource source,
-        IEnumerable<DetectedVideoRange> ranges,
-        bool hasVisionEvidence)
-    {
-        var output = ImmutableArray.CreateBuilder<StructuralSegment>();
-        foreach (var range in ranges.Where(item => IsStructural(item.Kind)))
-        {
-            var kind = ToStructuralKind(range.Kind);
-            if (kind == StructuralSegmentKind.Unknown) continue;
-            var startTime = TimelineTime.FromSeconds(Math.Clamp(range.SourceStart, 0, source.Duration.TotalSeconds));
-            var endTime = TimelineTime.FromSeconds(Math.Clamp(
-                range.SourceStart + range.Duration, startTime.TotalSeconds, source.Duration.TotalSeconds));
-            if (endTime <= startTime) continue;
-            var evidenceKind = hasVisionEvidence ? MontageEvidenceKind.Vision : MontageEvidenceKind.Technical;
-            var evidence = ImmutableArray.Create(new AnalysisEvidence(
-                evidenceKind, range.Description, range.Title));
-            var confidence = hasVisionEvidence ? range.Confidence : Math.Min(range.Confidence, 0.72);
-            output.Add(new StructuralSegment(
-                Guid.NewGuid(),
-                source.Id,
-                kind,
-                new TimeRange(startTime, endTime - startTime),
-                DispositionFor(kind, confidence, hasVisionEvidence),
-                confidence,
-                ToBoundary(source, startTime, range.StartBoundary, confidence, hasVisionEvidence, evidence),
-                ToBoundary(source, endTime, range.EndBoundary, confidence, hasVisionEvidence, evidence),
-                evidence));
-        }
-        return output
-            .GroupBy(item => item.Kind)
-            .Select(group => group.OrderByDescending(item => item.Confidence).First())
-            .OrderBy(item => item.SourceRange.Start)
-            .ToImmutableArray();
-    }
-
-    private static ResolvedBoundary ToBoundary(
-        MediaSource source,
-        TimelineTime time,
-        BoundaryVerificationResult? verification,
-        double confidence,
-        bool hasVisionEvidence,
-        ImmutableArray<AnalysisEvidence> evidence)
-    {
-        var isSourceEdge = time == TimelineTime.Zero || time == source.Duration;
-        var hasCut = verification?.HasUnambiguousCandidate == true;
-        var verified = hasVisionEvidence && confidence >= 0.75 && (hasCut || isSourceEdge);
-        return new ResolvedBoundary(
-            time,
-            time,
-            verified ? BoundaryResolutionStatus.Verified : BoundaryResolutionStatus.Suggested,
-            verified
-                ? source.IsVariableFrameRate ? BoundaryPrecision.ExactPresentationTimestamp : BoundaryPrecision.Frame
-                : BoundaryPrecision.Coarse,
-            verified ? confidence : Math.Min(confidence, 0.74),
-            evidence);
-    }
-
-    private static StructuralSegmentDisposition DispositionFor(
-        StructuralSegmentKind kind,
-        double confidence,
-        bool hasVisionEvidence)
-    {
-        if (!hasVisionEvidence || confidence < 0.75)
-            return StructuralSegmentDisposition.NeedsInput;
-        return kind switch
-        {
-            StructuralSegmentKind.Opening or StructuralSegmentKind.Ending or
-                StructuralSegmentKind.Recap or StructuralSegmentKind.Preview or StructuralSegmentKind.Credits
-                => StructuralSegmentDisposition.Remove,
-            StructuralSegmentKind.Story or StructuralSegmentKind.PostCreditsStory
-                => StructuralSegmentDisposition.Retain,
-            _ => StructuralSegmentDisposition.NeedsInput
-        };
-    }
-
-    private static bool IsStructural(Models.MarkerKind kind)
-        => kind is Models.MarkerKind.Opening or Models.MarkerKind.Ending or Models.MarkerKind.PostCredits or
-            Models.MarkerKind.Preview or Models.MarkerKind.Recap;
-
-    private static StructuralSegmentKind ToStructuralKind(Models.MarkerKind kind) => kind switch
-    {
-        Models.MarkerKind.Opening => StructuralSegmentKind.Opening,
-        Models.MarkerKind.Ending => StructuralSegmentKind.Ending,
-        Models.MarkerKind.Recap => StructuralSegmentKind.Recap,
-        Models.MarkerKind.Preview => StructuralSegmentKind.Preview,
-        Models.MarkerKind.PostCredits => StructuralSegmentKind.PostCreditsStory,
-        _ => StructuralSegmentKind.Unknown
-    };
 
     private static UiMediaAsset ToUiAsset(MediaSource source)
         => new()

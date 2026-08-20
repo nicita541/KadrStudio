@@ -14,21 +14,21 @@ public sealed class AnalysisSubtitleIntegrationTests
     private static readonly object EnvironmentLock = new();
 
     [Fact]
-    public void Anime_fingerprint_similarity_combines_visual_and_audio_recurrence()
+    public void Recurring_section_similarity_combines_visual_and_audio_evidence()
     {
-        var left = new AnimeSectionFingerprint(
+        var left = new RecurringSectionFingerprint(
             [0x0011223344556677UL, 0x8899AABBCCDDEEFFUL, 0x0F0F0F0F0F0F0F0FUL,
              0xAAAAAAAAAAAAAAAAUL, 0x5555555555555555UL, 0x0123456789ABCDEFUL,
              0xFEDCBA9876543210UL, 0x1111111111111111UL],
             [10, 30, 60, 100, 180, 220, 140, 50]);
         var same = left with { AudioEnvelope = [11, 29, 61, 98, 181, 219, 142, 49] };
-        var different = new AnimeSectionFingerprint(
+        var different = new RecurringSectionFingerprint(
             Enumerable.Repeat(ulong.MaxValue, 8).ToImmutableArray(),
             Enumerable.Repeat((byte)255, 8).ToImmutableArray());
 
-        Assert.True(AnimeFingerprintService.Similarity(left, same) > 0.95);
-        Assert.True(AnimeFingerprintService.Similarity(left, different) <
-                    AnimeFingerprintService.Similarity(left, same));
+        Assert.True(RecurringSectionFingerprintService.Similarity(left, same) > 0.95);
+        Assert.True(RecurringSectionFingerprintService.Similarity(left, different) <
+                    RecurringSectionFingerprintService.Similarity(left, same));
     }
 
     [Fact(Timeout = 60_000)]
@@ -61,21 +61,21 @@ public sealed class AnalysisSubtitleIntegrationTests
                 Duration = 3, Width = 320, Height = 180, FrameRate = 24, ProbeResult = probe
             };
             var approximate = new DetectedVideoRange(
-                UiMarkerKind.Opening, 0.72, 2.28, "Опенинг", "rough semantic suggestion", 0.6);
+                UiMarkerKind.Note, 0.72, 2.28, "Пользовательская зона", "rough query-driven suggestion", 0.6);
             var baseline = new VideoAnalysisResult("baseline", 0, 3, [approximate]);
             var service = new VideoAnalysisService(locator, new ProcessRunner());
 
             var verification = await service.VerifyBoundaryAsync(source, 0.72, 0, 3, 24);
             var refined = await service.RefineSemanticBoundariesAsync(asset, baseline);
 
-            var opening = Assert.Single(refined.Ranges);
+            var refinedRange = Assert.Single(refined.Ranges);
             Assert.True(verification.CoarseCandidateCount > 0,
                 $"No coarse candidates; result={verification}");
             Assert.True(Math.Abs(verification.VerifiedTime - 1) <= 1d / 24 + 0.001,
                 $"Boundary verification did not choose the hard cut: {verification}");
-            Assert.InRange(Math.Abs(opening.SourceStart - 1), 0, 1d / 24 + 0.001);
-            Assert.Contains("кандидаты склеек", opening.Description, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("1 кадр", opening.Description, StringComparison.OrdinalIgnoreCase);
+            Assert.InRange(Math.Abs(refinedRange.SourceStart - 1), 0, 1d / 24 + 0.001);
+            Assert.Contains("кандидаты склеек", refinedRange.Description, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("1 кадр", refinedRange.Description, StringComparison.OrdinalIgnoreCase);
         }
         finally { DeleteRoot(root); }
     }

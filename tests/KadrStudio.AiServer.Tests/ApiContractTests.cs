@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace KadrStudio.AiServer.Tests;
 
@@ -54,6 +55,28 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
     }
 
     [Fact]
+    public void StandaloneServerDoesNotRegisterWindowsEventLogProvider()
+    {
+        var providerNames = _factory.Services
+            .GetServices<ILoggerProvider>()
+            .Select(provider => provider.GetType().FullName)
+            .ToArray();
+
+        Assert.DoesNotContain(
+            providerNames,
+            name => string.Equals(
+                name,
+                "Microsoft.Extensions.Logging.EventLog.EventLogLoggerProvider",
+                StringComparison.Ordinal));
+        Assert.Contains(
+            providerNames,
+            name => string.Equals(
+                name,
+                "Microsoft.Extensions.Logging.Console.ConsoleLoggerProvider",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task StructuredInferenceRejectsNonObjectSchemaBeforeBackendCall()
     {
         using var client = _factory.CreateAuthorizedClient();
@@ -75,6 +98,33 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
         Assert.Contains("Prompt cannot be empty", await response.Content.ReadAsStringAsync());
     }
 
+    [Fact]
+    public async Task StructuredInferenceRejectsUnknownPublicModelBeforeBackendCall()
+    {
+        using var client = _factory.CreateAuthorizedClient();
+        var request = ValidRequest() with { Model = "user-selected-private-model" };
+        using var response = await client.PostAsJsonAsync("/v1/inference/structured", request);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("Unknown public AI model alias", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task PlannerRoleRejectsImagesBeforeBackendCall()
+    {
+        using var client = _factory.CreateAuthorizedClient();
+        var request = ValidRequest() with
+        {
+            Model = AiServerOptions.DefaultPlannerPublicModelAlias,
+            Think = true,
+            Images = ["base64-image"]
+        };
+        using var response = await client.PostAsJsonAsync("/v1/inference/structured", request);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("does not accept images", await response.Content.ReadAsStringAsync());
+    }
+
     private static StructuredContractRequest ValidRequest()
         => new(
             JsonSerializer.SerializeToElement(new
@@ -90,7 +140,9 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
         JsonElement Schema,
         string SystemPrompt,
         string UserPrompt,
-        string[]? Images = null);
+        string[]? Images = null,
+        string? Model = null,
+        bool Think = false);
 }
 
 public sealed class ApiContractFactory : WebApplicationFactory<Program>

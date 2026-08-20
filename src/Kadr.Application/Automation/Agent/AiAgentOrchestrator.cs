@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using System.Text.Json;
+using KadrStudio.Application.Automation.Agent.Tools;
 
 namespace KadrStudio.Application.Automation.Agent;
 
@@ -155,6 +157,81 @@ public sealed class AiAgentOrchestrator
         });
     }
 
+    public AgentTaskState RestoreTask(AgentTaskState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        if (state.Id == Guid.Empty || state.ProjectId == Guid.Empty ||
+            state.SourceSequenceId == Guid.Empty || string.IsNullOrWhiteSpace(state.UserRequest))
+        {
+            throw new ArgumentException("Persisted agent task is invalid.", nameof(state));
+        }
+
+        AgentTaskState restored;
+        lock (_sync)
+        {
+            if (_currentTask is { IsTerminal: false })
+            {
+                throw new AgentTaskTransitionException(
+                    "An active agent task must be stopped before restoring another task.");
+            }
+
+            ArchiveTerminalTaskLocked();
+            restored = state with
+            {
+                Questions = state.Questions.IsDefault ? [] : state.Questions,
+                Journal = state.Journal.IsDefault ? [] : state.Journal,
+                EvidenceLedger = state.Evidence
+            };
+            _currentTask = restored;
+        }
+
+        Publish(restored);
+        return restored;
+    }
+
+    public AgentTaskState SetTaskBrief(AgentTaskBrief brief)
+    {
+        ArgumentNullException.ThrowIfNull(brief);
+        if (string.IsNullOrWhiteSpace(brief.Goal) || string.IsNullOrWhiteSpace(brief.Scope))
+        {
+            throw new ArgumentException(
+                "Task brief must contain a goal and scope.",
+                nameof(brief));
+        }
+
+        return Mutate(current =>
+        {
+            RequirePhase(
+                current,
+                AgentTaskPhase.Understanding,
+                AgentTaskPhase.Investigating,
+                AgentTaskPhase.Planning,
+                AgentTaskPhase.WaitingForUserInput);
+
+            var now = _utcNow();
+            return AppendJournal(
+                current with { Brief = brief, UpdatedAt = now },
+                AgentJournalKind.Progress,
+                "Agent updated its structured understanding of the task.",
+                now);
+        });
+    }
+
+    public AgentTaskState ReplaceEvidenceLedger(
+        IEnumerable<AgentEvidenceRecord> evidence)
+    {
+        ArgumentNullException.ThrowIfNull(evidence);
+        var normalized = evidence
+            .OrderBy(item => item.Sequence)
+            .ToImmutableArray();
+
+        return Mutate(current => current with
+        {
+            EvidenceLedger = normalized,
+            UpdatedAt = _utcNow()
+        });
+    }
+
     public AgentTaskState BeginPlanning(string? note = null)
     {
         return Mutate(current =>
@@ -185,10 +262,28 @@ public sealed class AiAgentOrchestrator
     }
 
     public AgentTaskState AskQuestion(string prompt, string? context = null)
+        => AskQuestions([
+            new AgentQuestion(
+                Guid.NewGuid(),
+                prompt,
+                context,
+                _utcNow())
+        ]);
+
+    public AgentTaskState AskQuestions(IEnumerable<AgentQuestion> questions)
     {
-        if (string.IsNullOrWhiteSpace(prompt))
+        ArgumentNullException.ThrowIfNull(questions);
+        var requested = questions.ToArray();
+        if (requested.Length is < 1 or > 3)
         {
-            throw new ArgumentException("Question cannot be empty.", nameof(prompt));
+            throw new ArgumentException(
+                "A clarification batch must contain between one and three questions.",
+                nameof(questions));
+        }
+
+        if (requested.Any(question => string.IsNullOrWhiteSpace(question.Prompt)))
+        {
+            throw new ArgumentException("Question cannot be empty.", nameof(questions));
         }
 
         return Mutate(current =>
@@ -206,24 +301,33 @@ public sealed class AiAgentOrchestrator
             EnsureNoOpenQuestion(current);
 
             var now = _utcNow();
-            var question = new AgentQuestion(
-                Guid.NewGuid(),
-                prompt.Trim(),
-                string.IsNullOrWhiteSpace(context) ? null : context.Trim(),
-                now);
+            var batch = requested.Select(question => question with
+            {
+                Id = question.Id == Guid.Empty ? Guid.NewGuid() : question.Id,
+                Prompt = question.Prompt.Trim(),
+                Context = string.IsNullOrWhiteSpace(question.Context)
+                    ? null
+                    : question.Context.Trim(),
+                AskedAt = now,
+                AnsweredAt = null,
+                Answer = null,
+                Options = question.AvailableOptions
+            }).ToImmutableArray();
 
             var updated = current with
             {
                 Phase = AgentTaskPhase.WaitingForUserInput,
                 ResumePhase = current.Phase,
-                Questions = current.Questions.Add(question),
+                Questions = current.Questions.AddRange(batch),
                 UpdatedAt = now
             };
 
             return AppendJournal(
                 updated,
                 AgentJournalKind.QuestionAsked,
-                question.Prompt,
+                batch.Length == 1
+                    ? batch[0].Prompt
+                    : $"Agent asked {batch.Length} blocking clarification questions.",
                 now);
         });
     }
@@ -266,12 +370,15 @@ public sealed class AiAgentOrchestrator
             };
 
             var questions = current.Questions.SetItem(index, answered);
+            var hasOpenQuestions = questions.Any(item => !item.IsAnswered);
             var resumePhase = current.ResumePhase ?? AgentTaskPhase.Investigating;
 
             var updated = current with
             {
-                Phase = resumePhase,
-                ResumePhase = null,
+                Phase = hasOpenQuestions
+                    ? AgentTaskPhase.WaitingForUserInput
+                    : resumePhase,
+                ResumePhase = hasOpenQuestions ? current.ResumePhase : null,
                 Questions = questions,
                 UpdatedAt = now
             };
@@ -524,6 +631,42 @@ public sealed class AiAgentOrchestrator
         });
     }
 
+    public AgentTaskState CompleteReadOnly(string summary)
+    {
+        if (string.IsNullOrWhiteSpace(summary))
+        {
+            throw new ArgumentException("Completion summary cannot be empty.", nameof(summary));
+        }
+
+        return Mutate(current =>
+        {
+            RequirePhase(
+                current,
+                AgentTaskPhase.Understanding,
+                AgentTaskPhase.Investigating,
+                AgentTaskPhase.Planning);
+            EnsureNoOpenQuestion(current);
+            if (current.Brief?.Kind != AgentTaskKind.ReadOnly ||
+                current.DraftSequenceId is not null)
+            {
+                throw new AgentTaskTransitionException(
+                    "Only a read-only task without an Agent Draft can complete without an approved plan.");
+            }
+
+            var now = _utcNow();
+            return AppendJournal(
+                current with
+                {
+                    Phase = AgentTaskPhase.Completed,
+                    CompletionSummary = summary.Trim(),
+                    UpdatedAt = now
+                },
+                AgentJournalKind.TaskCompleted,
+                summary.Trim(),
+                now);
+        });
+    }
+
     public AgentTaskState Fail(string error)
     {
         if (string.IsNullOrWhiteSpace(error))
@@ -554,6 +697,35 @@ public sealed class AiAgentOrchestrator
                 updated,
                 AgentJournalKind.TaskFailed,
                 error.Trim(),
+                now);
+        });
+    }
+
+    public AgentTaskState RetryFailedPlanning()
+    {
+        return Mutate(current =>
+        {
+            RequirePhase(current, AgentTaskPhase.Failed);
+            if (current.DraftSequenceId is not null)
+            {
+                throw new AgentTaskTransitionException(
+                    "A failed task with an Agent Draft cannot be retried automatically. Review or delete the preserved draft first.");
+            }
+
+            var now = _utcNow();
+            var phase = current.Brief is null
+                ? AgentTaskPhase.Understanding
+                : AgentTaskPhase.Investigating;
+            return AppendJournal(
+                current with
+                {
+                    Phase = phase,
+                    ResumePhase = null,
+                    FailureMessage = null,
+                    UpdatedAt = now
+                },
+                AgentJournalKind.Progress,
+                "Failed planning inference is being retried without creating an Agent Draft.",
                 now);
         });
     }
@@ -794,7 +966,14 @@ public sealed class AiAgentOrchestrator
                     : draft.ExpectedEditingTool.Trim(),
                 draft.EvidenceObservationSequences.IsDefault
                     ? ImmutableArray<int>.Empty
-                    : draft.EvidenceObservationSequences.Distinct().ToImmutableArray()));
+                    : draft.EvidenceObservationSequences.Distinct().ToImmutableArray(),
+                draft.ExpectedEditingArguments is { ValueKind: JsonValueKind.Object } arguments
+                    ? AgentActionApproval.NormalizeArguments(arguments)
+                    : null,
+                draft.EvidenceRequirement,
+                draft.ExpectedEffect.Trim(),
+                NormalizeConstraints(draft.ProtectedInvariants),
+                NormalizeConstraints(draft.VerificationChecks)));
         }
 
         return builder.MoveToImmutable();

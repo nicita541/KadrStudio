@@ -3,102 +3,8 @@ using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Application.Automation;
 
-public enum AiChatIntentKind
-{
-    PresetMontage,
-    TimelineCommand,
-    MontagePlan,
-    PlanRevision
-}
-
-public sealed record AiChatRoute(AiChatIntentKind Intent, AutomationPreset? Preset = null);
-
 public sealed class AiMontageChatCoordinator
 {
-    public AiChatRoute Route(string message, string? explicitPresetId, MontagePlan? activePlan = null)
-    {
-        var normalized = message.Trim().ToLowerInvariant();
-
-        if (!string.IsNullOrWhiteSpace(explicitPresetId))
-        {
-            var explicitPreset = AutomationPresets.BuiltIn.FirstOrDefault(
-                preset => string.Equals(
-                    preset.Id,
-                    explicitPresetId,
-                    StringComparison.OrdinalIgnoreCase));
-
-            if (explicitPreset is not null)
-            {
-                return new AiChatRoute(
-                    AiChatIntentKind.PresetMontage,
-                    explicitPreset);
-            }
-        }
-
-        if (activePlan is not null && ContainsAny(normalized,
-                "исправ", "измени", "оставь", "не удаляй", "сделай", "пересобери"))
-        {
-            return new AiChatRoute(
-                AiChatIntentKind.PlanRevision,
-                activePlan.PresetSnapshot);
-        }
-
-        // Явная команда объединения нескольких серий.
-        if (ContainsAny(normalized,
-                "объедини серии",
-                "объединить серии",
-                "склей серии",
-                "склеить серии"))
-        {
-            return new AiChatRoute(
-                AiChatIntentKind.PresetMontage,
-                AutomationPresets.AnimeMergeEpisodes);
-        }
-
-        // Удаление структурных частей видео должно идти через AI-план,
-        // потому что сначала нужно определить, где находится опенинг/эндинг/рекап.
-        var asksToRemove = ContainsAny(normalized,
-            "удали ",
-            "удалить ",
-            "убери ",
-            "убрать ",
-            "выреж",
-            "remove ");
-
-        var mentionsStructuralPart = ContainsAny(normalized,
-            "опенинг",
-            "эндинг",
-            "рекап",
-            "opening",
-            "ending",
-            "recap");
-
-        if (asksToRemove && mentionsStructuralPart)
-        {
-            return new AiChatRoute(AiChatIntentKind.MontagePlan);
-        }
-
-        // Обычные прямые команды таймлайна.
-        if (ContainsAny(normalized,
-                "удали ",
-                "удалить ",
-                "убери ",
-                "убрать ",
-                "выреж",
-                "разреж",
-                "раздели",
-                "delete ",
-                "remove ",
-                "split "))
-        {
-            return new AiChatRoute(AiChatIntentKind.TimelineCommand);
-        }
-
-        // Упоминание аниме-структуры само по себе больше не означает,
-        // что пользователь хочет объединять несколько серий.
-        return new AiChatRoute(AiChatIntentKind.MontagePlan);
-    }
-
     public AiConversation Append(AiConversation conversation, AiChatMessage message)
         => conversation with
         {
@@ -158,9 +64,6 @@ public sealed class AiMontageChatCoordinator
             plan.Title, plan.Summary, plan.Duration, retained, removed,
             plan.Warnings.IsDefault ? [] : plan.Warnings, canCreateDraft);
     }
-
-    private static bool ContainsAny(string value, params string[] candidates)
-        => candidates.Any(candidate => value.Contains(candidate, StringComparison.OrdinalIgnoreCase));
 
     private static string Format(TimelineTime time)
         => TimeSpan.FromSeconds(time.TotalSeconds).ToString(@"hh\:mm\:ss\.fff");

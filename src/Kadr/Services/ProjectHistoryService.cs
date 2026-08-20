@@ -15,9 +15,7 @@ public sealed class ProjectHistoryService
 
     public ProjectHistoryService(string? historyRoot = null)
     {
-        _historyRoot = Path.GetFullPath(historyRoot ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio", "History"));
+        _historyRoot = Path.GetFullPath(historyRoot ?? KadrLocalDataPaths.HistoryRoot);
         Directory.CreateDirectory(_historyRoot);
     }
 

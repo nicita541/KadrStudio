@@ -10,9 +10,7 @@ public sealed class RecentProjectsService
 
     public RecentProjectsService()
     {
-        var dataDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio");
+        var dataDirectory = KadrLocalDataPaths.SettingsRoot;
         Directory.CreateDirectory(dataDirectory);
         _storagePath = Path.Combine(dataDirectory, "recent-projects.json");
     }

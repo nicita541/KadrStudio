@@ -21,8 +21,8 @@ public sealed class WorkspaceSettingsService
     public WorkspaceSettingsService(string? path = null)
     {
         _path = Path.GetFullPath(path ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio", "settings.json"));
+            KadrLocalDataPaths.SettingsRoot,
+            "workspace.json"));
     }
 
     public WorkspaceSettings Load()

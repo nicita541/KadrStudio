@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Collections.Immutable;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Text.Json;
 using System.Windows.Data;
 using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
@@ -94,10 +95,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         _automationScheduler = services.AutomationScheduler;
         AutomationOrchestrator = new AutomationOrchestrator(
             _automationScheduler, VideoAnalysisService, AiVideoAnalysisService, AutoSubtitleService);
-        var animeFingerprints = new AnimeFingerprintService(
+        var recurringSectionFingerprints = new RecurringSectionFingerprintService(
             services.FfmpegLocator, services.ProcessRunner, _artifactStore);
         AiMontageAnalysisService = new AiMontageAnalysisService(
-            AutomationOrchestrator, AutoSubtitleService, AiVideoAnalysisService, _artifactStore, animeFingerprints);
+            AutomationOrchestrator, AutoSubtitleService, AiVideoAnalysisService, _artifactStore);
         AiMontageCoordinator = new AiMontageCoordinator(
             AiMontageAnalysisService,
             new AiServerMontagePlanningProvider(AiVideoAnalysisService));
@@ -111,7 +112,21 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             _artifactStore);
         AgentReadOnlyToolBackend = new KadrAgentReadOnlyToolBackend(
             () => _editorSession.State,
-            agentRangeInspector);
+            agentRangeInspector,
+            () =>
+            {
+                var state = _editorSession.State;
+                var active = state.Sequences.First(sequence =>
+                    sequence.Id == (state.ActiveSequenceId ?? state.Sequences[0].Id));
+                return new AgentEditorContextSnapshot(
+                    active.Id,
+                    active.Revision,
+                    Playhead,
+                    SelectedClip?.Id,
+                    active.InPoint?.TotalSeconds,
+                    active.OutPoint?.TotalSeconds);
+            },
+            recurringSectionFingerprints);
         AgentToolRegistry = AgentReadOnlyToolSet.Create(AgentReadOnlyToolBackend);
         AgentEditingToolBackend = new KadrAgentEditingToolBackend(
             () => _editorSession.State,
@@ -148,7 +163,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 "task_changed",
                 args.State.Id,
                 args.State.Phase.ToString(),
-                Message: args.State.UserRequest,
+                Message: "Agent task state changed.",
                 Details: DescribeAgentTaskForDebug(args.State)));
 
             OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
@@ -584,6 +599,14 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             new DeleteMediaClipsCommand(new HashSet<Guid> { SelectedClip.Id }, IncludeLinked: true));
     }
 
+    public bool RippleDeleteSelectedClip()
+    {
+        if (SelectedClip is null) return false;
+        return ExecuteCoreCommand(
+            "Клип удалён со сдвигом",
+            new RippleDeleteSelectedMediaClipCommand(SelectedClip.Id));
+    }
+
     public bool SplitSelectedAtPlayhead()
     {
         var clip = SelectedClip;
@@ -596,6 +619,25 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         return ExecuteCoreCommand("Клип разделён",
             new SplitSelectedMediaClipCommand(clip.Id,
                 KadrStudio.Core.Domain.TimelineTime.FromSeconds(Playhead), rightId), rightId);
+    }
+
+    public bool SplitClipAt(Guid clipId, double seconds, bool includeLinked)
+    {
+        var clip = Project.FindClip(clipId);
+        if (clip is null || seconds <= clip.Start + 0.1 || seconds >= clip.End - 0.1)
+        {
+            return false;
+        }
+
+        var rightId = Guid.NewGuid();
+        return ExecuteCoreCommand(
+            includeLinked ? "Связанные клипы разделены" : "Клип разделён без связи",
+            new SplitSelectedMediaClipCommand(
+                clip.Id,
+                KadrStudio.Core.Domain.TimelineTime.FromSeconds(seconds),
+                rightId,
+                includeLinked),
+            rightId);
     }
 
     public bool UnlinkSelectedClip()
@@ -696,9 +738,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public IReadOnlyList<CoreGameEditingProfile> GetGameEditingProfiles()
         => _settingsService.LoadGameEditingProfiles();
-
-    public IReadOnlyList<KadrStudio.Core.Domain.AutomationPreset> GetAutomationPresets()
-        => AutomationPresets.BuiltIn;
 
     public Task SaveCustomGameEditingProfilesAsync(
         IEnumerable<CoreGameEditingProfile> profiles,
@@ -805,6 +844,80 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CoreState));
     }
 
+    public void PersistAgentTaskState(AgentTaskState task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        var normalizedPlan = task.Plan is null
+            ? null
+            : task.Plan with
+            {
+                Constraints = task.Plan.Constraints.IsDefault ? [] : task.Plan.Constraints,
+                Steps = task.Plan.Steps.Select(step => step with
+                {
+                    EvidenceObservationSequences = step.EvidenceObservationSequences.IsDefault
+                        ? []
+                        : step.EvidenceObservationSequences,
+                    ProtectedInvariants = step.ProtectedInvariants.IsDefault
+                        ? []
+                        : step.ProtectedInvariants,
+                    VerificationChecks = step.VerificationChecks.IsDefault
+                        ? []
+                        : step.VerificationChecks
+                }).ToImmutableArray()
+            };
+        var normalized = task with
+        {
+            Brief = task.Brief is null
+                ? null
+                : AgentTaskBrief.Create(
+                    task.Brief.Kind,
+                    task.Brief.Goal,
+                    task.Brief.Scope,
+                    task.Brief.ProtectedElements.IsDefault ? [] : task.Brief.ProtectedElements,
+                    task.Brief.Constraints.IsDefault ? [] : task.Brief.Constraints,
+                    task.Brief.AcceptanceCriteria.IsDefault ? [] : task.Brief.AcceptanceCriteria,
+                    task.Brief.Assumptions.IsDefault ? [] : task.Brief.Assumptions,
+                    task.Brief.MissingInformation.IsDefault ? [] : task.Brief.MissingInformation),
+            Plan = normalizedPlan,
+            Questions = task.Questions.IsDefault
+                ? []
+                : task.Questions.Select(question => question with
+                {
+                    Options = question.AvailableOptions
+                }).ToImmutableArray(),
+            Journal = task.Journal.IsDefault ? [] : task.Journal,
+            EvidenceLedger = task.Evidence.Select(evidence => evidence with
+            {
+                Facts = evidence.Facts.IsDefault ? [] : evidence.Facts
+            }).ToImmutableArray()
+        };
+        var payload = JsonSerializer.Serialize(normalized);
+        var conversation = GetAiConversation();
+        var existing = conversation.Messages.LastOrDefault(message =>
+            message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.AgentMemory &&
+            message.AgentTaskId == task.Id);
+        var memory = existing is null
+            ? new KadrStudio.Core.Domain.AiChatMessage(
+                Guid.NewGuid(),
+                KadrStudio.Core.Domain.AiChatRole.Assistant,
+                KadrStudio.Core.Domain.AiChatMessageKind.AgentMemory,
+                payload,
+                DateTimeOffset.UtcNow,
+                AgentTaskId: task.Id)
+            : existing with { Text = payload };
+        SaveAiConversation(existing is null
+            ? conversation with
+            {
+                Messages = conversation.Messages.Add(memory),
+                UpdatedAt = DateTimeOffset.UtcNow
+            }
+            : conversation with
+            {
+                Messages = conversation.Messages.Replace(existing, memory),
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+    }
+
     public AgentTaskState StartAgentTask(string userRequest)
     {
         if (HasPendingEditReview)
@@ -859,14 +972,21 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             source.Revision);
     }
 
-    public AgentTaskState AnswerAgentQuestion(string answer)
+    public AgentTaskState AnswerAgentQuestion(
+        string answer,
+        Guid? questionId = null)
     {
         var task = AiAgentOrchestrator.CurrentTask
             ?? throw new AgentTaskTransitionException(
                 "Нет активной задачи агента.");
-        var question = task.Questions.LastOrDefault(item => !item.IsAnswered)
-            ?? throw new AgentTaskTransitionException(
-                "У агента нет открытого вопроса.");
+        var question = questionId is { } requestedId
+            ? task.Questions.FirstOrDefault(item => item.Id == requestedId && !item.IsAnswered)
+            : task.Questions.LastOrDefault(item => !item.IsAnswered);
+        if (question is null)
+        {
+            throw new AgentTaskTransitionException(
+                "У агента нет указанного открытого вопроса.");
+        }
 
         return AiAgentOrchestrator.AnswerQuestion(
             question.Id,
@@ -957,6 +1077,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 string.IsNullOrWhiteSpace(reason)
                     ? "Задача остановлена пользователем."
                     : reason);
+    }
+
+    public AgentTaskState RetryFailedAgentPlanning()
+    {
+        var task = AiAgentOrchestrator.RetryFailedPlanning();
+        PersistAgentTaskState(task);
+        return task;
     }
 
     public async Task<ImmutableDictionary<Guid, CoreMediaAnalysisManifest>> AnalyzeMontageSourcesAsync(
@@ -1734,10 +1861,53 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private void AttachProject(ProjectViewState project)
     {
+        TryRestoreAgentTask();
         var timelineAssetIds = project.Clips.Select(item => item.AssetId).ToHashSet();
         foreach (var asset in project.Media.Where(item => timelineAssetIds.Contains(item.Id)))
         {
             QueueTimelineMediaPreparation(asset);
+        }
+    }
+
+    private void TryRestoreAgentTask()
+    {
+        if (AiAgentOrchestrator.CurrentTask is { IsTerminal: false })
+        {
+            return;
+        }
+
+        var memory = _editorSession.State.AiConversation.Messages
+            .LastOrDefault(message =>
+                message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.AgentMemory &&
+                message.AgentTaskId.HasValue);
+        if (memory is null || string.IsNullOrWhiteSpace(memory.Text))
+        {
+            return;
+        }
+
+        try
+        {
+            var task = JsonSerializer.Deserialize<AgentTaskState>(memory.Text);
+            if (task is null || task.ProjectId != _editorSession.State.Id)
+            {
+                return;
+            }
+
+            AiAgentOrchestrator.RestoreTask(task);
+            if (task.DraftSequenceId is not null)
+            {
+                AgentEditingToolBackend.Reset(task.Id);
+            }
+        }
+        catch (Exception exception) when (
+            exception is JsonException or AgentTaskTransitionException or ArgumentException)
+        {
+            AgentDebugLog.Write(new AgentDebugLogEntry(
+                DateTimeOffset.UtcNow,
+                "agent_persistence",
+                "restore_failed",
+                Message: exception.Message,
+                Exception: exception.ToString()));
         }
     }
 
@@ -1852,7 +2022,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             // Most users drag freshly imported media immediately. Keep this
             // cheap idle window so background detection never races that drop.
             await Task.Delay(TimeSpan.FromSeconds(8), cancellationToken);
-            var profile = GameEditingProfiles.Get("generic-sandbox");
+            var profile = GameEditingProfiles.Get("universal");
             var manifests = await AiMontageCoordinator.AnalyzeSourcesAsync(
                 snapshot,
                 new MediaAnalysisRequest(sourceIds, profile, string.Empty, DeepAnalysis: false, IsBackground: true),

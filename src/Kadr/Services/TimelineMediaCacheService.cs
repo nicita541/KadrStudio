@@ -84,7 +84,7 @@ public sealed class TimelineMediaCacheService : IAsyncDisposable
             cached = await _artifacts.TryGetPayloadPathAsync(key, ".jpg", cancellationToken);
             if (cached is not null) return cached;
 
-            var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.jpg");
+            var temporary = Path.Combine(KadrLocalDataPaths.TempRoot, "artifacts", $"{Guid.NewGuid():N}.jpg");
             Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
             try
             {

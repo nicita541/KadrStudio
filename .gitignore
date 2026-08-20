@@ -24,3 +24,4 @@ TestResults/
 *.proxy.*
 AI
 Logs/
+LocalData/

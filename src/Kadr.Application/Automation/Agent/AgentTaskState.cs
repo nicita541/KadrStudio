@@ -18,7 +18,9 @@ public sealed record AgentTaskState(
     string? FailureMessage,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    long? SourceSequenceRevision = null)
+    long? SourceSequenceRevision = null,
+    AgentTaskBrief? Brief = null,
+    ImmutableArray<AgentEvidenceRecord> EvidenceLedger = default)
 {
     public bool IsTerminal =>
         Phase is AgentTaskPhase.Completed or AgentTaskPhase.Failed or AgentTaskPhase.Stopped;
@@ -28,6 +30,11 @@ public sealed record AgentTaskState(
 
     public bool HasApprovedPlan =>
         Plan?.ApprovedAt is not null;
+
+    public ImmutableArray<AgentEvidenceRecord> Evidence =>
+        EvidenceLedger.IsDefault
+            ? ImmutableArray<AgentEvidenceRecord>.Empty
+            : EvidenceLedger;
 
     // The future UI can bind to this property:
     // during agent execution/verification the draft is visible, but user editing is locked.

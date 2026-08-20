@@ -326,7 +326,7 @@ public sealed class AgentPlanningLoopTests
     }
 
     [Fact]
-    public async Task Planning_model_only_receives_read_only_tool_descriptors()
+    public async Task Planning_model_receives_read_tools_and_plan_only_editing_catalog()
     {
         var orchestrator = CreateStartedTask();
         var registry = new AgentToolRegistry();
@@ -345,31 +345,64 @@ public sealed class AgentPlanningLoopTests
         await loop.RunUntilPauseAsync();
 
         var request = Assert.Single(model.Requests);
-        var descriptor = Assert.Single(request.AvailableTools);
-        Assert.Equal("inspect_counter", descriptor.Name);
-        Assert.Equal(AgentToolAccess.ReadOnly, descriptor.Access);
+        Assert.Collection(
+            request.AvailableTools.OrderBy(item => item.Name, StringComparer.Ordinal),
+            descriptor =>
+            {
+                Assert.Equal("fake_edit", descriptor.Name);
+                Assert.Equal(AgentToolAccess.Editing, descriptor.Access);
+            },
+            descriptor =>
+            {
+                Assert.Equal("inspect_counter", descriptor.Name);
+                Assert.Equal(AgentToolAccess.ReadOnly, descriptor.Access);
+            });
     }
 
     [Fact]
-    public async Task Opening_and_ending_removal_cannot_be_planned_from_timeline_structure_alone()
+    public async Task Planning_model_cannot_execute_visible_editing_catalog_entry()
+    {
+        var orchestrator = CreateStartedTask();
+        var registry = new AgentToolRegistry();
+        registry.Register(new FakeEditingTool());
+        var model = new ScriptedAgentModel(
+            AgentModelDecision.UseTool("fake_edit", AgentToolJson.EmptyObject()),
+            AgentModelDecision.PublishPlan(CreatePlan()));
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var result = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForApproval, result.Phase);
+        Assert.Contains(loop.Observations, observation =>
+            observation.ErrorCode == "editing_tool_requires_approved_plan");
+    }
+
+    [Fact]
+    public async Task Semantic_edit_cannot_be_planned_from_timeline_structure_alone()
     {
         var orchestrator = new AiAgentOrchestrator();
         orchestrator.StartTask(
             Guid.NewGuid(),
             Guid.NewGuid(),
-            "Удали опенинг и эндинг, остальное не трогай.");
+            "Удали повторяющуюся служебную сцену, остальное не трогай.");
         var registry = new AgentToolRegistry();
         registry.Register(new CountingReadTool());
         registry.Register(new FakeEditingTool());
         var unsupportedPlan = AgentPlanDraft.Create(
-            "Удалить опенинг и эндинг.",
+            "Удалить служебную сцену.",
             "Границы якобы определены по структуре таймлайна.",
             ["Остальное не менять."],
             [new AgentPlanStepDraft(
                 "Удалить диапазоны",
                 "Удалить начало и конец.",
                 "fake_edit",
-                [1])]);
+                [1],
+                AgentToolJson.EmptyObject(),
+                AgentEvidenceRequirement.Frames)]);
         var model = new ScriptedAgentModel(
             AgentModelDecision.UseTool("inspect_counter", AgentToolJson.EmptyObject()),
             AgentModelDecision.PublishPlan(unsupportedPlan),
@@ -391,6 +424,51 @@ public sealed class AgentPlanningLoopTests
             "визуально",
             Assert.Single(waiting.Questions.Where(item => !item.IsAnswered)).Prompt,
             StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Multiple_ripple_delete_steps_are_rejected_before_approval()
+    {
+        var orchestrator = CreateStartedTask();
+        var registry = new AgentToolRegistry();
+        var unsafePlan = AgentPlanDraft.Create(
+            "Удалить два диапазона.",
+            "Небезопасные последовательные координаты.",
+            ["Остальное не менять."],
+            [
+                new AgentPlanStepDraft(
+                    "Удалить слева",
+                    "Первый ripple меняет координаты.",
+                    "ripple_delete_ranges",
+                    [1],
+                    AgentToolJson.ToElement(new { ranges = new[] { new { start_seconds = 1, end_seconds = 2 } } }),
+                    AgentEvidenceRequirement.Timeline),
+                new AgentPlanStepDraft(
+                    "Удалить справа",
+                    "Второй ripple использует уже устаревшие координаты.",
+                    "ripple_delete_ranges",
+                    [1],
+                    AgentToolJson.ToElement(new { ranges = new[] { new { start_seconds = 8, end_seconds = 9 } } }),
+                    AgentEvidenceRequirement.Timeline)
+            ]);
+        var model = new ScriptedAgentModel(
+            AgentModelDecision.PublishPlan(unsafePlan),
+            AgentModelDecision.AskUser(
+                "План нужно пересобрать одним пакетным действием.",
+                "Последовательные ripple-вызовы меняют координаты."));
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var result = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, result.Phase);
+        Assert.Null(result.Plan);
+        Assert.Contains(loop.Observations, item =>
+            item.ErrorCode == "plan_evidence_required" &&
+            item.Summary.Contains("ripple_delete_ranges", StringComparison.Ordinal));
     }
 
     private static AiAgentOrchestrator CreateStartedTask()

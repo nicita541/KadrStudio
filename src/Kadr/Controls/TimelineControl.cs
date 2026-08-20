@@ -32,6 +32,8 @@ public sealed class TimelineControl : FrameworkElement
     private readonly Pen _gridPen = CreatePen(Color.FromRgb(48, 49, 57), 1);
     private readonly Pen _minorGridPen = CreatePen(Color.FromRgb(38, 39, 46), 1);
     private readonly Pen _playheadPen = CreatePen(Color.FromRgb(242, 84, 105), 2);
+    private readonly Pen _razorGuidePen = CreatePen(Color.FromRgb(251, 191, 36), 1.5);
+    private readonly Pen _snapGuidePen = CreatePen(Color.FromRgb(167, 139, 250), 1.5);
     private TimelineReadModel? _document;
     private Guid? _selectedClipId;
     private double _playheadSeconds;
@@ -44,6 +46,10 @@ public sealed class TimelineControl : FrameworkElement
     private TextOverlay? _dragTextOriginal;
     private Guid? _selectedTextOverlayId;
     private bool _dragChanged;
+    private Guid? _razorHoverClipId;
+    private double? _razorHoverTime;
+    private bool _razorHoverIsSnapped;
+    private double? _snapGuideTime;
 
     public TimelineControl()
     {
@@ -61,6 +67,7 @@ public sealed class TimelineControl : FrameworkElement
     public event EventHandler<TimelineEditEventArgs>? EditCompleted;
     public event EventHandler<TimelineEditRequestedEventArgs>? EditRequested;
     public event EventHandler<AssetDroppedEventArgs>? AssetDropped;
+    public event EventHandler<RazorSplitRequestedEventArgs>? RazorSplitRequested;
 
     public Func<Guid, TimelineTime, CancellationToken, Task<string?>>? ThumbnailRequest
     {
@@ -73,6 +80,7 @@ public sealed class TimelineControl : FrameworkElement
         set
         {
             _document = value is null ? null : TimelineReadModel.From(value);
+            ClearInteractionGuides();
             _thumbnailRenderer.BeginViewportGeneration();
             InvalidateMeasure();
             InvalidateVisual();
@@ -123,6 +131,21 @@ public sealed class TimelineControl : FrameworkElement
     }
 
     public bool IsEditingLocked { get; set; }
+
+    public TimelineToolMode ToolMode
+    {
+        get => _interaction.ToolMode;
+        set
+        {
+            if (_interaction.ToolMode == value) return;
+            _interaction.ToolMode = value;
+            ClearInteractionGuides();
+            Cursor = value == TimelineToolMode.Razor ? Cursors.Cross : Cursors.Arrow;
+            InvalidateVisual();
+        }
+    }
+
+    public bool IsSnappingEnabled { get; set; } = true;
 
     public double PixelsPerSecond
     {
@@ -211,6 +234,7 @@ public sealed class TimelineControl : FrameworkElement
         DrawSemanticFlags(context, dpi);
         DrawInOutSelection(context, dpi);
         DrawPlayhead(context);
+        DrawInteractionGuide(context, dpi);
         DrawStickyHeaders(context, dpi);
     }
 
@@ -228,7 +252,28 @@ public sealed class TimelineControl : FrameworkElement
             e.Handled = true;
             return;
         }
-        if (point.Y <= RulerHeight || Math.Abs(point.X - playheadX) <= 7)
+        if (point.Y <= RulerHeight)
+        {
+            SetPlayheadFromPoint(point);
+            BeginPlayheadDrag();
+            e.Handled = true;
+            return;
+        }
+
+        if (ToolMode == TimelineToolMode.Razor && !IsEditingLocked)
+        {
+            if (ResolveRazorTarget(point) is { } razorTarget)
+            {
+                RazorSplitRequested?.Invoke(this, new RazorSplitRequestedEventArgs(
+                    razorTarget.Clip.Id,
+                    razorTarget.Time,
+                    includeLinked: !Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)));
+            }
+            e.Handled = true;
+            return;
+        }
+
+        if (Math.Abs(point.X - playheadX) <= 7)
         {
             SetPlayheadFromPoint(point);
             BeginPlayheadDrag();
@@ -337,7 +382,14 @@ public sealed class TimelineControl : FrameworkElement
 
         if (IsEditingLocked)
         {
+            ClearInteractionGuides();
             Cursor = point.Y <= RulerHeight ? Cursors.Hand : Cursors.Arrow;
+            return;
+        }
+
+        if (ToolMode == TimelineToolMode.Razor && e.LeftButton != MouseButtonState.Pressed)
+        {
+            UpdateRazorHover(point);
             return;
         }
 
@@ -382,6 +434,7 @@ public sealed class TimelineControl : FrameworkElement
             _interaction.EndPlayheadDrag();
             if (IsMouseCaptured) ReleaseMouseCapture();
             Cursor = Cursors.Arrow;
+            _snapGuideTime = null;
             e.Handled = true;
             return;
         }
@@ -406,6 +459,7 @@ public sealed class TimelineControl : FrameworkElement
             }
             EditCompleted?.Invoke(this, new TimelineEditEventArgs(overlayId, changed));
             _dragChanged = false;
+            _snapGuideTime = null;
             e.Handled = true;
             return;
         }
@@ -436,7 +490,18 @@ public sealed class TimelineControl : FrameworkElement
         }
         EditCompleted?.Invoke(this, new TimelineEditEventArgs(clipId, changedClip));
         _dragChanged = false;
+        _snapGuideTime = null;
         e.Handled = true;
+    }
+
+    protected override void OnMouseLeave(MouseEventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (!_interaction.IsDraggingPlayhead && _dragClip is null && _dragTextOverlay is null)
+        {
+            ClearInteractionGuides();
+            InvalidateVisual();
+        }
     }
 
     private void BeginPlayheadDrag()
@@ -573,7 +638,8 @@ public sealed class TimelineControl : FrameworkElement
                         minimumDelta = Math.Max(minimumDelta, linkedPrevious.End - linkedOriginal.Start);
                 }
                 var maximumDelta = _dragOriginal.Duration - MinimumClipDuration;
-                var applied = Math.Clamp(SnapDuration(deltaSeconds), minimumDelta, maximumDelta);
+                var snappedStart = SnapEditTime(_dragOriginal.Start + deltaSeconds, MovingClipIds());
+                var applied = Math.Clamp(snappedStart - _dragOriginal.Start, minimumDelta, maximumDelta);
                 _dragClip.SourceStart = _dragOriginal.SourceStart + applied;
                 _dragClip.Duration = _dragOriginal.Duration - applied;
                 _dragClip.Start = Math.Max(0, _dragOriginal.Start + applied);
@@ -603,8 +669,9 @@ public sealed class TimelineControl : FrameworkElement
                     maximumDuration = Math.Min(maximumDuration,
                         _dragOriginal.Duration + linkedMaximum - linkedOriginal.Duration);
                 }
+                var snappedEnd = SnapEditTime(_dragOriginal.End + deltaSeconds, MovingClipIds());
                 _dragClip.Duration = Math.Clamp(
-                    _dragOriginal.Duration + SnapDuration(deltaSeconds),
+                    snappedEnd - _dragOriginal.Start,
                     MinimumClipDuration,
                     maximumDuration);
                 break;
@@ -631,7 +698,8 @@ public sealed class TimelineControl : FrameworkElement
         {
             _dragClip.TrackIndex = target.Index;
         }
-        var desiredStart = SnapTime(Math.Max(0, Viewport.ContentXToTime(point.X) - _interaction.PointerOffsetSeconds));
+        var rawStart = Math.Max(0, Viewport.ContentXToTime(point.X) - _interaction.PointerOffsetSeconds);
+        var desiredStart = SnapMovingStart(rawStart);
         _dragClip.Start = FindNonOverlappingStart(_dragClip, desiredStart);
     }
 
@@ -660,38 +728,40 @@ public sealed class TimelineControl : FrameworkElement
             return Math.Max(0, desiredStart);
         }
         var movingIds = _dragLinkedClips.Select(item => item.Clip.Id).Append(moving.Id).ToHashSet();
-        var candidate = Math.Max(0, desiredStart);
-        var memberCount = _dragLinkedClips.Count + 1;
-        for (var attempt = 0; attempt <= Math.Max(4, _document.Clips.Count * memberCount); attempt++)
-        {
-            var adjusted = false;
-            var members = new[] { (Clip: moving, Original: _dragOriginal ?? moving) }
-                .Concat(_dragLinkedClips);
-            foreach (var (member, original) in members)
+        var anchorStart = _dragOriginal?.Start ?? moving.Start;
+        var members = new[] { (Clip: moving, Original: _dragOriginal ?? moving) }
+            .Concat(_dragLinkedClips)
+            .Select(item => new
             {
-                var relativeStart = original.Start - (_dragOriginal?.Start ?? moving.Start);
-                var memberStart = candidate + relativeStart;
-                if (memberStart < 0)
-                {
-                    candidate -= memberStart;
-                    adjusted = true;
-                    break;
-                }
-                var others = _document.GetTrackClips(member.Track, member.TrackIndex)
-                    .Where(clip => !movingIds.Contains(clip.Id));
-                var overlap = others.FirstOrDefault(clip =>
-                    memberStart < clip.End - 0.0001 && memberStart + member.Duration > clip.Start + 0.0001);
-                if (overlap is null) continue;
-                candidate = memberStart + member.Duration / 2 < overlap.Start + overlap.Duration / 2
-                    ? overlap.Start - member.Duration - relativeStart
-                    : overlap.End - relativeStart;
-                candidate = Math.Max(0, candidate);
-                adjusted = true;
-                break;
+                item.Clip,
+                RelativeStart = item.Original.Start - anchorStart
+            })
+            .ToArray();
+        var minimumStart = members.Max(member => -member.RelativeStart);
+        var candidates = new HashSet<double> { Math.Max(minimumStart, desiredStart), minimumStart };
+        foreach (var member in members)
+        {
+            foreach (var other in _document.GetTrackClips(member.Clip.Track, member.Clip.TrackIndex)
+                         .Where(clip => !movingIds.Contains(clip.Id)))
+            {
+                candidates.Add(other.Start - member.Clip.Duration - member.RelativeStart);
+                candidates.Add(other.End - member.RelativeStart);
             }
-            if (!adjusted) break;
         }
-        return SnapTime(candidate);
+
+        return candidates
+            .Where(candidate => candidate >= minimumStart - 0.0001)
+            .Where(candidate => members.All(member =>
+            {
+                var start = candidate + member.RelativeStart;
+                var end = start + member.Clip.Duration;
+                return _document.GetTrackClips(member.Clip.Track, member.Clip.TrackIndex)
+                    .Where(clip => !movingIds.Contains(clip.Id))
+                    .All(other => start >= other.End - 0.0001 || end <= other.Start + 0.0001);
+            }))
+            .OrderBy(candidate => Math.Abs(candidate - desiredStart))
+            .ThenBy(candidate => candidate)
+            .FirstOrDefault(Math.Max(minimumStart, desiredStart));
     }
 
     private void DrawRuler(DrawingContext context, double dpi)
@@ -1005,6 +1075,34 @@ public sealed class TimelineControl : FrameworkElement
         context.DrawGeometry(new SolidColorBrush(Color.FromRgb(242, 84, 105)), null, marker);
     }
 
+    private void DrawInteractionGuide(DrawingContext context, double dpi)
+    {
+        if (_razorHoverTime is { } razorTime && _razorHoverClipId.HasValue)
+        {
+            var x = Viewport.TimeToContentX(razorTime);
+            var pen = _razorHoverIsSnapped ? _snapGuidePen : _razorGuidePen;
+            context.DrawLine(pen, new Point(x, TrackAreaTop), new Point(x, RenderSize.Height));
+            var label = TimeSpan.FromSeconds(Math.Max(0, razorTime)).ToString(@"mm\:ss\.fff");
+            var text = CreateText(label, 9, _razorHoverIsSnapped
+                ? Color.FromRgb(196, 181, 253)
+                : Color.FromRgb(253, 230, 138), dpi, FontWeights.SemiBold);
+            context.DrawRoundedRectangle(
+                new SolidColorBrush(Color.FromArgb(225, 20, 21, 26)),
+                pen,
+                new Rect(Math.Max(LeftGutterWidth, x + 5), TrackAreaTop + 2, text.Width + 10, text.Height + 5),
+                4,
+                4);
+            context.DrawText(text, new Point(Math.Max(LeftGutterWidth + 5, x + 10), TrackAreaTop + 4));
+            return;
+        }
+
+        if (_snapGuideTime is { } snapTime)
+        {
+            var x = Viewport.TimeToContentX(snapTime);
+            context.DrawLine(_snapGuidePen, new Point(x, TrackAreaTop), new Point(x, RenderSize.Height));
+        }
+    }
+
     private void DrawInOutSelection(DrawingContext context, double dpi)
     {
         if (_document is null || (_document.InPoint is null && _document.OutPoint is null))
@@ -1130,12 +1228,121 @@ public sealed class TimelineControl : FrameworkElement
             .FirstOrDefault();
 
     private double SnapTime(double seconds)
+        => TimelineSnapEngine.SnapTime(
+            seconds,
+            _document?.FrameRateValue.FramesPerSecond ?? 30,
+            PixelsPerSecond,
+            snappingEnabled: false,
+            []).Value;
+
+    private double SnapDuration(double seconds)
     {
         var frameRate = Math.Max(1, _document?.FrameRateValue.FramesPerSecond ?? 30);
         return Math.Round(seconds * frameRate) / frameRate;
     }
 
-    private double SnapDuration(double seconds) => SnapTime(seconds);
+    private double SnapEditTime(double proposedTime, IReadOnlySet<Guid> excludedClipIds)
+    {
+        var result = TimelineSnapEngine.SnapTime(
+            proposedTime,
+            _document?.FrameRateValue.FramesPerSecond ?? 30,
+            PixelsPerSecond,
+            IsSnappingEnabled,
+            GetSnapTargets(excludedClipIds));
+        _snapGuideTime = result.IsSnapped ? result.Value : null;
+        return result.Value;
+    }
+
+    private double SnapMovingStart(double proposedStart)
+    {
+        if (_dragOriginal is null)
+        {
+            return SnapTime(proposedStart);
+        }
+
+        var proposedDelta = proposedStart - _dragOriginal.Start;
+        var frameAlignedDelta = SnapTime(proposedStart) - _dragOriginal.Start;
+        var anchors = new[] { _dragOriginal.Start, _dragOriginal.End }
+            .Concat(_dragLinkedClips.SelectMany(item => new[] { item.Original.Start, item.Original.End }))
+            .ToArray();
+        var result = TimelineSnapEngine.SnapDelta(
+            proposedDelta,
+            frameAlignedDelta,
+            anchors,
+            GetSnapTargets(MovingClipIds()),
+            PixelsPerSecond,
+            IsSnappingEnabled);
+        _snapGuideTime = result.IsSnapped ? result.Target?.Time : null;
+        return Math.Max(0, _dragOriginal.Start + result.Value);
+    }
+
+    private HashSet<Guid> MovingClipIds()
+        => _dragLinkedClips.Select(item => item.Clip.Id)
+            .Append(_dragClip?.Id ?? Guid.Empty)
+            .Where(id => id != Guid.Empty)
+            .ToHashSet();
+
+    private IReadOnlyList<TimelineSnapTarget> GetSnapTargets(IReadOnlySet<Guid>? excludedClipIds = null)
+    {
+        if (_document is null) return [];
+        var targets = new List<TimelineSnapTarget>
+        {
+            new(0, TimelineSnapTargetKind.TimelineStart),
+            new(PlayheadSeconds, TimelineSnapTargetKind.Playhead)
+        };
+        foreach (var clip in _document.Clips)
+        {
+            if (excludedClipIds?.Contains(clip.Id) == true) continue;
+            targets.Add(new TimelineSnapTarget(clip.Start, TimelineSnapTargetKind.ClipEdge, clip.Id));
+            targets.Add(new TimelineSnapTarget(clip.End, TimelineSnapTargetKind.ClipEdge, clip.Id));
+        }
+        foreach (var marker in _document.Markers)
+        {
+            targets.Add(new TimelineSnapTarget(marker.Start, TimelineSnapTargetKind.Marker, marker.Id));
+            if (marker.Duration > 0)
+            {
+                targets.Add(new TimelineSnapTarget(marker.End, TimelineSnapTargetKind.Marker, marker.Id));
+            }
+        }
+        return targets;
+    }
+
+    private void UpdateRazorHover(Point point)
+    {
+        var target = ResolveRazorTarget(point);
+        _razorHoverClipId = target?.Clip.Id;
+        _razorHoverTime = target?.Time;
+        _razorHoverIsSnapped = target?.IsSnapped == true;
+        Cursor = target is null ? Cursors.No : Cursors.Cross;
+        InvalidateVisual();
+    }
+
+    private RazorTarget? ResolveRazorTarget(Point point)
+    {
+        if (_document is null || point.Y <= RulerHeight || point.X < LeftGutterWidth) return null;
+        var clip = HitTestClip(point);
+        if (clip is null) return null;
+        var rawTime = Viewport.ContentXToTime(point.X);
+        var result = TimelineSnapEngine.SnapTime(
+            rawTime,
+            _document.FrameRateValue.FramesPerSecond,
+            PixelsPerSecond,
+            IsSnappingEnabled,
+            GetSnapTargets());
+        if (result.Value <= clip.Start + MinimumClipDuration || result.Value >= clip.End - MinimumClipDuration)
+        {
+            return null;
+        }
+        return new RazorTarget(clip, result.Value, result.IsSnapped);
+    }
+
+    private void ClearInteractionGuides()
+    {
+        _razorHoverClipId = null;
+        _razorHoverTime = null;
+        _razorHoverIsSnapped = false;
+        _snapGuideTime = null;
+    }
 
     private void SetPlayheadFromPoint(Point point)
     {
@@ -1235,6 +1442,8 @@ public sealed class TimelineControl : FrameworkElement
         _ => throw new InvalidOperationException("Timeline gesture ended without an edit operation.")
     };
 
+    private sealed record RazorTarget(TimelineClip Clip, double Time, bool IsSnapped);
+
 }
 
 public sealed class ClipSelectedEventArgs(Guid? clipId) : EventArgs
@@ -1269,4 +1478,11 @@ public sealed class AssetDroppedEventArgs(Guid assetId, double requestedStart, T
     public double RequestedStart { get; } = requestedStart;
     public TrackKind RequestedTrack { get; } = requestedTrack;
     public int RequestedTrackIndex { get; } = requestedTrackIndex;
+}
+
+public sealed class RazorSplitRequestedEventArgs(Guid clipId, double seconds, bool includeLinked) : EventArgs
+{
+    public Guid ClipId { get; } = clipId;
+    public double Seconds { get; } = seconds;
+    public bool IncludeLinked { get; } = includeLinked;
 }

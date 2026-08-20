@@ -92,6 +92,32 @@ public sealed class AgentPlanningLoop
 
             if (task.Phase == AgentTaskPhase.Understanding)
             {
+                if (task.Brief is null && _model is IAgentTaskInterpreter interpreter)
+                {
+                    _orchestrator.RecordProgress("Модель размышляет и формирует JSON понимания задачи…");
+                    await SeedUnderstandingObservationsAsync(cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var understanding = await interpreter.UnderstandAsync(
+                        new AgentModelTurnRequest(
+                            task,
+                            // The brief only needs the seeded editor/project facts.
+                            // Full tool schemas are introduced on the investigation
+                            // turn where the model can actually choose among them.
+                            ImmutableArray<AgentToolDescriptor>.Empty,
+                            GetObservationContext(),
+                            GetConversationContext(),
+                            0,
+                            AgentModelTurnMode.Planning),
+                        cancellationToken).ConfigureAwait(false);
+
+                    task = _orchestrator.SetTaskBrief(understanding.Brief);
+                    if (!understanding.Questions.IsDefaultOrEmpty)
+                    {
+                        return _orchestrator.AskQuestions(understanding.Questions);
+                    }
+                }
+
                 task = _orchestrator.BeginInvestigation(
                     "Agent started task-driven investigation.");
             }
@@ -130,6 +156,7 @@ public sealed class AgentPlanningLoop
                         turn,
                         AgentModelTurnMode.Planning);
 
+                    _orchestrator.RecordProgress("Модель размышляет и формирует JSON следующего исследовательского шага…");
                     decision = await _model.DecideAsync(
                         request,
                         cancellationToken).ConfigureAwait(false);
@@ -176,12 +203,25 @@ public sealed class AgentPlanningLoop
                         return HandleQuestionDecision(decision);
 
                     case AgentModelActionKind.PublishPlan:
-                        var planState = HandlePlanDecision(decision);
+                        var planState = await HandlePlanDecisionAsync(
+                            decision,
+                            turn,
+                            cancellationToken).ConfigureAwait(false);
                         if (planState is not null)
                         {
                             return planState;
                         }
                         break;
+
+                    case AgentModelActionKind.CompleteReadOnly:
+                        if (task.Brief?.Kind != AgentTaskKind.ReadOnly ||
+                            string.IsNullOrWhiteSpace(decision.CompletionSummary))
+                        {
+                            return FailTask(
+                                "Only a proven read-only task can complete without a plan.");
+                        }
+                        return _orchestrator.CompleteReadOnly(
+                            LimitText(decision.CompletionSummary, 4_000));
 
                     default:
                         return FailTask(
@@ -219,6 +259,27 @@ public sealed class AgentPlanningLoop
                 AgentToolResultStatus.Rejected,
                 "Agent model tool arguments must be a JSON object.",
                 "invalid_model_tool_call");
+            return;
+        }
+
+        if (!_registry.TryGet(decision.ToolName, out var requestedTool) ||
+            requestedTool is null)
+        {
+            AddSyntheticObservation(
+                decision.ToolName,
+                AgentToolResultStatus.Rejected,
+                "The requested tool is not available.",
+                "tool_not_found");
+            return;
+        }
+
+        if (requestedTool.Descriptor.Access != AgentToolAccess.ReadOnly)
+        {
+            AddSyntheticObservation(
+                decision.ToolName,
+                AgentToolResultStatus.Rejected,
+                "Editing tools are visible only for plan construction and cannot run during investigation.",
+                "editing_tool_requires_approved_plan");
             return;
         }
 
@@ -266,6 +327,33 @@ public sealed class AgentPlanningLoop
             result));
     }
 
+    private async Task SeedUnderstandingObservationsAsync(
+        CancellationToken cancellationToken)
+    {
+        foreach (var toolName in new[] { "inspect_editor_context", "inspect_project" })
+        {
+            if (!_registry.TryGet(toolName, out var tool) ||
+                tool is null ||
+                tool.Descriptor.Access != AgentToolAccess.ReadOnly)
+            {
+                continue;
+            }
+
+            var task = RequireCurrentTask();
+            var call = AgentToolCall.Create(
+                task.Id,
+                toolName,
+                AgentToolJson.EmptyObject());
+            var result = await _toolExecutor.ExecuteAsync(
+                task,
+                call,
+                cancellationToken).ConfigureAwait(false);
+            AddObservation(AgentModelObservation.FromResult(
+                _nextObservationSequence++,
+                result));
+        }
+    }
+
     private AgentTaskState HandleQuestionDecision(
         AgentModelDecision decision)
     {
@@ -282,8 +370,10 @@ public sealed class AgentPlanningLoop
                 : LimitText(decision.QuestionContext, 4_000));
     }
 
-    private AgentTaskState? HandlePlanDecision(
-        AgentModelDecision decision)
+    private async Task<AgentTaskState?> HandlePlanDecisionAsync(
+        AgentModelDecision decision,
+        int turn,
+        CancellationToken cancellationToken)
     {
         if (decision.Plan is null)
         {
@@ -292,7 +382,7 @@ public sealed class AgentPlanningLoop
         }
 
         var task = RequireCurrentTask();
-        if (!ValidateMachineCheckablePlan(task, decision.Plan, out var validationError))
+        if (!ValidateMachineCheckablePlan(decision.Plan, out var validationError))
         {
             AddSyntheticObservation(
                 "publish_plan",
@@ -300,6 +390,30 @@ public sealed class AgentPlanningLoop
                 validationError,
                 "plan_evidence_required");
             return null;
+        }
+
+        if (_model is IAgentPlanCritic critic)
+        {
+            var review = await critic.ReviewPlanAsync(
+                new AgentPlanReviewRequest(
+                    task,
+                    decision.Plan,
+                    GetObservationContext(),
+                    GetConversationContext(),
+                    turn),
+                cancellationToken).ConfigureAwait(false);
+            if (!review.Accepted)
+            {
+                var issues = review.Issues.IsDefaultOrEmpty
+                    ? review.Summary
+                    : review.Summary + " " + string.Join(" ", review.Issues);
+                AddSyntheticObservation(
+                    "review_plan",
+                    AgentToolResultStatus.Rejected,
+                    LimitText(issues, 8_000),
+                    "plan_rejected_by_critic");
+                return null;
+            }
         }
 
         if (task.Phase == AgentTaskPhase.Investigating)
@@ -317,7 +431,6 @@ public sealed class AgentPlanningLoop
     }
 
     private bool ValidateMachineCheckablePlan(
-        AgentTaskState task,
         AgentPlanDraft plan,
         out string error)
     {
@@ -332,6 +445,14 @@ public sealed class AgentPlanningLoop
             return true;
         }
 
+        var rippleDeleteSteps = editingSteps.Count(step =>
+            step.ExpectedEditingTool is "ripple_delete_range" or "ripple_delete_ranges");
+        if (rippleDeleteSteps > 1)
+        {
+            error = "Multiple ripple-delete actions would invalidate later coordinates. Use one ripple_delete_ranges action for ranges measured on the same sequence revision.";
+            return false;
+        }
+
         var observations = GetObservationContext();
         foreach (var step in editingSteps)
         {
@@ -340,6 +461,12 @@ public sealed class AgentPlanningLoop
                 tool.Descriptor.Access != AgentToolAccess.Editing)
             {
                 error = $"Plan step '{step.Title}' names an unavailable editing action '{step.ExpectedEditingTool}'.";
+                return false;
+            }
+
+            if (step.ExpectedEditingArguments is not { ValueKind: JsonValueKind.Object })
+            {
+                error = $"Plan step '{step.Title}' has no exact editing arguments.";
                 return false;
             }
 
@@ -359,10 +486,11 @@ public sealed class AgentPlanningLoop
                 return false;
             }
 
-            if (RequiresVisualBoundaryEvidence(task.UserRequest) &&
-                !referenced.Any(IsVisualRangeEvidence))
+            if (!referenced.Any(item => SatisfiesEvidenceRequirement(
+                    item,
+                    step.EvidenceRequirement)))
             {
-                error = $"Plan step '{step.Title}' needs a successful inspect_range observation with frames/all evidence; inspect_timeline or summary is not enough to identify opening/ending boundaries.";
+                error = $"Plan step '{step.Title}' needs successful {step.EvidenceRequirement.ToString().ToLowerInvariant()} evidence. The referenced observations do not provide that channel.";
                 return false;
             }
         }
@@ -371,13 +499,29 @@ public sealed class AgentPlanningLoop
         return true;
     }
 
-    private static bool RequiresVisualBoundaryEvidence(string request)
-        => new[] { "опенинг", "эндинг", "opening", "ending", "intro", "outro" }
-            .Any(value => request.Contains(value, StringComparison.OrdinalIgnoreCase));
-
-    private static bool IsVisualRangeEvidence(AgentModelObservation observation)
+    private static bool SatisfiesEvidenceRequirement(
+        AgentModelObservation observation,
+        AgentEvidenceRequirement requirement)
     {
-        if (!string.Equals(observation.ToolName, "inspect_range", StringComparison.OrdinalIgnoreCase) ||
+        if (observation.Status != AgentToolResultStatus.Succeeded)
+        {
+            return false;
+        }
+
+        if (requirement == AgentEvidenceRequirement.Timeline)
+        {
+            return observation.ToolName is "inspect_timeline" or
+                "inspect_timeline_integrity" or "inspect_project" or "inspect_range";
+        }
+
+        return IsRangeEvidence(observation, requirement);
+    }
+
+    private static bool IsRangeEvidence(
+        AgentModelObservation observation,
+        AgentEvidenceRequirement requirement)
+    {
+        if (observation.ToolName is not ("inspect_range" or "inspect_boundary") ||
             observation.Data is not { } data ||
             data.ValueKind != JsonValueKind.Object ||
             !data.TryGetProperty("detail", out var detailElement))
@@ -385,9 +529,16 @@ public sealed class AgentPlanningLoop
             return false;
         }
 
-        var detail = detailElement.GetString();
-        if (!string.Equals(detail, "frames", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(detail, "all", StringComparison.OrdinalIgnoreCase))
+        var detail = detailElement.GetString()?.ToLowerInvariant();
+        var detailMatches = requirement switch
+        {
+            AgentEvidenceRequirement.Frames => detail is "frames" or "all",
+            AgentEvidenceRequirement.Audio => detail is "audio" or "all",
+            AgentEvidenceRequirement.Transcript => detail is "transcript" or "all",
+            AgentEvidenceRequirement.All => detail == "all",
+            _ => true
+        };
+        if (!detailMatches)
         {
             return false;
         }
@@ -398,18 +549,27 @@ public sealed class AgentPlanningLoop
             return false;
         }
 
-        return HasVisualObservations(data);
+        return requirement switch
+        {
+            AgentEvidenceRequirement.Frames => HasEvidenceProperty(data, "vision", "observations"),
+            AgentEvidenceRequirement.Transcript => HasEvidenceProperty(data, "transcript", "cues"),
+            AgentEvidenceRequirement.Audio => HasAudioEvidence(data),
+            AgentEvidenceRequirement.All =>
+                HasEvidenceProperty(data, "vision", "observations") && HasAudioEvidence(data),
+            _ => true
+        };
     }
 
-    private static bool HasVisualObservations(JsonElement data)
+    private static bool HasEvidenceProperty(
+        JsonElement data,
+        string propertyName,
+        string collectionName)
     {
-        if (data.TryGetProperty("vision", out var vision) &&
-            vision.ValueKind == JsonValueKind.Object &&
-            vision.TryGetProperty("available", out var available) &&
-            available.ValueKind == JsonValueKind.True &&
-            vision.TryGetProperty("observations", out var observations) &&
-            observations.ValueKind == JsonValueKind.Array &&
-            observations.GetArrayLength() > 0)
+        if (data.TryGetProperty(propertyName, out var evidence) &&
+            evidence.ValueKind == JsonValueKind.Object &&
+            evidence.TryGetProperty(collectionName, out var values) &&
+            values.ValueKind == JsonValueKind.Array &&
+            values.GetArrayLength() > 0)
         {
             return true;
         }
@@ -422,12 +582,28 @@ public sealed class AgentPlanningLoop
                    string.Equals(status.GetString(), "succeeded", StringComparison.OrdinalIgnoreCase) &&
                    item.TryGetProperty("observation", out var nested) &&
                    nested.ValueKind == JsonValueKind.Object &&
-                   HasVisualObservations(nested));
+                   HasEvidenceProperty(nested, propertyName, collectionName));
     }
+
+    private static bool HasAudioEvidence(JsonElement data)
+        => (data.TryGetProperty("analysis", out var analysis) &&
+            analysis.ValueKind == JsonValueKind.Object) ||
+           (data.TryGetProperty("analyses", out var analyses) &&
+            analyses.ValueKind == JsonValueKind.Array &&
+            analyses.EnumerateArray().Any(item =>
+                item.ValueKind == JsonValueKind.Object &&
+                item.TryGetProperty("status", out var status) &&
+                string.Equals(status.GetString(), "succeeded", StringComparison.OrdinalIgnoreCase) &&
+                item.TryGetProperty("observation", out var nested) &&
+                nested.ValueKind == JsonValueKind.Object &&
+                HasAudioEvidence(nested)));
 
     private ImmutableArray<AgentToolDescriptor> GetPlanningToolDescriptors()
         => _registry.Descriptors
-            .Where(descriptor => descriptor.Access == AgentToolAccess.ReadOnly)
+            .Where(descriptor => !string.Equals(
+                                     descriptor.Name,
+                                     "inspect_agent_edits",
+                                     StringComparison.OrdinalIgnoreCase))
             .ToImmutableArray();
 
     private ImmutableArray<AgentModelObservation> GetObservationContext()
@@ -499,20 +675,107 @@ public sealed class AgentPlanningLoop
         lock (_observations)
         {
             _observations.Add(observation);
+            AgentObservationRetention.Trim(
+                _observations,
+                RequireCurrentTask(),
+                _options.MaxObservationCount,
+                _options.MaxObservationContextCharacters);
+        }
 
-            while (_observations.Count > _options.MaxObservationCount)
-            {
-                _observations.RemoveAt(0);
-            }
-
-            while (_observations.Count > 1 &&
-                   EstimateObservationCharacters(_observations) >
-                   _options.MaxObservationContextCharacters)
-            {
-                _observations.RemoveAt(0);
-            }
+        if (observation.Status == AgentToolResultStatus.Succeeded)
+        {
+            var task = RequireCurrentTask();
+            var existing = task.Evidence.FirstOrDefault(item => item.Sequence == observation.Sequence);
+            var data = observation.Data;
+            var targetId = TryReadGuid(data, "sequence_id")
+                           ?? TryReadGuid(data, "media_id")
+                           ?? TryReadGuid(data, "target_id")
+                           ?? task.SourceSequenceId;
+            var record = new AgentEvidenceRecord(
+                existing?.Id ?? Guid.NewGuid(),
+                observation.Sequence,
+                ToEvidenceChannel(observation.ToolName, data),
+                observation.ToolName,
+                targetId,
+                TryReadInt64(data, "revision")
+                ?? TryReadInt64(data, "source_revision")
+                ?? task.SourceSequenceRevision,
+                TryReadDouble(data, "start_seconds"),
+                TryReadDouble(data, "end_seconds"),
+                observation.Summary,
+                ImmutableArray.Create(observation.Summary),
+                TryReadString(data, "artifact_reference"),
+                DateTimeOffset.UtcNow);
+            _orchestrator.ReplaceEvidenceLedger(
+                task.Evidence
+                    .Where(item => item.Sequence != observation.Sequence)
+                    .Append(record));
         }
     }
+
+    private static AgentEvidenceChannel ToEvidenceChannel(
+        string toolName,
+        JsonElement? data)
+    {
+        var reportedChannel = TryReadString(data, "channel")?.ToLowerInvariant();
+        if (reportedChannel is not null)
+        {
+            return reportedChannel switch
+            {
+                "editor_context" => AgentEvidenceChannel.EditorContext,
+                "project" => AgentEvidenceChannel.Project,
+                "timeline" => AgentEvidenceChannel.Timeline,
+                "integrity" => AgentEvidenceChannel.Integrity,
+                "frames" or "vision" or "all" => AgentEvidenceChannel.Frames,
+                "audio" => AgentEvidenceChannel.Audio,
+                "transcript" => AgentEvidenceChannel.Transcript,
+                "recurrence" or "comparison" => AgentEvidenceChannel.Recurrence,
+                "sequence_diff" => AgentEvidenceChannel.SequenceDiff,
+                "edit_log" => AgentEvidenceChannel.EditLog,
+                _ => AgentEvidenceChannel.Timeline
+            };
+        }
+
+        return toolName.ToLowerInvariant() switch
+        {
+            "inspect_editor_context" => AgentEvidenceChannel.EditorContext,
+            "inspect_project" => AgentEvidenceChannel.Project,
+            "inspect_timeline_integrity" => AgentEvidenceChannel.Integrity,
+            "compare_media_ranges" => AgentEvidenceChannel.Recurrence,
+            "compare_sequences" => AgentEvidenceChannel.SequenceDiff,
+            "inspect_agent_edits" => AgentEvidenceChannel.EditLog,
+            "inspect_range" or "inspect_boundary" => AgentEvidenceChannel.Frames,
+            _ => AgentEvidenceChannel.Timeline
+        };
+    }
+
+    private static Guid? TryReadGuid(JsonElement? data, string propertyName)
+        => data is { ValueKind: JsonValueKind.Object } value &&
+           value.TryGetProperty(propertyName, out var property) &&
+           property.TryGetGuid(out var result)
+            ? result
+            : null;
+
+    private static long? TryReadInt64(JsonElement? data, string propertyName)
+        => data is { ValueKind: JsonValueKind.Object } value &&
+           value.TryGetProperty(propertyName, out var property) &&
+           property.TryGetInt64(out var result)
+            ? result
+            : null;
+
+    private static double? TryReadDouble(JsonElement? data, string propertyName)
+        => data is { ValueKind: JsonValueKind.Object } value &&
+           value.TryGetProperty(propertyName, out var property) &&
+           property.TryGetDouble(out var result)
+            ? result
+            : null;
+
+    private static string? TryReadString(JsonElement? data, string propertyName)
+        => data is { ValueKind: JsonValueKind.Object } value &&
+           value.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.String
+            ? property.GetString()
+            : null;
 
     private static int EstimateObservationCharacters(
         IEnumerable<AgentModelObservation> observations)

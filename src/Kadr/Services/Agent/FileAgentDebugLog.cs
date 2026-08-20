@@ -17,9 +17,11 @@ namespace KadrStudio.Services.Agent;
 /// </summary>
 public sealed class FileAgentDebugLog : IAgentDebugLog
 {
-    private const int MaximumDetailsCharacters = 300_000;
-    private const int MaximumExceptionCharacters = 120_000;
+    private const int MaximumDetailsCharacters = 16_000;
+    private const int MaximumExceptionCharacters = 16_000;
     private const int MaximumSessionLogs = 20;
+    private const long MaximumSessionLogBytes = 2 * 1024 * 1024;
+    private const long MaximumTotalLogBytes = 10 * 1024 * 1024;
 
     private static readonly UTF8Encoding Utf8NoBom = new(false);
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -103,6 +105,11 @@ public sealed class FileAgentDebugLog : IAgentDebugLog
 
             lock (_gate)
             {
+                if (new FileInfo(CurrentLogPath!).Length >= MaximumSessionLogBytes)
+                {
+                    return;
+                }
+
                 File.AppendAllText(
                     CurrentLogPath!,
                     json + Environment.NewLine,
@@ -133,6 +140,30 @@ public sealed class FileAgentDebugLog : IAgentDebugLog
 
             foreach (var file in oldFiles)
             {
+                try
+                {
+                    file.Delete();
+                }
+                catch
+                {
+                }
+            }
+
+
+            var filesByAge = new DirectoryInfo(RootDirectory)
+                .EnumerateFiles("agent-*.jsonl", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ToArray();
+            var retainedBytes = 0L;
+            foreach (var file in filesByAge)
+            {
+                retainedBytes += file.Length;
+                if (retainedBytes <= MaximumTotalLogBytes ||
+                    string.Equals(file.FullName, currentPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 try
                 {
                     file.Delete();

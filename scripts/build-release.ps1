@@ -69,7 +69,7 @@ if (Test-Path -LiteralPath $publishPath) {
 New-Item -ItemType Directory -Path $publishPath -Force | Out-Null
 
 Write-Host 'Восстановление, сборка и тестирование всего решения…' -ForegroundColor Cyan
-& $dotnetExe restore $solutionPath --disable-parallel --disable-build-servers -m:1
+& $dotnetExe restore $solutionPath --disable-parallel --disable-build-servers -m:1 -nr:false
 if ($LASTEXITCODE -ne 0) { throw "dotnet restore solution завершился с кодом $LASTEXITCODE" }
 
 & $dotnetExe build $solutionPath -c Release --no-restore -m:1 -nr:false -warnaserror
@@ -78,7 +78,7 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet build solution завершился с 
 & $dotnetExe test $solutionPath -c Release --no-build --no-restore -m:1 -nr:false
 if ($LASTEXITCODE -ne 0) { throw "dotnet test завершился с кодом $LASTEXITCODE" }
 
-& $dotnetExe restore $projectPath --runtime win-x64 --disable-parallel --disable-build-servers -m:1
+& $dotnetExe restore $projectPath --runtime win-x64 --disable-parallel --disable-build-servers -m:1 -nr:false
 if ($LASTEXITCODE -ne 0) { throw "dotnet restore win-x64 завершился с кодом $LASTEXITCODE" }
 
 Write-Host 'Создание переносимой Windows-сборки…' -ForegroundColor Cyan

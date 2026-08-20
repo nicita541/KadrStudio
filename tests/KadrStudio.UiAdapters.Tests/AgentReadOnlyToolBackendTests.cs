@@ -95,6 +95,37 @@ public sealed class AgentReadOnlyToolBackendTests
         Assert.Equal("project_changed", error.ErrorCode);
     }
 
+    [Fact]
+    public async Task Timeline_integrity_reports_exact_gap_seconds_and_frames()
+    {
+        var fixture = CreateProject();
+        var project = fixture.Project;
+        var first = Assert.Single(project.MediaClips);
+        var second = first with
+        {
+            Id = Guid.NewGuid(),
+            Start = TimelineTime.FromSeconds(30.197863),
+            SourceIn = TimelineTime.FromSeconds(60),
+            Duration = TimelineTime.FromSeconds(10)
+        };
+        project = (project with { MediaClips = [first, second] })
+            .SynchronizeActiveSequence(incrementRevision: false);
+        var backend = new KadrAgentReadOnlyToolBackend(
+            () => project,
+            new FakeRangeInspector());
+
+        var integrity = await backend.InspectTimelineIntegrityAsync(
+            Context(project, fixture.SequenceId),
+            fixture.SequenceId,
+            CancellationToken.None);
+
+        Assert.Equal(1, integrity.GetProperty("gap_count").GetInt32());
+        var gap = Assert.Single(integrity.GetProperty("gaps").EnumerateArray());
+        Assert.Equal(0.197863, gap.GetProperty("delta_seconds").GetDouble(), precision: 6);
+        Assert.Equal(5.936, gap.GetProperty("delta_frames").GetDouble(), precision: 3);
+        Assert.Equal(0, integrity.GetProperty("overlap_count").GetInt32());
+    }
+
     private static Fixture CreateProject()
     {
         var project = ProjectState.CreateNew("Agent backend test");

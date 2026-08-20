@@ -401,6 +401,319 @@ public sealed class KadrAgentEditingToolBackend(
         }));
     }
 
+    public ValueTask<JsonElement> SplitClipsAsync(
+        AgentToolContext context,
+        IReadOnlyCollection<Guid> clipIds,
+        double positionSeconds,
+        bool includeLinked,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var before = RequireDraft(context);
+        var position = TimelineTime.FromSeconds(positionSeconds);
+        var requested = clipIds.Distinct().Select(id =>
+            before.MediaClips.FirstOrDefault(clip => clip.Id == id)
+            ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{id}' was not found.")).ToArray();
+        if (requested.Any(clip => position <= clip.Start || position >= clip.End))
+            throw new AgentToolRejectedException("split_outside_clip", "The split position must be inside every requested clip.");
+
+        var representatives = includeLinked
+            ? requested.GroupBy(clip => clip.LinkGroupId ?? clip.Id).Select(group => group.First()).ToArray()
+            : requested;
+        var commands = representatives.Select(clip =>
+            (IEditCommand)new SplitSelectedMediaClipCommand(clip.Id, position, IncludeLinked: includeLinked)).ToArray();
+        Apply(
+            context,
+            "split_clips",
+            reason,
+            $"Agent: разрезать {requested.Length} выбранных клип(ов) в {positionSeconds:0.###} с",
+            new EditBatchCommand("Разрезать выбранные клипы", commands));
+        var after = RequireDraft(context);
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = after.Id,
+            requested_clip_ids = requested.Select(clip => clip.Id).ToArray(),
+            position_seconds = Round(positionSeconds),
+            include_linked = includeLinked,
+            media_clip_count_before = before.MediaClips.Length,
+            media_clip_count_after = after.MediaClips.Length
+        }));
+    }
+
+    public ValueTask<JsonElement> SetClipVideoAsync(
+        AgentToolContext context,
+        Guid clipId,
+        VideoParameters parameters,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var before = RequireDraft(context);
+        var clip = before.MediaClips.FirstOrDefault(item => item.Id == clipId)
+                   ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{clipId}' was not found.");
+        var track = before.Tracks.First(item => item.Id == clip.TrackId);
+        if (track.Kind != TrackKind.Visual)
+            throw new AgentToolRejectedException("video_track_required", "set_clip_video requires a visual clip.");
+        Apply(context, "set_clip_video", reason, $"Agent: изменить параметры видео {clipId}",
+            new UpsertMediaClipCommand(clip with { Video = parameters }));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_id = clipId,
+            video = parameters
+        }));
+    }
+
+    public ValueTask<JsonElement> SetClipAudioAsync(
+        AgentToolContext context,
+        Guid clipId,
+        AudioParameters parameters,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var before = RequireDraft(context);
+        var clip = before.MediaClips.FirstOrDefault(item => item.Id == clipId)
+                   ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{clipId}' was not found.");
+        var track = before.Tracks.First(item => item.Id == clip.TrackId);
+        if (track.Kind != TrackKind.Audio)
+            throw new AgentToolRejectedException("audio_track_required", "set_clip_audio requires an audio clip.");
+        var normalized = parameters with
+        {
+            Volume = Math.Clamp(parameters.Volume, 0, 4),
+            Pan = Math.Clamp(parameters.Pan, -1, 1),
+            FadeIn = parameters.FadeIn <= clip.Duration ? parameters.FadeIn : clip.Duration,
+            FadeOut = parameters.FadeOut <= clip.Duration ? parameters.FadeOut : clip.Duration
+        };
+        Apply(context, "set_clip_audio", reason, $"Agent: изменить параметры аудио {clipId}",
+            new UpsertMediaClipCommand(clip with { Audio = normalized }));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_id = clipId,
+            audio = normalized
+        }));
+    }
+
+    public ValueTask<JsonElement> UpdateClipVideoAsync(
+        AgentToolContext context,
+        Guid clipId,
+        AgentVideoParametersPatch patch,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var clip = draft.MediaClips.FirstOrDefault(item => item.Id == clipId)
+                   ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{clipId}' was not found.");
+        var track = draft.Tracks.First(item => item.Id == clip.TrackId);
+        if (track.Kind != TrackKind.Visual)
+            throw new AgentToolRejectedException("video_track_required", "set_clip_video requires a visual clip.");
+        var current = clip.Video ?? new VideoParameters();
+        var updated = current with
+        {
+            Brightness = patch.Brightness ?? current.Brightness,
+            Contrast = patch.Contrast ?? current.Contrast,
+            Saturation = patch.Saturation ?? current.Saturation,
+            Temperature = patch.Temperature ?? current.Temperature,
+            PositionX = patch.PositionX ?? current.PositionX,
+            PositionY = patch.PositionY ?? current.PositionY,
+            ScaleX = patch.ScaleX ?? current.ScaleX,
+            ScaleY = patch.ScaleY ?? current.ScaleY,
+            Rotation = patch.Rotation ?? current.Rotation,
+            CropLeft = patch.CropLeft ?? current.CropLeft,
+            CropTop = patch.CropTop ?? current.CropTop,
+            CropRight = patch.CropRight ?? current.CropRight,
+            CropBottom = patch.CropBottom ?? current.CropBottom,
+            Opacity = patch.Opacity ?? current.Opacity
+        };
+        Apply(context, "set_clip_video", reason, $"Agent: изменить параметры видео {clipId}",
+            new UpsertMediaClipCommand(clip with { Video = updated }));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_id = clipId,
+            video = updated
+        }));
+    }
+
+    public ValueTask<JsonElement> UpdateClipAudioAsync(
+        AgentToolContext context,
+        Guid clipId,
+        AgentAudioParametersPatch patch,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var clip = draft.MediaClips.FirstOrDefault(item => item.Id == clipId)
+                   ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{clipId}' was not found.");
+        var track = draft.Tracks.First(item => item.Id == clip.TrackId);
+        if (track.Kind != TrackKind.Audio)
+            throw new AgentToolRejectedException("audio_track_required", "set_clip_audio requires an audio clip.");
+        var current = clip.Audio ?? new AudioParameters();
+        var updated = current with
+        {
+            Volume = patch.Volume ?? current.Volume,
+            IsMuted = patch.Muted ?? current.IsMuted,
+            Pan = patch.Pan ?? current.Pan,
+            FadeIn = patch.FadeInSeconds is { } fadeIn ? TimelineTime.FromSeconds(fadeIn) : current.FadeIn,
+            FadeOut = patch.FadeOutSeconds is { } fadeOut ? TimelineTime.FromSeconds(fadeOut) : current.FadeOut,
+            Bass = patch.Bass ?? current.Bass,
+            Mid = patch.Mid ?? current.Mid,
+            Treble = patch.Treble ?? current.Treble
+        };
+        updated = updated with
+        {
+            FadeIn = updated.FadeIn <= clip.Duration ? updated.FadeIn : clip.Duration,
+            FadeOut = updated.FadeOut <= clip.Duration ? updated.FadeOut : clip.Duration
+        };
+        Apply(context, "set_clip_audio", reason, $"Agent: изменить параметры аудио {clipId}",
+            new UpsertMediaClipCommand(clip with { Audio = updated }));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_id = clipId,
+            audio = updated
+        }));
+    }
+
+    public ValueTask<JsonElement> InsertSourceRangeAsync(
+        AgentToolContext context,
+        Guid sourceId,
+        Guid targetTrackId,
+        double sourceStartSeconds,
+        double sourceEndSeconds,
+        double timelineStartSeconds,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var state = stateProvider();
+        if (!state.Sources.TryGetValue(sourceId, out var source))
+            throw new AgentToolRejectedException("media_not_found", $"Media source '{sourceId}' was not found.");
+        var track = draft.Tracks.FirstOrDefault(item => item.Id == targetTrackId)
+                    ?? throw new AgentToolRejectedException("track_not_found", $"Draft track '{targetTrackId}' was not found.");
+        if (track.Kind == TrackKind.Text ||
+            track.Kind == TrackKind.Audio && !source.HasAudio ||
+            track.Kind == TrackKind.Visual && source.Kind == MediaKind.Audio)
+            throw new AgentToolRejectedException("track_media_mismatch", "The source is not compatible with the target track.");
+        var sourceStart = TimelineTime.FromSeconds(sourceStartSeconds);
+        var duration = TimelineTime.FromSeconds(sourceEndSeconds - sourceStartSeconds);
+        if (sourceStart < TimelineTime.Zero || sourceStart + duration > source.Duration)
+            throw new AgentToolRejectedException("source_range_out_of_bounds", "The requested source range is outside the media duration.");
+        var start = TimelineTime.FromSeconds(timelineStartSeconds);
+        var end = start + duration;
+        if (draft.MediaClips.Any(clip => clip.TrackId == targetTrackId && clip.Start < end && clip.End > start))
+            throw new AgentToolRejectedException("timeline_overlap", "The inserted range would overlap another clip on the target track.");
+        var clip = new MediaClip(
+            Guid.NewGuid(),
+            sourceId,
+            targetTrackId,
+            start,
+            sourceStart,
+            duration,
+            Audio: track.Kind == TrackKind.Audio ? new AudioParameters() : null);
+        Apply(context, "insert_source_range", reason, "Agent: вставить диапазон исходника",
+            new AddMediaClipsCommand([clip]));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_id = clip.Id,
+            source_id = sourceId,
+            target_track_id = targetTrackId,
+            source_start_seconds = Round(sourceStartSeconds),
+            source_end_seconds = Round(sourceEndSeconds),
+            timeline_start_seconds = Round(timelineStartSeconds)
+        }));
+    }
+
+    public ValueTask<JsonElement> UnlinkClipsAsync(
+        AgentToolContext context,
+        IReadOnlyCollection<Guid> clipIds,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var representatives = clipIds.Distinct()
+            .Select(id => draft.MediaClips.FirstOrDefault(clip => clip.Id == id)
+                          ?? throw new AgentToolRejectedException("clip_not_found", $"Draft clip '{id}' was not found."))
+            .Where(clip => clip.LinkGroupId.HasValue)
+            .GroupBy(clip => clip.LinkGroupId!.Value)
+            .Select(group => group.First().Id)
+            .ToArray();
+        if (representatives.Length == 0)
+            throw new AgentToolRejectedException("linked_clip_required", "No requested clip belongs to a link group.");
+        Apply(context, "unlink_clips", reason, "Agent: разорвать связи клипов",
+            new EditBatchCommand(
+                "Разорвать связи клипов",
+                representatives.Select(id => (IEditCommand)new UnlinkMediaClipCommand(id)).ToArray()));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            clip_ids = clipIds.Distinct().ToArray()
+        }));
+    }
+
+    public ValueTask<JsonElement> DeleteTimelineObjectsAsync(
+        AgentToolContext context,
+        IReadOnlyCollection<Guid> textClipIds,
+        IReadOnlyCollection<Guid> transitionIds,
+        IReadOnlyCollection<Guid> markerIds,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var commands = new List<IEditCommand>();
+        if (textClipIds.Count > 0) commands.Add(new DeleteTextClipsCommand(textClipIds.ToHashSet()));
+        if (transitionIds.Count > 0) commands.Add(new DeleteTransitionsCommand(transitionIds.ToHashSet()));
+        if (markerIds.Count > 0)
+            commands.Add(new ReplaceMarkersCommand(draft.Markers.Where(marker => !markerIds.Contains(marker.Id)).ToArray()));
+        if (commands.Count == 0)
+            throw new AgentToolRejectedException("objects_required", "At least one timeline object id is required.");
+        Apply(context, "delete_timeline_objects", reason, "Agent: удалить объекты таймлайна",
+            new EditBatchCommand("Удалить объекты таймлайна", commands));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            text_clip_ids = textClipIds,
+            transition_ids = transitionIds,
+            marker_ids = markerIds
+        }));
+    }
+
+    public ValueTask<JsonElement> AddMarkerAsync(
+        AgentToolContext context,
+        double startSeconds,
+        double durationSeconds,
+        string title,
+        string description,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var marker = new TimelineMarker(
+            Guid.NewGuid(), MarkerKind.Note, TimelineTime.FromSeconds(startSeconds),
+            TimelineTime.FromSeconds(durationSeconds), title.Trim(), description.Trim());
+        if (marker.Start < TimelineTime.Zero || marker.End > draft.Duration)
+            throw new AgentToolRejectedException("marker_out_of_bounds", "Marker must stay inside the Agent Draft.");
+        Apply(context, "add_marker", reason, "Agent: добавить маркер",
+            new ReplaceMarkersCommand(draft.Markers.Add(marker)));
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            marker_id = marker.Id,
+            start_seconds = startSeconds,
+            duration_seconds = durationSeconds,
+            title = marker.Title
+        }));
+    }
+
     public ValueTask<JsonElement> AddTextAsync(
         AgentToolContext context,
         double startSeconds,
@@ -534,6 +847,205 @@ public sealed class KadrAgentEditingToolBackend(
         }));
     }
 
+    public ValueTask<JsonElement> UpdateTextAsync(
+        AgentToolContext context,
+        Guid textClipId,
+        double? startSeconds,
+        double? durationSeconds,
+        string? text,
+        bool? subtitle,
+        double? fontSize,
+        double? x,
+        double? y,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var current = draft.TextClips.FirstOrDefault(item => item.Id == textClipId)
+            ?? throw new AgentToolRejectedException(
+                "text_clip_not_found",
+                $"Draft text clip '{textClipId}' was not found.");
+
+        var updated = current with
+        {
+            Start = startSeconds is { } start
+                ? TimelineTime.FromSeconds(start)
+                : current.Start,
+            Duration = durationSeconds is { } duration
+                ? TimelineTime.FromSeconds(duration)
+                : current.Duration,
+            Text = text ?? current.Text,
+            Style = current.Style with
+            {
+                IsSubtitle = subtitle ?? current.Style.IsSubtitle,
+                FontSize = fontSize ?? current.Style.FontSize,
+                X = x ?? current.Style.X,
+                Y = y ?? current.Style.Y
+            }
+        };
+
+        if (updated.Start < TimelineTime.Zero ||
+            updated.Duration <= TimelineTime.Zero ||
+            updated.End > draft.Duration)
+        {
+            throw new AgentToolRejectedException(
+                "text_outside_draft",
+                "Updated text must have a positive duration and stay inside the Agent Draft.");
+        }
+
+        Apply(
+            context,
+            "update_text",
+            reason,
+            $"Agent: изменить текст {textClipId}",
+            new UpsertTextClipCommand(updated));
+
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            text_clip_id = updated.Id,
+            start_seconds = Round(updated.Start.TotalSeconds),
+            duration_seconds = Round(updated.Duration.TotalSeconds),
+            text = updated.Text,
+            subtitle = updated.Style.IsSubtitle,
+            font_size = updated.Style.FontSize,
+            x = updated.Style.X,
+            y = updated.Style.Y
+        }));
+    }
+
+    public ValueTask<JsonElement> UpdateMarkerAsync(
+        AgentToolContext context,
+        Guid markerId,
+        double? startSeconds,
+        double? durationSeconds,
+        string? title,
+        string? description,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var current = draft.Markers.FirstOrDefault(item => item.Id == markerId)
+            ?? throw new AgentToolRejectedException(
+                "marker_not_found",
+                $"Draft marker '{markerId}' was not found.");
+        if (current.Kind != MarkerKind.Note)
+        {
+            throw new AgentToolRejectedException(
+                "neutral_marker_required",
+                "Only neutral note markers can be updated by the agent.");
+        }
+
+        var updated = current with
+        {
+            Start = startSeconds is { } start
+                ? TimelineTime.FromSeconds(start)
+                : current.Start,
+            Duration = durationSeconds is { } duration
+                ? TimelineTime.FromSeconds(duration)
+                : current.Duration,
+            Title = title ?? current.Title,
+            Description = description ?? current.Description
+        };
+        if (updated.Start < TimelineTime.Zero ||
+            updated.Duration < TimelineTime.Zero ||
+            updated.End > draft.Duration)
+        {
+            throw new AgentToolRejectedException(
+                "marker_out_of_bounds",
+                "Updated marker must stay inside the Agent Draft.");
+        }
+
+        Apply(
+            context,
+            "update_marker",
+            reason,
+            $"Agent: изменить маркер {markerId}",
+            new ReplaceMarkersCommand(
+                draft.Markers.Select(item => item.Id == markerId ? updated : item).ToArray()));
+
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = RequireDraft(context).Id,
+            marker_id = updated.Id,
+            start_seconds = Round(updated.Start.TotalSeconds),
+            duration_seconds = Round(updated.Duration.TotalSeconds),
+            title = updated.Title,
+            description = updated.Description
+        }));
+    }
+
+    public ValueTask<JsonElement> UpdateTransitionAsync(
+        AgentToolContext context,
+        Guid transitionId,
+        string? kind,
+        double? durationSeconds,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var draft = RequireDraft(context);
+        var current = draft.Transitions.FirstOrDefault(item => item.Id == transitionId)
+            ?? throw new AgentToolRejectedException(
+                "transition_not_found",
+                $"Draft transition '{transitionId}' was not found.");
+        var from = draft.MediaClips.FirstOrDefault(item => item.Id == current.FromClipId)
+            ?? throw new AgentToolRejectedException(
+                "transition_clip_not_found",
+                "Transition outgoing clip was not found in the Agent Draft.");
+        var to = draft.MediaClips.FirstOrDefault(item => item.Id == current.ToClipId)
+            ?? throw new AgentToolRejectedException(
+                "transition_clip_not_found",
+                "Transition incoming clip was not found in the Agent Draft.");
+        if (from.TrackId != current.TrackId || to.TrackId != current.TrackId || from.End != to.Start)
+        {
+            throw new AgentToolRejectedException(
+                "transition_boundary_changed",
+                "Transition clips are no longer adjacent on the same track.");
+        }
+
+        var updatedKind = kind is null ? current.Kind : ParseTransitionKind(kind);
+        var updatedDuration = durationSeconds is { } duration
+            ? TimelineTime.FromSeconds(duration)
+            : current.Duration;
+        if (updatedDuration <= TimelineTime.Zero)
+        {
+            throw new AgentToolRejectedException(
+                "invalid_transition_duration",
+                "Transition duration must be positive.");
+        }
+
+        var beforeHalf = new TimelineTime(updatedDuration.Ticks / 2);
+        var updated = current with
+        {
+            Kind = updatedKind,
+            Start = from.End - beforeHalf,
+            Duration = updatedDuration
+        };
+
+        Apply(
+            context,
+            "update_transition",
+            reason,
+            $"Agent: изменить переход {transitionId}",
+            new UpsertTransitionCommand(updated));
+
+        var after = RequireDraft(context);
+        var normalized = after.Transitions.Single(item => item.Id == transitionId);
+        return ValueTask.FromResult(AgentToolJson.ToElement(new
+        {
+            sequence_id = after.Id,
+            transition_id = normalized.Id,
+            kind = FormatTransitionKind(normalized.Kind),
+            from_clip_id = normalized.FromClipId,
+            to_clip_id = normalized.ToClipId,
+            start_seconds = Round(normalized.Start.TotalSeconds),
+            duration_seconds = Round(normalized.Duration.TotalSeconds)
+        }));
+    }
+
     public ValueTask<JsonElement> InspectEditLogAsync(
         AgentToolContext context,
         CancellationToken cancellationToken)
@@ -654,6 +1166,20 @@ public sealed class KadrAgentEditingToolBackend(
             "wipe" => TransitionKind.Wipe,
             "slide" => TransitionKind.Slide,
             "constant_power_audio" => TransitionKind.ConstantPowerAudio,
+            _ => throw new AgentToolRejectedException(
+                "unknown_transition_kind",
+                $"Unknown transition kind '{value}'.")
+        };
+
+    private static string FormatTransitionKind(TransitionKind value)
+        => value switch
+        {
+            TransitionKind.CrossDissolve => "cross_dissolve",
+            TransitionKind.DipToBlack => "dip_to_black",
+            TransitionKind.DipToWhite => "dip_to_white",
+            TransitionKind.Wipe => "wipe",
+            TransitionKind.Slide => "slide",
+            TransitionKind.ConstantPowerAudio => "constant_power_audio",
             _ => throw new AgentToolRejectedException(
                 "unknown_transition_kind",
                 $"Unknown transition kind '{value}'.")

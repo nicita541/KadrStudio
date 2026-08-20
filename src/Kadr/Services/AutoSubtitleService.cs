@@ -196,7 +196,7 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
 
     private static string CreateTemporaryDirectory()
     {
-        var directory = Path.Combine(Path.GetTempPath(), "KadrStudio", "subtitles", Guid.NewGuid().ToString("N"));
+        var directory = Path.Combine(KadrLocalDataPaths.TempRoot, "subtitles", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         return directory;
     }

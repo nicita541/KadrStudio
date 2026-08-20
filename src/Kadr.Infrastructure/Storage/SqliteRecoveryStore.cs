@@ -17,8 +17,9 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
     public SqliteRecoveryStore(string? root = null, IProjectValidator? validator = null)
     {
         _root = Path.GetFullPath(root ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Kadr Studio", "Recovery"));
+            AppContext.BaseDirectory,
+            "LocalData",
+            "Recovery"));
         _validator = validator ?? new ProjectValidator();
         Directory.CreateDirectory(_root);
     }

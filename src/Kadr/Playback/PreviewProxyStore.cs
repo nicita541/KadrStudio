@@ -122,7 +122,7 @@ public sealed class PreviewProxyStore : IAsyncDisposable
             var path = await _artifacts.TryGetPayloadPathAsync(key, ".mp4", token).ConfigureAwait(false);
             if (path is null || !await ProbeVideoAsync(path, token).ConfigureAwait(false))
             {
-                var temporary = Path.Combine(Path.GetTempPath(), "KadrStudio", "artifacts", $"{Guid.NewGuid():N}.mp4");
+                var temporary = Path.Combine(KadrLocalDataPaths.TempRoot, "artifacts", $"{Guid.NewGuid():N}.mp4");
                 Directory.CreateDirectory(Path.GetDirectoryName(temporary)!);
                 try
                 {

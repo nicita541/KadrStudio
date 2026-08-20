@@ -83,9 +83,8 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var summary =
             $"Диапазон {FormatTime(rangeStart)}–{FormatTime(rangeEnd)}: " +
             $"границ сцен — {sceneCuts.Count}, затемнений — {blackRanges.Count}, " +
-            $"пауз — {silenceRanges.Count}, стоп-кадров — {freezeRanges.Count}. " +
-            "Метки опенинга, эндинга и превью являются вероятностной оценкой по структуре монтажа.";
-        progress?.Report(new VideoAnalysisProgress(84, "Шаг 4/5: грубые смысловые зоны готовы для проверки ИИ"));
+            $"пауз — {silenceRanges.Count}, стоп-кадров — {freezeRanges.Count}.";
+        progress?.Report(new VideoAnalysisProgress(84, "Шаг 4/5: технические измерения готовы"));
         return new VideoAnalysisResult(summary, rangeStart, rangeEnd, detected);
     }
 
@@ -95,12 +94,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         IProgress<VideoAnalysisProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        var semanticKinds = new HashSet<MarkerKind>
-        {
-            MarkerKind.Opening, MarkerKind.Ending, MarkerKind.PostCredits,
-            MarkerKind.Preview, MarkerKind.Recap, MarkerKind.Note
-        };
-        var semantic = result.Ranges.Where(range => semanticKinds.Contains(range.Kind)).ToList();
+        // Only a neutral, query-driven observation is eligible here. Persisted
+        // scenario marker kinds are read for compatibility but never steer analysis.
+        var semantic = result.Ranges.Where(range => range.Kind == MarkerKind.Note).ToList();
         if (semantic.Count == 0)
         {
             return result;
@@ -318,14 +314,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         IReadOnlyList<TimeRange> silenceRanges,
         IReadOnlyList<TimeRange> freezeRanges)
     {
-        var query = (prompt ?? string.Empty).ToLowerInvariant();
-        var genericAnalysis = string.IsNullOrWhiteSpace(query) || query.Contains("анализ") || query.Contains("всё") || query.Contains("все");
-        var wantsScenes = genericAnalysis || query.Contains("сцен") || query.Contains("монтаж") || query.Contains("разбей");
-        var wantsTechnical = genericAnalysis || query.Contains("тиш") || query.Contains("пауз") || query.Contains("затем") || query.Contains("стоп") || query.Contains("повтор");
-        var wantsAnime = query.Contains("аним") || query.Contains("опен") || query.Contains("эндинг") || query.Contains("титр") || query.Contains("следующ");
+        _ = prompt;
         var markers = new List<DetectedVideoRange>();
 
-        if (wantsScenes)
         {
             var boundaries = new List<double> { rangeStart };
             boundaries.AddRange(sceneCuts.Where(time => time > rangeStart + 0.8 && time < rangeEnd - 0.8));
@@ -350,7 +341,6 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             }
         }
 
-        if (wantsTechnical)
         {
             markers.AddRange(blackRanges.Where(range => range.Duration >= 0.35).Select((range, index) =>
                 new DetectedVideoRange(MarkerKind.BlackFrame, range.Start, range.Duration, $"Затемнение {index + 1}", "Тёмный переход или чёрный кадр.", 0.9)));
@@ -360,142 +350,11 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
                 new DetectedVideoRange(MarkerKind.Freeze, range.Start, range.Duration, $"Стоп-кадр {index + 1}", "Продолжительный почти неизменный кадр.", 0.82)));
         }
 
-        if (wantsAnime && rangeEnd - rangeStart >= 240)
-        {
-            AddAnimeStructure(markers, rangeStart, rangeEnd, sceneCuts, blackRanges);
-        }
-
         return markers
             .Where(marker => marker.Duration >= 0.1)
             .OrderBy(marker => marker.SourceStart)
             .ThenBy(marker => marker.Kind)
             .ToList();
-    }
-
-    private static void AddAnimeStructure(
-        ICollection<DetectedVideoRange> markers,
-        double rangeStart,
-        double rangeEnd,
-        IReadOnlyList<double> sceneCuts,
-        IReadOnlyList<TimeRange> blackRanges)
-    {
-        var duration = rangeEnd - rangeStart;
-        var openingSearchEnd = Math.Min(rangeEnd, rangeStart + Math.Min(300, duration * 0.3));
-        var coarseOpeningStart = FindDensestWindowStart(sceneCuts, rangeStart, openingSearchEnd, 90);
-        var openingStart = SnapToTechnicalBoundary(coarseOpeningStart, sceneCuts, blackRanges, 12);
-        var openingEnd = SnapToTechnicalBoundary(Math.Min(rangeEnd, openingStart + 90), sceneCuts, blackRanges, 12);
-        if (openingEnd - openingStart is < 55 or > 135)
-        {
-            openingEnd = Math.Min(rangeEnd, openingStart + 90);
-        }
-        markers.Add(new DetectedVideoRange(
-            MarkerKind.Opening,
-            openingStart,
-            openingEnd - openingStart,
-            "Вероятный опенинг",
-            "90-секундный участок с высокой плотностью монтажных склеек в начале видео.",
-            SceneConfidence(sceneCuts, openingStart, openingEnd, 0.52)));
-
-        if (openingStart - rangeStart >= 20)
-        {
-            markers.Add(new DetectedVideoRange(
-                MarkerKind.Recap,
-                rangeStart,
-                openingStart - rangeStart,
-                "Вероятный рекап / вступление",
-                "Материал перед предполагаемым опенингом.",
-                0.44));
-        }
-
-        var lateBlack = blackRanges
-            .Where(range => range.Start >= rangeEnd - Math.Min(360, duration * 0.35))
-            .OrderBy(range => range.Start)
-            .ToList();
-        var previewBoundary = lateBlack
-            .Where(range => rangeEnd - range.End is >= 8 and <= 55)
-            .LastOrDefault();
-        var previewStart = previewBoundary.Duration > 0 ? previewBoundary.End : rangeEnd;
-        if (rangeEnd - previewStart is >= 8 and <= 55)
-        {
-            markers.Add(new DetectedVideoRange(
-                MarkerKind.Preview,
-                previewStart,
-                rangeEnd - previewStart,
-                "Вероятное превью следующей серии",
-                "Короткий финальный блок после позднего затемнения.",
-                0.58));
-        }
-
-        var endingEnd = previewStart < rangeEnd ? previewStart : rangeEnd;
-        endingEnd = SnapToTechnicalBoundary(endingEnd, sceneCuts, blackRanges, 8);
-        var endingStart = SnapToTechnicalBoundary(Math.Max(rangeStart, endingEnd - 90), sceneCuts, blackRanges, 12);
-        if (endingEnd - endingStart is < 55 or > 135)
-        {
-            endingStart = Math.Max(rangeStart, endingEnd - 90);
-        }
-        markers.Add(new DetectedVideoRange(
-            MarkerKind.Ending,
-            endingStart,
-            endingEnd - endingStart,
-            "Вероятный эндинг",
-            "Финальный музыкальный блок перед превью или концом файла.",
-            SceneConfidence(sceneCuts, endingStart, endingEnd, 0.48)));
-
-        // Посттитровую сцену нельзя надёжно вывести только из затемнения перед эндингом.
-        // Её добавляет vision-проход, если он действительно видит отдельную сцену после титров.
-    }
-
-    private static double FindDensestWindowStart(IReadOnlyList<double> cuts, double start, double end, double window)
-    {
-        var lastStart = Math.Max(start, end - window);
-        var bestStart = start;
-        var bestCount = -1;
-        var candidates = cuts
-            .Where(time => time >= start && time <= lastStart)
-            .Prepend(start)
-            .Distinct()
-            .OrderBy(time => time);
-        foreach (var candidate in candidates)
-        {
-            var count = cuts.Count(time => time >= candidate && time <= candidate + window);
-            if (count > bestCount)
-            {
-                bestCount = count;
-                bestStart = candidate;
-            }
-        }
-        return bestStart;
-    }
-
-    private static double SnapToTechnicalBoundary(
-        double target,
-        IReadOnlyList<double> sceneCuts,
-        IReadOnlyList<TimeRange> blackRanges,
-        double radius)
-    {
-        var blackBoundary = blackRanges
-            .SelectMany(range => new[] { range.Start, range.End })
-            .Where(time => Math.Abs(time - target) <= Math.Min(radius, 6))
-            .OrderBy(time => Math.Abs(time - target))
-            .Cast<double?>()
-            .FirstOrDefault();
-        if (blackBoundary.HasValue)
-        {
-            return blackBoundary.Value;
-        }
-
-        var sceneBoundary = sceneCuts
-            .Where(time => Math.Abs(time - target) <= radius)
-            .OrderBy(time => Math.Abs(time - target))
-            .Cast<double?>()
-            .FirstOrDefault();
-        return sceneBoundary ?? target;
-    }
-
-    private static double SceneConfidence(IReadOnlyList<double> cuts, double start, double end, double baseline)
-    {
-        var perMinute = cuts.Count(time => time >= start && time <= end) / Math.Max(0.1, (end - start) / 60);
-        return Math.Clamp(baseline + perMinute / 120, baseline, 0.82);
     }
 
     private static List<double> ParseTimes(IEnumerable<string> lines, Regex regex, double rangeStart, double rangeDuration)

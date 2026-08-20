@@ -5,6 +5,8 @@ namespace KadrStudio.Application.Automation.Agent.Tools.Editing;
 public abstract class AgentEditingToolBase(
     IAgentEditingToolBackend backend) : IAgentTool
 {
+    protected const string ApprovedPlanReason = "Approved agent plan";
+
     protected IAgentEditingToolBackend Backend { get; } =
         backend ?? throw new ArgumentNullException(nameof(backend));
 
@@ -34,10 +36,9 @@ public sealed class RippleDeleteRangeAgentTool(
               "type": "object",
               "properties": {
                 "start_seconds": { "type": "number", "minimum": 0 },
-                "end_seconds": { "type": "number", "exclusiveMinimum": 0 },
-                "reason": { "type": "string" }
+                "end_seconds": { "type": "number", "exclusiveMinimum": 0 }
               },
-              "required": ["start_seconds", "end_seconds", "reason"],
+              "required": ["start_seconds", "end_seconds"],
               "additionalProperties": false
             }
             """));
@@ -52,8 +53,7 @@ public sealed class RippleDeleteRangeAgentTool(
         AgentToolJson.EnsureOnlyProperties(
             arguments,
             "start_seconds",
-            "end_seconds",
-            "reason");
+            "end_seconds");
 
         var start = AgentToolJson.RequireFiniteDouble(arguments, "start_seconds", 0);
         var end = AgentToolJson.RequireFiniteDouble(arguments, "end_seconds", 0);
@@ -63,12 +63,11 @@ public sealed class RippleDeleteRangeAgentTool(
                 "'end_seconds' must be greater than 'start_seconds'.");
         }
 
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.RippleDeleteRangeAsync(
             context,
             start,
             end,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -102,10 +101,9 @@ public sealed class RippleDeleteRangesAgentTool(
                     "required": ["start_seconds", "end_seconds"],
                     "additionalProperties": false
                   }
-                },
-                "reason": { "type": "string" }
+                }
               },
-              "required": ["ranges", "reason"],
+              "required": ["ranges"],
               "additionalProperties": false
             }
             """));
@@ -119,8 +117,7 @@ public sealed class RippleDeleteRangesAgentTool(
     {
         AgentToolJson.EnsureOnlyProperties(
             arguments,
-            "ranges",
-            "reason");
+            "ranges");
 
         if (!arguments.TryGetProperty("ranges", out var rangesElement) ||
             rangesElement.ValueKind != JsonValueKind.Array)
@@ -167,64 +164,14 @@ public sealed class RippleDeleteRangesAgentTool(
                 "'ranges' must contain at least one range.");
         }
 
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.RippleDeleteRangesAsync(
             context,
             ranges,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
             $"Removed {ranges.Count} ranges from the Agent Draft.",
-            data);
-    }
-}
-
-public sealed class SplitTimelineAgentTool(
-    IAgentEditingToolBackend backend) : AgentEditingToolBase(backend)
-{
-    private static readonly AgentToolDescriptor ToolDescriptor = new(
-        "split_timeline_at",
-        "Split all draft clips that cross an exact timeline position. This does not remove material.",
-        AgentToolAccess.Editing,
-        AgentToolJson.ParseObject(
-            """
-            {
-              "type": "object",
-              "properties": {
-                "position_seconds": { "type": "number", "minimum": 0 },
-                "reason": { "type": "string" }
-              },
-              "required": ["position_seconds", "reason"],
-              "additionalProperties": false
-            }
-            """));
-
-    public override AgentToolDescriptor Descriptor => ToolDescriptor;
-
-    public override async ValueTask<AgentToolExecutionOutput> ExecuteAsync(
-        AgentToolContext context,
-        JsonElement arguments,
-        CancellationToken cancellationToken)
-    {
-        AgentToolJson.EnsureOnlyProperties(
-            arguments,
-            "position_seconds",
-            "reason");
-
-        var position = AgentToolJson.RequireFiniteDouble(
-            arguments,
-            "position_seconds",
-            0);
-        var reason = AgentToolJson.RequireString(arguments, "reason");
-        var data = await Backend.SplitTimelineAsync(
-            context,
-            position,
-            reason,
-            cancellationToken);
-
-        return Output(
-            $"Split the draft at {position:0.###}s.",
             data);
     }
 }
@@ -247,10 +194,9 @@ public sealed class DeleteClipsAgentTool(
                   "minItems": 1,
                   "maxItems": 100
                 },
-                "include_linked": { "type": "boolean", "default": true },
-                "reason": { "type": "string" }
+                "include_linked": { "type": "boolean", "default": true }
               },
-              "required": ["clip_ids", "reason"],
+              "required": ["clip_ids"],
               "additionalProperties": false
             }
             """));
@@ -265,20 +211,18 @@ public sealed class DeleteClipsAgentTool(
         AgentToolJson.EnsureOnlyProperties(
             arguments,
             "clip_ids",
-            "include_linked",
-            "reason");
+            "include_linked");
 
         var clipIds = AgentToolJson.RequireGuidArray(arguments, "clip_ids");
         var includeLinked = AgentToolJson.OptionalBoolean(
             arguments,
             "include_linked",
             true);
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.DeleteClipsAsync(
             context,
             clipIds,
             includeLinked,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -301,10 +245,9 @@ public sealed class TrimClipAgentTool(
               "properties": {
                 "clip_id": { "type": "string", "format": "uuid" },
                 "edge": { "type": "string", "enum": ["left", "right"] },
-                "edge_seconds": { "type": "number", "minimum": 0 },
-                "reason": { "type": "string" }
+                "edge_seconds": { "type": "number", "minimum": 0 }
               },
-              "required": ["clip_id", "edge", "edge_seconds", "reason"],
+              "required": ["clip_id", "edge", "edge_seconds"],
               "additionalProperties": false
             }
             """));
@@ -320,8 +263,7 @@ public sealed class TrimClipAgentTool(
             arguments,
             "clip_id",
             "edge",
-            "edge_seconds",
-            "reason");
+            "edge_seconds");
 
         var clipId = AgentToolJson.RequireGuid(arguments, "clip_id");
         var edge = AgentToolJson.RequireString(arguments, "edge").ToLowerInvariant();
@@ -335,13 +277,12 @@ public sealed class TrimClipAgentTool(
             arguments,
             "edge_seconds",
             0);
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.TrimClipAsync(
             context,
             clipId,
             edge,
             edgeSeconds,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -364,10 +305,9 @@ public sealed class MoveClipAgentTool(
               "properties": {
                 "clip_id": { "type": "string", "format": "uuid" },
                 "target_track_id": { "type": "string", "format": "uuid" },
-                "start_seconds": { "type": "number", "minimum": 0 },
-                "reason": { "type": "string" }
+                "start_seconds": { "type": "number", "minimum": 0 }
               },
-              "required": ["clip_id", "target_track_id", "start_seconds", "reason"],
+              "required": ["clip_id", "target_track_id", "start_seconds"],
               "additionalProperties": false
             }
             """));
@@ -383,8 +323,7 @@ public sealed class MoveClipAgentTool(
             arguments,
             "clip_id",
             "target_track_id",
-            "start_seconds",
-            "reason");
+            "start_seconds");
 
         var clipId = AgentToolJson.RequireGuid(arguments, "clip_id");
         var trackId = AgentToolJson.RequireGuid(arguments, "target_track_id");
@@ -392,13 +331,12 @@ public sealed class MoveClipAgentTool(
             arguments,
             "start_seconds",
             0);
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.MoveClipAsync(
             context,
             clipId,
             trackId,
             startSeconds,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -421,10 +359,9 @@ public sealed class SetClipVolumeAgentTool(
               "properties": {
                 "clip_id": { "type": "string", "format": "uuid" },
                 "volume": { "type": "number", "minimum": 0, "maximum": 4 },
-                "muted": { "type": "boolean" },
-                "reason": { "type": "string" }
+                "muted": { "type": "boolean" }
               },
-              "required": ["clip_id", "volume", "muted", "reason"],
+              "required": ["clip_id", "volume", "muted"],
               "additionalProperties": false
             }
             """));
@@ -440,8 +377,7 @@ public sealed class SetClipVolumeAgentTool(
             arguments,
             "clip_id",
             "volume",
-            "muted",
-            "reason");
+            "muted");
 
         var clipId = AgentToolJson.RequireGuid(arguments, "clip_id");
         var volume = AgentToolJson.RequireFiniteDouble(arguments, "volume", 0);
@@ -452,13 +388,12 @@ public sealed class SetClipVolumeAgentTool(
         }
 
         var muted = AgentToolJson.OptionalBoolean(arguments, "muted");
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.SetClipVolumeAsync(
             context,
             clipId,
             volume,
             muted,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -485,8 +420,7 @@ public sealed class AddTextAgentTool(
                 "subtitle": { "type": "boolean" },
                 "font_size": { "type": "number", "minimum": 8, "maximum": 240 },
                 "x": { "type": "number", "minimum": 0, "maximum": 1 },
-                "y": { "type": "number", "minimum": 0, "maximum": 1 },
-                "reason": { "type": "string" }
+                "y": { "type": "number", "minimum": 0, "maximum": 1 }
               },
               "required": [
                 "start_seconds",
@@ -495,8 +429,7 @@ public sealed class AddTextAgentTool(
                 "subtitle",
                 "font_size",
                 "x",
-                "y",
-                "reason"
+                "y"
               ],
               "additionalProperties": false
             }
@@ -517,8 +450,7 @@ public sealed class AddTextAgentTool(
             "subtitle",
             "font_size",
             "x",
-            "y",
-            "reason");
+            "y");
 
         var start = AgentToolJson.RequireFiniteDouble(arguments, "start_seconds", 0);
         var duration = AgentToolJson.RequireFiniteDouble(arguments, "duration_seconds", 0.001);
@@ -533,7 +465,6 @@ public sealed class AddTextAgentTool(
                 "font_size/x/y exceed their allowed ranges.");
         }
 
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.AddTextAsync(
             context,
             start,
@@ -543,7 +474,7 @@ public sealed class AddTextAgentTool(
             fontSize,
             x,
             y,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(
@@ -576,10 +507,9 @@ public sealed class AddTransitionAgentTool(
                     "constant_power_audio"
                   ]
                 },
-                "duration_seconds": { "type": "number", "exclusiveMinimum": 0 },
-                "reason": { "type": "string" }
+                "duration_seconds": { "type": "number", "exclusiveMinimum": 0 }
               },
-              "required": ["from_clip_id", "kind", "duration_seconds", "reason"],
+              "required": ["from_clip_id", "kind", "duration_seconds"],
               "additionalProperties": false
             }
             """));
@@ -595,8 +525,7 @@ public sealed class AddTransitionAgentTool(
             arguments,
             "from_clip_id",
             "kind",
-            "duration_seconds",
-            "reason");
+            "duration_seconds");
 
         var fromClipId = AgentToolJson.RequireGuid(arguments, "from_clip_id");
         var kind = AgentToolJson.RequireString(arguments, "kind");
@@ -604,13 +533,12 @@ public sealed class AddTransitionAgentTool(
             arguments,
             "duration_seconds",
             0.001);
-        var reason = AgentToolJson.RequireString(arguments, "reason");
         var data = await Backend.AddTransitionAsync(
             context,
             fromClipId,
             kind,
             duration,
-            reason,
+            ApprovedPlanReason,
             cancellationToken);
 
         return Output(

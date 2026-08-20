@@ -311,7 +311,11 @@ public sealed record SplitMediaClipsCommand(TimelineTime Position) : IEditComman
     }
 }
 
-public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Position, Guid? SelectedRightId = null) : IEditCommand
+public sealed record SplitSelectedMediaClipCommand(
+    Guid ClipId,
+    TimelineTime Position,
+    Guid? SelectedRightId = null,
+    bool IncludeLinked = true) : IEditCommand
 {
     public string Description => "Разрезать выбранный клип";
 
@@ -319,10 +323,11 @@ public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Pos
     {
         var selected = RequireClip(project, ClipId);
         if (Position <= selected.Start || Position >= selected.End) return project;
-        var targets = selected.LinkGroupId is { } group
+        var targets = IncludeLinked && selected.LinkGroupId is { } group
             ? project.MediaClips.Where(item => item.LinkGroupId == group && Position > item.Start && Position < item.End).ToArray()
             : [selected];
         var rightGroup = targets.Length > 1 ? Guid.NewGuid() : (Guid?)null;
+        var unlinkedGroup = !IncludeLinked ? selected.LinkGroupId : null;
         var left = new Dictionary<Guid, MediaClip>();
         var right = new List<MediaClip>();
         foreach (var clip in targets)
@@ -330,7 +335,12 @@ public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Pos
             var source = project.Sources[clip.SourceId];
             var leftDuration = Position - clip.Start;
             var rightDuration = clip.Duration - leftDuration;
-            left[clip.Id] = clip with { Duration = leftDuration, Audio = ClampAudioFades(clip.Audio, leftDuration) };
+            left[clip.Id] = clip with
+            {
+                LinkGroupId = unlinkedGroup.HasValue ? null : clip.LinkGroupId,
+                Duration = leftDuration,
+                Audio = ClampAudioFades(clip.Audio, leftDuration)
+            };
             right.Add(clip with
             {
                 Id = clip.Id == selected.Id && SelectedRightId.HasValue ? SelectedRightId.Value : Guid.NewGuid(),
@@ -341,7 +351,10 @@ public sealed record SplitSelectedMediaClipCommand(Guid ClipId, TimelineTime Pos
         }
         return project with
         {
-            MediaClips = project.MediaClips.Select(item => left.GetValueOrDefault(item.Id, item))
+            MediaClips = project.MediaClips.Select(item =>
+                    unlinkedGroup.HasValue && item.LinkGroupId == unlinkedGroup
+                        ? left.GetValueOrDefault(item.Id, item with { LinkGroupId = null })
+                        : left.GetValueOrDefault(item.Id, item))
                 .Concat(right).ToImmutableArray(),
             Transitions = RemoveTransitionsForClips(
                 project.Transitions, targets.Select(item => item.Id).ToHashSet())
@@ -362,6 +375,38 @@ public sealed record UnlinkMediaClipCommand(Guid ClipId) : IEditCommand
                 ? item with { LinkGroupId = null }
                 : item).ToImmutableArray()
         };
+    }
+}
+
+public sealed record RippleDeleteSelectedMediaClipCommand(Guid ClipId) : IEditCommand
+{
+    public string Description => "Удалить выбранный клип со сдвигом";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var selected = RequireClip(project, ClipId);
+        var targets = selected.LinkGroupId is { } group
+            ? project.MediaClips.Where(item => item.LinkGroupId == group).ToArray()
+            : [selected];
+        var rangeStart = targets.Min(item => item.Start);
+        var rangeEnd = targets.Max(item => item.End);
+        if (targets.Any(item => item.Start != rangeStart || item.End != rangeEnd))
+        {
+            throw new EditRejectedException(
+                "Связанные клипы рассинхронизированы. Сначала выровняйте видео и аудио.");
+        }
+
+        var targetIds = targets.Select(item => item.Id).ToHashSet();
+        var hasUnselectedOverlap = project.MediaClips.Any(item =>
+            !targetIds.Contains(item.Id) && item.Start < rangeEnd && item.End > rangeStart);
+        var hasTextOverlap = project.TextClips.Any(item => item.Start < rangeEnd && item.End > rangeStart);
+        if (hasUnselectedOverlap || hasTextOverlap)
+        {
+            throw new EditRejectedException(
+                "Ripple Delete остановлен: диапазон пересекает несвязанное содержимое на другой дорожке.");
+        }
+
+        return new RippleDeleteRangeCommand(new TimeRange(rangeStart, rangeEnd - rangeStart)).Apply(project);
     }
 }
 

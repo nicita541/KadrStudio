@@ -14,77 +14,152 @@ namespace KadrStudio.Services.Agent;
 /// The model chooses exactly one externally visible action per turn and never
 /// receives direct access to project objects.
 /// </summary>
-public sealed class AiServerAgentModel : IAgentModel
+public sealed class AiServerAgentModel :
+    IAgentModel,
+    IAgentTaskInterpreter,
+    IAgentPlanCritic,
+    IAgentVerificationReporter
 {
     private const int MaximumPlanConstraints = 24;
     private const int MaximumPlanSteps = 24;
+    private const int MaximumObservationPromptCharacters = 24_000;
 
     private static readonly JsonSerializerOptions TurnPayloadJsonOptions = new()
     {
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
     };
 
-    private static readonly JsonElement DecisionSchema = AgentToolJson.ParseObject(
+    private static readonly JsonElement InvestigationDecisionSchema = AgentToolJson.ParseObject(
         """
         {
           "type": "object",
           "properties": {
-            "action": {
-              "type": "string",
-              "enum": [
-                "use_tool",
-                "ask_user",
-                "publish_plan",
-                "begin_verification",
-                "complete_task"
-              ]
-            },
-            "progress": { "type": "string" },
-            "tool_name": { "type": "string" },
-            "tool_arguments": {
-              "type": "object",
-              "additionalProperties": true
-            },
-            "question": { "type": "string" },
-            "question_context": { "type": "string" },
-            "plan_objective": { "type": "string" },
-            "plan_summary": { "type": "string" },
-            "plan_constraints": {
-              "type": "array",
-              "items": { "type": "string" }
-            },
+            "action": { "type": "string", "enum": ["use_tool", "ask_user", "publish_plan", "complete_read_only"] },
+            "progress": { "type": "string", "maxLength": 600 },
+            "tool_name": { "type": "string", "maxLength": 100 },
+            "tool_arguments": { "type": "object", "additionalProperties": true },
+            "question": { "type": "string", "maxLength": 1000 },
+            "question_context": { "type": "string", "maxLength": 1600 },
+            "completion_summary": { "type": "string", "maxLength": 3000 }
+          },
+          "required": ["action", "progress", "tool_name", "tool_arguments", "question", "question_context", "completion_summary"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement PublishedPlanSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "plan_objective": { "type": "string", "minLength": 1, "maxLength": 400 },
+            "plan_summary": { "type": "string", "minLength": 1, "maxLength": 1200 },
+            "plan_constraints": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 300 } },
             "plan_steps": {
               "type": "array",
+              "minItems": 1,
+              "maxItems": 12,
               "items": {
                 "type": "object",
                 "properties": {
-                  "title": { "type": "string" },
-                  "description": { "type": "string" },
-                  "expected_editing_tool": { "type": "string" },
-                  "evidence_observation_sequences": {
-                    "type": "array",
-                    "items": { "type": "integer", "minimum": 1 }
-                  }
+                  "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+                  "description": { "type": "string", "minLength": 1, "maxLength": 500 },
+                  "expected_editing_tool": { "type": "string", "maxLength": 100 },
+                  "expected_editing_arguments": { "type": "object", "additionalProperties": true },
+                  "evidence_requirement": { "type": "string", "enum": ["timeline", "frames", "audio", "transcript", "all"] },
+                  "evidence_observation_sequences": { "type": "array", "maxItems": 32, "items": { "type": "integer", "minimum": 1 } },
+                  "expected_effect": { "type": "string", "maxLength": 500 },
+                  "protected_invariants": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 300 } },
+                  "verification_checks": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 300 } }
                 },
-                "required": ["title", "description", "expected_editing_tool", "evidence_observation_sequences"],
+                "required": ["title", "description", "expected_editing_tool", "expected_editing_arguments", "evidence_requirement", "evidence_observation_sequences", "expected_effect", "protected_invariants", "verification_checks"],
                 "additionalProperties": false
               }
-            },
+            }
+          },
+          "required": ["plan_objective", "plan_summary", "plan_constraints", "plan_steps"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement ExecutionDecisionSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "action": { "type": "string", "enum": ["use_tool", "ask_user", "begin_verification"] },
+            "progress": { "type": "string" },
+            "tool_name": { "type": "string" },
+            "tool_arguments": { "type": "object", "additionalProperties": true },
+            "question": { "type": "string" },
+            "question_context": { "type": "string" }
+          },
+          "required": ["action", "progress", "tool_name", "tool_arguments", "question", "question_context"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement LegacyVerificationDecisionSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "action": { "type": "string", "enum": ["use_tool", "ask_user", "complete_task"] },
+            "progress": { "type": "string" },
+            "tool_name": { "type": "string" },
+            "tool_arguments": { "type": "object", "additionalProperties": true },
+            "question": { "type": "string" },
+            "question_context": { "type": "string" },
             "completion_summary": { "type": "string" }
           },
-          "required": [
-            "action",
-            "progress",
-            "tool_name",
-            "tool_arguments",
-            "question",
-            "question_context",
-            "plan_objective",
-            "plan_summary",
-            "plan_constraints",
-            "plan_steps",
-            "completion_summary"
-          ],
+          "required": ["action", "progress", "tool_name", "tool_arguments", "question", "question_context", "completion_summary"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement TaskBriefSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "task_kind": { "type": "string", "enum": ["read_only", "edit", "mixed"] },
+            "goal": { "type": "string", "minLength": 1, "maxLength": 240 },
+            "scope": { "type": "string", "minLength": 1, "maxLength": 240 },
+            "protected_elements": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 200 } },
+            "constraints": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 200 } },
+            "acceptance_criteria": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 200 } },
+            "assumptions": { "type": "array", "maxItems": 6, "items": { "type": "string", "maxLength": 200 } },
+            "missing_information": { "type": "array", "maxItems": 6, "items": { "type": "string", "maxLength": 200 } }
+          },
+          "required": ["task_kind", "goal", "scope", "protected_elements", "constraints", "acceptance_criteria", "assumptions", "missing_information"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement PlanReviewSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "accepted": { "type": "boolean" },
+            "summary": { "type": "string" },
+            "issues": { "type": "array", "items": { "type": "string" }, "maxItems": 12 }
+          },
+          "required": ["accepted", "summary", "issues"],
+          "additionalProperties": false
+        }
+        """);
+
+    private static readonly JsonElement VerificationReportSchema = AgentToolJson.ParseObject(
+        """
+        {
+          "type": "object",
+          "properties": {
+            "accepted": { "type": "boolean" },
+            "summary": { "type": "string", "minLength": 1 },
+            "issues": { "type": "array", "items": { "type": "string" }, "maxItems": 12 }
+          },
+          "required": ["accepted", "summary", "issues"],
           "additionalProperties": false
         }
         """);
@@ -107,7 +182,11 @@ public sealed class AiServerAgentModel : IAgentModel
         ArgumentNullException.ThrowIfNull(request);
 
         var systemPrompt = BuildSystemPrompt(request.Mode);
-        var turnPayload = BuildTurnPayload(request);
+        var turnPayload = BuildTurnPayload(
+            request,
+            request.Mode == AgentModelTurnMode.Planning
+                ? AgentToolAccess.ReadOnly
+                : null);
         var startedAt = DateTimeOffset.UtcNow;
 
         _debugLog.Write(new AgentDebugLogEntry(
@@ -118,15 +197,20 @@ public sealed class AiServerAgentModel : IAgentModel
             request.Task.Phase.ToString(),
             request.TurnIndex,
             $"Sending {request.Mode} turn to Kadr AI Server.",
-            $"system_prompt:\n{systemPrompt}\n\nturn_payload:\n{turnPayload}"));
+            $"payload_characters={turnPayload.Length}; tools={request.AvailableTools.Length}; observations={request.Observations.Length}; conversation={request.Conversation.Length}"));
 
         try
         {
             var raw = await _aiServer.RunAgentStructuredTurnAsync(
-                DecisionSchema,
+                GetDecisionSchema(request.Mode),
                 systemPrompt,
                 turnPayload,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                think: request.Mode == AgentModelTurnMode.Planning,
+                maxTokens: 2048,
+                reasoningTokens: request.Mode == AgentModelTurnMode.Planning
+                    ? 1024
+                    : null).ConfigureAwait(false);
 
             _debugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
@@ -136,10 +220,25 @@ public sealed class AiServerAgentModel : IAgentModel
                 request.Task.Phase.ToString(),
                 request.TurnIndex,
                 $"Kadr AI Server returned a structured response in {(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds:0} ms.",
-                raw));
+                $"response_characters={raw.Length}"));
 
             try
             {
+                if (request.Mode == AgentModelTurnMode.Planning)
+                {
+                    using var actionDocument = JsonDocument.Parse(raw);
+                    if (string.Equals(
+                            ReadRequiredString(actionDocument.RootElement, "action"),
+                            "publish_plan",
+                            StringComparison.Ordinal))
+                    {
+                        return await GeneratePublishedPlanAsync(
+                            request,
+                            ReadString(actionDocument.RootElement, "progress"),
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                }
+
                 return ParseDecision(raw);
             }
             catch (Exception parseException)
@@ -152,7 +251,7 @@ public sealed class AiServerAgentModel : IAgentModel
                     request.Task.Phase.ToString(),
                     request.TurnIndex,
                     parseException.Message,
-                    raw,
+                    $"response_characters={raw.Length}",
                     parseException.ToString()));
                 throw;
             }
@@ -179,10 +278,228 @@ public sealed class AiServerAgentModel : IAgentModel
                 request.Task.Phase.ToString(),
                 request.TurnIndex,
                 exception.Message,
-                $"turn_payload:\n{turnPayload}",
+                $"payload_characters={turnPayload.Length}",
                 exception.ToString()));
             throw;
         }
+    }
+
+    private async ValueTask<AgentModelDecision> GeneratePublishedPlanAsync(
+        AgentModelTurnRequest request,
+        string progress,
+        CancellationToken cancellationToken)
+    {
+        var prompt =
+            """
+            Сформируй компактный машинно проверяемый план уже исследованной задачи.
+            Не вызывай инструменты и не добавляй новые действия сверх Task Brief.
+            Для каждого editing-шага укажи точный tool_name из available_tools,
+            нормализованные аргументы без reason, тип доказательства и номера фактических
+            observations. Не придумывай IDs или таймкоды. Шаги без монтажа оставляй с
+            expected_editing_tool="" и пустым объектом аргументов. Явно сохрани
+            protected invariants. Если несколько диапазонов удаления измерены на одной
+            revision, создай ровно один шаг ripple_delete_ranges со всеми диапазонами;
+            не разбивай их на последовательные ripple-вызовы, меняющие координаты.
+            Не раскрывай рассуждения. Верни только JSON по schema.
+            """;
+        var planPayload = BuildTurnPayload(request);
+        var raw = await _aiServer.RunAgentStructuredTurnAsync(
+            PublishedPlanSchema,
+            prompt,
+            planPayload,
+            cancellationToken,
+            think: true,
+            maxTokens: 4096,
+            reasoningTokens: 1280).ConfigureAwait(false);
+        _debugLog.Write(new AgentDebugLogEntry(
+            DateTimeOffset.UtcNow,
+            "ai_server_agent_model",
+            "published_plan_response",
+            request.Task.Id,
+            request.Task.Phase.ToString(),
+            request.TurnIndex,
+            "Kadr AI Server returned the dedicated structured plan response.",
+            $"response_characters={raw.Length}"));
+        using var document = JsonDocument.Parse(raw);
+        return ParsePlanDecision(document.RootElement, progress);
+    }
+
+    public async ValueTask<AgentTaskUnderstanding> UnderstandAsync(
+        AgentModelTurnRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var prompt =
+            """
+            Ты директор универсального монтажного агента Kadr Studio. Сначала преврати
+            запрос в точный Task Brief. Не выбирай монтажные действия и не придумывай
+            факты проекта. Используй переданный диалог и наблюдения редактора.
+            task_kind означает намерение пользователя, а не текущую read-only стадию
+            исследования: read_only — пользователь просит только ответ/анализ без
+            изменения проекта; edit — пользователь просит любое изменение монтажа;
+            mixed — одновременно ответ и изменение. Будущее утверждение плана не делает
+            монтажный запрос read_only.
+            Не задавай вопросы на этом шаге. Блокирующее намерение или предпочтение
+            будет уточнено действием ask_user после доступного исследования проекта.
+            Таймкоды, границы, clip IDs,
+            содержание кадров и звука агент обязан исследовать tools: перечисли такие
+            факты в missing_information, но не спрашивай их у пользователя. Агент всегда
+            работает в отдельном Agent Draft, не перезаписывает source и не экспортирует,
+            поэтому сохранение копии, исходные файлы, контейнер, битрейт и формат вывода
+            не являются недостающей информацией для Task Brief.
+            Пиши поля Task Brief компактно, без повторов и длинных объяснений.
+            Никакой жанр, название или пример задачи не создаёт специального сценария.
+            Не раскрывай внутренние рассуждения. Верни только JSON по schema.
+            """;
+
+        var payload = BuildTurnPayload(request);
+        var raw = await _aiServer.RunAgentStructuredTurnAsync(
+            TaskBriefSchema,
+            prompt,
+            payload,
+            cancellationToken,
+            // This stage only serializes already available intent/context into a
+            // compact brief. Keeping thinking enabled here made Qwen consume the
+            // response budget before it emitted JSON; actual investigation and
+            // plan criticism still use thinking.
+            think: false,
+            maxTokens: 1536,
+            reasoningTokens: null).ConfigureAwait(false);
+        using var briefDocument = JsonDocument.Parse(raw);
+        var briefRoot = briefDocument.RootElement;
+        var brief = ParseTaskBrief(briefRoot);
+        return new AgentTaskUnderstanding(brief, []);
+    }
+
+    public async ValueTask<AgentPlanReview> ReviewPlanAsync(
+        AgentPlanReviewRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var prompt =
+            """
+            Ты независимый критик плана универсального монтажного агента. Не исправляй
+            план и не вызывай инструменты. Отклони его, если действие не поддерживается,
+            аргументы неточны, evidence не доказывает действие, нарушены Task Brief или
+            protected invariants, присутствуют выдуманные id/таймкоды, либо результат
+            нельзя детерминированно проверить. Не требуй конкретного творческого решения:
+            проверяй только соответствие запросу, доказательствам и безопасности.
+            Не раскрывай внутренние рассуждения. Верни только JSON по schema.
+            """;
+
+        var reviewPlan = new
+        {
+            request.Plan.Objective,
+            request.Plan.Summary,
+            constraints = request.Plan.Constraints.IsDefault
+                ? ImmutableArray<string>.Empty
+                : request.Plan.Constraints,
+            steps = request.Plan.Steps.Select(step => new
+            {
+                step.Title,
+                step.Description,
+                step.ExpectedEditingTool,
+                step.ExpectedEditingArguments,
+                evidence_observation_sequences = step.EvidenceObservationSequences.IsDefault
+                    ? ImmutableArray<int>.Empty
+                    : step.EvidenceObservationSequences,
+                evidence_requirement = ToSchemaValue(step.EvidenceRequirement),
+                step.ExpectedEffect,
+                protected_invariants = step.ProtectedInvariants.IsDefault
+                    ? ImmutableArray<string>.Empty
+                    : step.ProtectedInvariants,
+                verification_checks = step.VerificationChecks.IsDefault
+                    ? ImmutableArray<string>.Empty
+                    : step.VerificationChecks
+            })
+        };
+        var payload = JsonSerializer.Serialize(new
+        {
+            task = new
+            {
+                request.Task.Id,
+                request.Task.UserRequest,
+                request.Task.SourceSequenceId,
+                request.Task.SourceSequenceRevision,
+                brief = request.Task.Brief
+            },
+            plan = reviewPlan,
+            observations = request.Observations,
+            conversation = request.Conversation
+        }, TurnPayloadJsonOptions);
+
+        var raw = await _aiServer.RunAgentStructuredTurnAsync(
+            PlanReviewSchema,
+            prompt,
+            payload,
+            cancellationToken,
+            think: true,
+            maxTokens: 1536,
+            reasoningTokens: 1024).ConfigureAwait(false);
+
+        using var document = JsonDocument.Parse(raw);
+        var root = document.RootElement;
+        var accepted = root.TryGetProperty("accepted", out var acceptedElement) &&
+                       acceptedElement.ValueKind is JsonValueKind.True;
+        var summary = ReadRequiredString(root, "summary");
+        var issues = ReadStringArray(root, "issues", 12);
+        return new AgentPlanReview(accepted, summary, issues);
+    }
+
+    public async ValueTask<AgentVerificationReport> ReportVerificationAsync(
+        AgentVerificationReportRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var prompt =
+            """
+            Ты формируешь только итоговый отчёт детерминированной проверки Agent Draft.
+            Ты не выбираешь tools, не предлагаешь скрытые исправления и не меняешь план.
+            accepted=true допустимо только если edit log совпадает с утверждённым планом,
+            source sequence не менялась, а проверки целостности и сравнения завершились
+            успешно. Кратко опиши фактически выполненные изменения и проверки. Если
+            observation сообщает ошибку или несовпадение, верни accepted=false и issues.
+            Не раскрывай внутренние рассуждения. Верни только JSON по schema.
+            """;
+        var payload = JsonSerializer.Serialize(new
+        {
+            task = new
+            {
+                request.Task.Id,
+                request.Task.UserRequest,
+                request.Task.SourceSequenceId,
+                request.Task.SourceSequenceRevision,
+                request.Task.DraftSequenceId,
+                brief = request.Task.Brief,
+                plan = request.Task.Plan
+            },
+            verification_observations = request.VerificationObservations.Select(observation => new
+            {
+                observation.Sequence,
+                observation.ToolName,
+                status = observation.Status.ToString().ToLowerInvariant(),
+                observation.Summary,
+                observation.ErrorCode,
+                data = CompactObservationForPrompt(observation.Data)
+            })
+        }, TurnPayloadJsonOptions);
+        var raw = await _aiServer.RunAgentStructuredTurnAsync(
+            VerificationReportSchema,
+            prompt,
+            payload,
+            cancellationToken,
+            think: false,
+            maxTokens: 1536,
+            reasoningTokens: null).ConfigureAwait(false);
+        using var document = JsonDocument.Parse(raw);
+        var root = document.RootElement;
+        return new AgentVerificationReport(
+            root.TryGetProperty("accepted", out var accepted) &&
+            accepted.ValueKind == JsonValueKind.True,
+            ReadRequiredString(root, "summary"),
+            ReadStringArray(root, "issues", 12));
     }
 
     private static string BuildSystemPrompt(AgentModelTurnMode mode)
@@ -192,14 +509,20 @@ public sealed class AiServerAgentModel : IAgentModel
             AgentModelTurnMode.Planning =>
                 """
                 Сейчас этап ИССЛЕДОВАНИЯ И ПЛАНА.
-                Разрешённые итоговые действия: use_tool, ask_user, publish_plan.
-                Не выполняй монтаж. Используй только read-only tools.
+                Разрешённые итоговые действия: use_tool, ask_user, publish_plan, complete_read_only.
+                Не выполняй монтаж. В action=use_tool используй только tools с access=read_only.
+                Tools с access=editing показаны только как каталог допустимых будущих
+                expected_editing_tool для плана и до утверждения не вызываются.
                 publish_plan делай только когда данных достаточно для конкретного,
                 проверяемого и понятного пользователю плана.
-                Для каждого шага монтажа укажи точное имя editing tool в expected_editing_tool
-                и номера observations, доказывающих границы, в evidence_observation_sequences.
-                Для шага без монтажа верни expected_editing_tool="". Смысловое удаление нельзя
-                обосновать одним inspect_timeline: нужен inspect_range с frames/audio/transcript/all.
+                Для каждого шага монтажа укажи точное имя editing tool и точные нормализованные
+                аргументы в expected_editing_arguments. Не включай туда свободное поле reason.
+                Укажи тип достаточного доказательства в evidence_requirement и номера observations,
+                доказывающих действие, в evidence_observation_sequences. Для шага без монтажа
+                верни expected_editing_tool="" и пустой объект аргументов. Выбирай канал доказательства
+                по смыслу действия: timeline для геометрии, frames/audio/transcript либо all для содержания.
+                Если Task Brief имеет task kind read_only, ответь доказанно через complete_read_only:
+                не создавай план и Agent Draft.
                 """,
             AgentModelTurnMode.Execution =>
                 """
@@ -218,8 +541,8 @@ public sealed class AiServerAgentModel : IAgentModel
                 Разрешённые итоговые действия: use_tool, ask_user, complete_task.
                 Сначала проверь фактические изменения read-only инструментами.
                 Обязательно вызови inspect_agent_edits после последнего изменения, затем
-                inspect_timeline и/или inspect_range для проверки фактического состояния
-                черновика и важных новых склеек/изменённых мест.
+                inspect_timeline_integrity и inspect_range для проверки фактического состояния,
+                gaps/overlaps/link-групп и важных новых склеек/изменённых мест.
                 Если обнаружена ошибка в рамках утверждённого плана, можешь исправить её
                 editing tool и затем снова проверить. Если исправление выходит за рамки
                 утверждённого плана, сначала спроси пользователя.
@@ -230,7 +553,6 @@ public sealed class AiServerAgentModel : IAgentModel
 
         return
             """
-            /no_think
             Ты монтажный AI-агент Kadr Studio.
 
             Общие правила:
@@ -260,7 +582,8 @@ public sealed class AiServerAgentModel : IAgentModel
     }
 
     private static string BuildTurnPayload(
-        AgentModelTurnRequest request)
+        AgentModelTurnRequest request,
+        AgentToolAccess? toolAccess = null)
     {
         var answeredQuestions = request.Task.Questions
             .Where(question => question.IsAnswered)
@@ -284,14 +607,20 @@ public sealed class AiServerAgentModel : IAgentModel
                 {
                     order = step.Order,
                     title = step.Title,
-                    description = step.Description,
-                    expected_editing_tool = step.ExpectedEditingTool,
-                    evidence_observation_sequences = step.EvidenceObservationSequences
+                description = step.Description,
+                expected_editing_tool = step.ExpectedEditingTool,
+                expected_editing_arguments = step.ExpectedEditingArguments,
+                evidence_requirement = ToSchemaValue(step.EvidenceRequirement),
+                evidence_observation_sequences = step.EvidenceObservationSequences,
+                expected_effect = step.ExpectedEffect,
+                protected_invariants = step.ProtectedInvariants,
+                verification_checks = step.VerificationChecks
                 }).ToArray(),
                 approved = plan.ApprovedAt is not null
             };
 
         var tools = request.AvailableTools
+            .Where(tool => toolAccess is null || tool.Access == toolAccess)
             .Select(tool => new
             {
                 name = tool.Name,
@@ -301,7 +630,7 @@ public sealed class AiServerAgentModel : IAgentModel
             })
             .ToArray();
 
-        var observations = request.Observations
+        var observations = SelectObservationsForPrompt(request)
             .Select(observation => new
             {
                 sequence = observation.Sequence,
@@ -309,7 +638,7 @@ public sealed class AiServerAgentModel : IAgentModel
                 status = observation.Status.ToString().ToLowerInvariant(),
                 summary = observation.Summary,
                 error_code = observation.ErrorCode,
-                data = observation.Data
+                data = CompactObservationForPrompt(observation.Data)
             })
             .ToArray();
 
@@ -338,6 +667,21 @@ public sealed class AiServerAgentModel : IAgentModel
                 answered_questions = answeredQuestions,
                 current_plan = currentPlan
             },
+            task_brief = request.Task.Brief,
+            evidence_ledger = request.Task.Evidence.Select(item => new
+            {
+                item.Id,
+                item.Sequence,
+                channel = item.Channel.ToString().ToLowerInvariant(),
+                item.ToolName,
+                item.TargetId,
+                item.SourceRevision,
+                item.StartSeconds,
+                item.EndSeconds,
+                item.Summary,
+                item.Facts,
+                item.ArtifactReference
+            }),
             conversation,
             available_tools = tools,
             observations,
@@ -347,6 +691,69 @@ public sealed class AiServerAgentModel : IAgentModel
 
         return JsonSerializer.Serialize(payload, TurnPayloadJsonOptions);
     }
+
+    private static ImmutableArray<AgentModelObservation> SelectObservationsForPrompt(
+        AgentModelTurnRequest request)
+    {
+        if (request.Observations.IsDefaultOrEmpty)
+        {
+            return [];
+        }
+
+        var pinned = request.Task.Plan?.Steps
+            .SelectMany(step => step.EvidenceObservationSequences.IsDefault
+                ? []
+                : step.EvidenceObservationSequences)
+            .ToHashSet() ?? [];
+        var selected = new Dictionary<int, AgentModelObservation>();
+        var characters = 0;
+
+        void TryAdd(AgentModelObservation observation, bool required)
+        {
+            if (selected.ContainsKey(observation.Sequence))
+            {
+                return;
+            }
+
+            var size = EstimatePromptObservationCharacters(observation);
+            if (!required && characters + size > MaximumObservationPromptCharacters)
+            {
+                return;
+            }
+
+            selected[observation.Sequence] = observation;
+            characters += size;
+        }
+
+        foreach (var observation in request.Observations.Where(observation =>
+                     pinned.Contains(observation.Sequence) ||
+                     string.Equals(
+                         observation.ToolName,
+                         "inspect_editor_context",
+                         StringComparison.OrdinalIgnoreCase)))
+        {
+            TryAdd(observation, required: true);
+        }
+
+        foreach (var observation in request.Observations
+                     .OrderByDescending(observation => observation.Sequence))
+        {
+            TryAdd(observation, required: false);
+        }
+
+        return selected.Values
+            .OrderBy(observation => observation.Sequence)
+            .ToImmutableArray();
+    }
+
+    private static int EstimatePromptObservationCharacters(
+        AgentModelObservation observation)
+        => observation.ToolName.Length +
+           observation.Summary.Length +
+           (observation.ErrorCode?.Length ?? 0) +
+           Math.Min(
+               observation.Data?.GetRawText().Length ?? 0,
+               20_000);
 
     private static AgentModelDecision ParseDecision(string raw)
     {
@@ -367,6 +774,9 @@ public sealed class AiServerAgentModel : IAgentModel
             "use_tool" => ParseToolDecision(root, progress),
             "ask_user" => ParseQuestionDecision(root, progress),
             "publish_plan" => ParsePlanDecision(root, progress),
+            "complete_read_only" => AgentModelDecision.CompleteReadOnly(
+                ReadRequiredString(root, "completion_summary"),
+                progress),
             "begin_verification" => AgentModelDecision.BeginVerification(progress),
             "complete_task" => AgentModelDecision.CompleteTask(
                 ReadRequiredString(root, "completion_summary"),
@@ -374,6 +784,69 @@ public sealed class AiServerAgentModel : IAgentModel
             _ => throw new InvalidOperationException(
                 $"Agent model returned unknown action '{action}'.")
         };
+    }
+
+    private static JsonElement GetDecisionSchema(AgentModelTurnMode mode)
+        => mode switch
+        {
+            AgentModelTurnMode.Planning => InvestigationDecisionSchema,
+            AgentModelTurnMode.Execution => ExecutionDecisionSchema,
+            AgentModelTurnMode.Verification => LegacyVerificationDecisionSchema,
+            _ => throw new ArgumentOutOfRangeException(nameof(mode))
+        };
+
+    private static JsonElement? CompactObservationForPrompt(JsonElement? data)
+    {
+        if (data is not { ValueKind: JsonValueKind.Object } value ||
+            value.GetRawText().Length <= 20_000)
+        {
+            return data?.Clone();
+        }
+
+        var retained = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var name in new[]
+                 {
+                     "channel", "project_revision", "sequence_id", "sequence_revision",
+                     "revision", "source_revision", "draft_revision", "target",
+                     "start_seconds", "end_seconds", "detail", "truncated",
+                     "artifact_reference", "recommended_next_inspection", "next_cursor",
+                     "total_matches", "gap_count", "overlap_count", "link_issue_count",
+                     "edit_count"
+                 })
+        {
+            if (value.TryGetProperty(name, out var property))
+            {
+                retained[name] = property.Clone();
+            }
+        }
+
+        retained["observation_data_omitted"] = true;
+        retained["omitted_character_count"] = value.GetRawText().Length;
+        retained["recommended_next_inspection"] = retained.GetValueOrDefault("recommended_next_inspection") ??
+                                                   "Request a narrower or paginated inspection.";
+        return AgentToolJson.ToElement(retained);
+    }
+
+    private static AgentTaskBrief ParseTaskBrief(JsonElement root)
+    {
+        var kind = ReadRequiredString(root, "task_kind") switch
+        {
+            "read_only" => AgentTaskKind.ReadOnly,
+            "edit" => AgentTaskKind.Edit,
+            "mixed" => AgentTaskKind.Mixed,
+            var value => throw new InvalidOperationException(
+                $"Agent model returned unknown task kind '{value}'.")
+        };
+
+        return AgentTaskBrief.Create(
+            kind,
+            ReadRequiredString(root, "goal"),
+            ReadRequiredString(root, "scope"),
+            ReadStringArray(root, "protected_elements", 24),
+            ReadStringArray(root, "constraints", 24),
+            ReadStringArray(root, "acceptance_criteria", 24),
+            ReadStringArray(root, "assumptions", 24),
+            ReadStringArray(root, "missing_information", 24));
     }
 
     private static AgentModelDecision ParseToolDecision(
@@ -461,7 +934,15 @@ public sealed class AiServerAgentModel : IAgentModel
                             .Where(value => value > 0)
                             .Distinct()
                             .ToImmutableArray()
-                        : ImmutableArray<int>.Empty));
+                        : ImmutableArray<int>.Empty,
+                    item.TryGetProperty("expected_editing_arguments", out var argumentsElement) &&
+                    argumentsElement.ValueKind == JsonValueKind.Object
+                        ? AgentActionApproval.NormalizeArguments(argumentsElement)
+                        : AgentActionApproval.NormalizeArguments(AgentToolJson.ParseObject("{}")),
+                    ParseEvidenceRequirement(ReadString(item, "evidence_requirement")),
+                    ReadString(item, "expected_effect"),
+                    ReadStringArray(item, "protected_invariants", 24),
+                    ReadStringArray(item, "verification_checks", 24)));
             }
         }
 
@@ -501,4 +982,33 @@ public sealed class AiServerAgentModel : IAgentModel
            property.ValueKind == JsonValueKind.String
             ? property.GetString()?.Trim() ?? string.Empty
             : string.Empty;
+
+    private static ImmutableArray<string> ReadStringArray(
+        JsonElement element,
+        string propertyName,
+        int maximumItems)
+        => element.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.Array
+            ? property.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString()?.Trim())
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Select(item => item!)
+                .Distinct(StringComparer.Ordinal)
+                .Take(maximumItems)
+                .ToImmutableArray()
+            : ImmutableArray<string>.Empty;
+
+    private static AgentEvidenceRequirement ParseEvidenceRequirement(string value)
+        => value.ToLowerInvariant() switch
+        {
+            "frames" => AgentEvidenceRequirement.Frames,
+            "audio" => AgentEvidenceRequirement.Audio,
+            "transcript" => AgentEvidenceRequirement.Transcript,
+            "all" => AgentEvidenceRequirement.All,
+            _ => AgentEvidenceRequirement.Timeline
+        };
+
+    private static string ToSchemaValue(AgentEvidenceRequirement requirement)
+        => requirement.ToString().ToLowerInvariant();
 }

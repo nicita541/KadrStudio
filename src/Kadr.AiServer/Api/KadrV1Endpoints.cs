@@ -20,15 +20,15 @@ public static class KadrV1Endpoints
                 await runtime.EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
                 return Results.Json(new
                 {
-                    models = new[]
+                    models = options.ConfiguredModels.Select(model => new
                     {
-                        new
-                        {
-                            id = options.PublicModelAlias,
-                            capabilities = new[] { "structured-output", "vision" },
-                            managed = true
-                        }
-                    }
+                        id = model.PublicAlias,
+                        role = model.Role,
+                        capabilities = model.RequiresVision
+                            ? new[] { "structured-output", "vision" }
+                            : new[] { "structured-output", "planning", "thinking" },
+                        managed = true
+                    }).ToArray()
                 });
             }
             catch (Exception exception) when (exception is AiBackendException or FileNotFoundException)
@@ -40,7 +40,7 @@ public static class KadrV1Endpoints
         app.MapPost("/v1/inference/structured", async (
             HttpRequest request,
             AiServerOptions options,
-            OllamaRuntime runtime,
+            StructuredInferencePipeline pipeline,
             CancellationToken cancellationToken) =>
         {
             StructuredInferenceRequest? payload;
@@ -66,6 +66,16 @@ public static class KadrV1Endpoints
                 return BadRequest("schema must be a JSON object.");
             }
 
+            AiServerModelRoute model;
+            try
+            {
+                model = options.ResolveModel(payload.Model);
+            }
+            catch (InvalidOperationException exception)
+            {
+                return BadRequest(exception.Message);
+            }
+
             if (!ValidatePrompt(payload.SystemPrompt, options, out var promptError) ||
                 !ValidatePrompt(payload.UserPrompt, options, out promptError))
             {
@@ -84,69 +94,47 @@ public static class KadrV1Endpoints
                 return BadRequest("Image payloads cannot be empty.");
             }
 
-            var imageNodes = images
-                .Select(image => (JsonNode?)JsonValue.Create(image))
-                .ToArray();
-            var userMessage = new JsonObject
+            if (images.Length > 0 && !model.RequiresVision)
             {
-                ["role"] = "user",
-                ["content"] = payload.UserPrompt
-            };
-            if (imageNodes.Length > 0)
-            {
-                userMessage["images"] = new JsonArray(imageNodes);
+                return BadRequest(
+                    $"Model '{model.PublicAlias}' does not accept images. Use '{options.PublicModelAlias}'.");
             }
 
-            var modelRequest = new JsonObject
-            {
-                ["stream"] = false,
-                ["think"] = false,
-                ["format"] = JsonNode.Parse(payload.Schema.GetRawText()),
-                ["messages"] = new JsonArray
-                {
-                    new JsonObject
-                    {
-                        ["role"] = "system",
-                        ["content"] = payload.SystemPrompt
-                    },
-                    userMessage
-                },
-                ["options"] = new JsonObject
-                {
-                    ["temperature"] = Math.Clamp(payload.Temperature, 0, 2),
-                    ["num_ctx"] = Math.Clamp(payload.ContextTokens, 2048, 65536),
-                    ["num_predict"] = Math.Clamp(payload.MaxTokens, 32, 8192)
-                }
-            };
-
-            return await RunInferenceAsync(runtime, modelRequest, cancellationToken)
+            return await RunInferenceAsync(pipeline, payload, model, cancellationToken)
                 .ConfigureAwait(false);
         });
     }
 
     private static async Task<IResult> RunInferenceAsync(
-        OllamaRuntime runtime,
-        JsonObject request,
+        StructuredInferencePipeline pipeline,
+        StructuredInferenceRequest payload,
+        AiServerModelRoute model,
         CancellationToken cancellationToken)
     {
         try
         {
-            var response = await runtime.ChatAsync(request, cancellationToken).ConfigureAwait(false);
-            var content = response["message"]?["content"]?.GetValue<string>() ?? string.Empty;
-            var doneReason = response["done_reason"]?.GetValue<string>();
-            var evalCount = response["eval_count"] is JsonValue evalValue &&
-                            evalValue.TryGetValue<int>(out var parsedEvalCount)
-                ? parsedEvalCount
-                : 0;
-
-            if (string.IsNullOrWhiteSpace(content))
+            var result = await pipeline.RunAsync(payload, model, cancellationToken)
+                .ConfigureAwait(false);
+            if (!result.IsSuccess)
             {
                 return Results.Json(
-                    new { error = "AI model returned an empty response." },
-                    statusCode: StatusCodes.Status502BadGateway);
+                    new InferenceErrorResponse(
+                        result.ErrorCode!,
+                        result.Error!,
+                        result.DoneReason,
+                        result.EvalCount,
+                        result.AttemptCount),
+                    statusCode: result.ErrorCode == "invalid_context_budget"
+                        ? StatusCodes.Status400BadRequest
+                        : StatusCodes.Status502BadGateway);
             }
 
-            return Results.Json(new InferenceResponse(content, doneReason, evalCount));
+            return Results.Json(new InferenceResponse(
+                result.Content!,
+                result.DoneReason,
+                result.EvalCount,
+                result.ReasoningEvalCount,
+                result.AttemptCount));
         }
         catch (BadHttpRequestException exception)
         {

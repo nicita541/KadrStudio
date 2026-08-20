@@ -89,6 +89,78 @@ public sealed class EditorSessionTests
     }
 
     [Fact]
+    public void Razor_split_of_selected_clip_splits_the_linked_pair()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+
+        session.Execute(new EditTransaction(
+            "razor",
+            new SplitSelectedMediaClipCommand(
+                fixture.VideoClip.Id,
+                TimelineTime.FromSeconds(7))));
+
+        Assert.Equal(4, session.State.MediaClips.Length);
+        Assert.All(
+            session.State.MediaClips.GroupBy(clip => clip.LinkGroupId),
+            group => Assert.Equal(2, group.Count()));
+    }
+
+    [Fact]
+    public void Alt_razor_unlinks_original_group_and_splits_only_hovered_clip()
+    {
+        var fixture = CreateLinkedProject();
+        var session = new EditorSession(fixture.Project);
+
+        session.Execute(new EditTransaction(
+            "alt razor",
+            new SplitSelectedMediaClipCommand(
+                fixture.VideoClip.Id,
+                TimelineTime.FromSeconds(7),
+                IncludeLinked: false)));
+
+        Assert.Equal(3, session.State.MediaClips.Length);
+        Assert.All(session.State.MediaClips, clip => Assert.Null(clip.LinkGroupId));
+        Assert.Single(session.State.MediaClips.Where(clip => clip.TrackId == fixture.AudioTrack.Id));
+        Assert.Equal(2, session.State.MediaClips.Count(clip => clip.TrackId == fixture.VideoTrack.Id));
+    }
+
+    [Fact]
+    public void Ripple_delete_selected_link_group_closes_the_right_hand_gap()
+    {
+        var fixture = CreateLinkedProject();
+        var secondGroup = Guid.NewGuid();
+        var rightVideo = fixture.VideoClip with
+        {
+            Id = Guid.NewGuid(),
+            Start = fixture.VideoClip.End,
+            SourceIn = TimelineTime.FromSeconds(10),
+            Duration = TimelineTime.FromSeconds(5),
+            LinkGroupId = secondGroup
+        };
+        var rightAudio = fixture.AudioClip with
+        {
+            Id = Guid.NewGuid(),
+            Start = fixture.AudioClip.End,
+            SourceIn = TimelineTime.FromSeconds(10),
+            Duration = TimelineTime.FromSeconds(5),
+            LinkGroupId = secondGroup
+        };
+        var session = new EditorSession(fixture.Project with
+        {
+            MediaClips = fixture.Project.MediaClips.Concat([rightVideo, rightAudio]).ToImmutableArray()
+        });
+
+        session.Execute(new EditTransaction(
+            "ripple selected",
+            new RippleDeleteSelectedMediaClipCommand(fixture.VideoClip.Id)));
+
+        Assert.Equal(2, session.State.MediaClips.Length);
+        Assert.All(session.State.MediaClips, clip => Assert.Equal(TimelineTime.FromSeconds(2), clip.Start));
+        Assert.All(session.State.MediaClips, clip => Assert.Equal(secondGroup, clip.LinkGroupId));
+    }
+
+    [Fact]
     public void Ripple_delete_updates_media_text_markers_and_in_out_together()
     {
         var fixture = CreateLinkedProject(startSeconds: 0, durationSeconds: 20);

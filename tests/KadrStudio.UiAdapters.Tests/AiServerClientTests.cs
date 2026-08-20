@@ -50,7 +50,7 @@ public sealed class AiServerClientTests
     }
 
     [Fact]
-    public async Task Readiness_probe_uses_schema_and_never_sends_model_or_ollama_fields()
+    public async Task Readiness_probe_uses_structured_schema_and_public_model_role()
     {
         var handler = new FakeAiServerHandler();
         using var service = new AiVideoAnalysisService(
@@ -60,9 +60,11 @@ public sealed class AiServerClientTests
 
         using var document = JsonDocument.Parse(handler.LastInferenceBody!);
         Assert.Equal(JsonValueKind.Object, document.RootElement.GetProperty("schema").ValueKind);
-        Assert.False(document.RootElement.TryGetProperty("model", out _));
+        Assert.Equal(
+            AiVideoAnalysisService.DefaultServerModelAlias,
+            document.RootElement.GetProperty("model").GetString());
         Assert.False(document.RootElement.TryGetProperty("messages", out _));
-        Assert.False(document.RootElement.TryGetProperty("think", out _));
+        Assert.False(document.RootElement.GetProperty("think").GetBoolean());
     }
 
     [Fact]

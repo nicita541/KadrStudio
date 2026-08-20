@@ -252,6 +252,38 @@ public sealed class AiAgentOrchestratorTests
             observed);
     }
 
+    [Fact]
+    public void Failed_planning_can_retry_same_task_without_creating_a_draft()
+    {
+        var coordinator = new AiAgentOrchestrator();
+        var started = coordinator.StartTask(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            "Исследуй материал и предложи план.");
+        coordinator.Fail("Повреждённый ответ модели.");
+
+        var retried = coordinator.RetryFailedPlanning();
+
+        Assert.Equal(started.Id, retried.Id);
+        Assert.Equal(AgentTaskPhase.Understanding, retried.Phase);
+        Assert.Null(retried.DraftSequenceId);
+        Assert.Null(retried.FailureMessage);
+    }
+
+    [Fact]
+    public void Failed_execution_with_a_draft_cannot_be_retried_automatically()
+    {
+        var coordinator = CreateApprovedCoordinator();
+        coordinator.BeginExecution(Guid.NewGuid());
+        coordinator.Fail("Детерминированное действие отклонено.");
+
+        var error = Assert.Throws<AgentTaskTransitionException>(
+            coordinator.RetryFailedPlanning);
+
+        Assert.Contains("Agent Draft", error.Message, StringComparison.Ordinal);
+        Assert.Equal(AgentTaskPhase.Failed, coordinator.CurrentTask!.Phase);
+    }
+
     private static AiAgentOrchestrator CreateApprovedCoordinator()
     {
         var coordinator = new AiAgentOrchestrator();

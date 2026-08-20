@@ -252,7 +252,8 @@ public enum AiChatMessageKind
     Error,
     Plan,
     Question,
-    Draft
+    Draft,
+    AgentMemory
 }
 
 public enum AiChatOperationState
@@ -478,10 +479,14 @@ public sealed record AiChatMessage(
     ImmutableArray<AiChatEditCommand> EditCommands = default,
     Guid? AgentTaskId = null,
     int? AgentPlanVersion = null,
-    Guid? AgentQuestionId = null)
+    Guid? AgentQuestionId = null,
+    ImmutableArray<MontageDecisionOption> AgentQuestionOptions = default,
+    string? AgentRecommendedOptionId = null)
 {
     public ImmutableArray<AiChatEditCommand> EditCommands { get; init; } =
         EditCommands.IsDefault ? [] : EditCommands;
+    public ImmutableArray<MontageDecisionOption> AgentQuestionOptions { get; init; } =
+        AgentQuestionOptions.IsDefault ? [] : AgentQuestionOptions;
     public bool IsPendingQuestion => Kind == AiChatMessageKind.Question && string.IsNullOrWhiteSpace(Answer);
 }
 

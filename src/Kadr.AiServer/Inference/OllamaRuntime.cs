@@ -6,15 +6,17 @@ using KadrStudio.AiServer.Configuration;
 
 namespace KadrStudio.AiServer.Inference;
 
-public sealed class OllamaRuntime : IAsyncDisposable
+public sealed class OllamaRuntime : IInferenceChatRuntime, IAsyncDisposable
 {
     private readonly HttpClient _httpClient;
     private readonly AiServerOptions _options;
     private readonly ILogger<OllamaRuntime> _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly SemaphoreSlim _inferenceGate = new(1, 1);
     private readonly object _statusGate = new();
     private Process? _ownedProcess;
-    private int _ready;
+    private readonly HashSet<string> _readyModels = new(StringComparer.OrdinalIgnoreCase);
+    private string? _loadedBackendModel;
     private OllamaRuntimeStatus _status = new(
         OllamaRuntimeState.Starting,
         "AI backend has not been checked yet.",
@@ -43,17 +45,33 @@ public sealed class OllamaRuntime : IAsyncDisposable
 
     public async Task EnsureReadyAsync(CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _ready) == 1)
+        foreach (var model in _options.ConfiguredModels)
         {
-            return;
+            await EnsureReadyAsync(model, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public async Task EnsureReadyAsync(
+        AiServerModelRoute model,
+        CancellationToken cancellationToken)
+    {
+        lock (_statusGate)
+        {
+            if (_readyModels.Contains(model.PublicAlias))
+            {
+                return;
+            }
         }
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _ready) == 1)
+            lock (_statusGate)
             {
-                return;
+                if (_readyModels.Contains(model.PublicAlias))
+                {
+                    return;
+                }
             }
 
             SetStatus(OllamaRuntimeState.Starting, "Checking Ollama backend.");
@@ -76,13 +94,19 @@ public sealed class OllamaRuntime : IAsyncDisposable
                 await WaitForBackendAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await EnsureConfiguredModelAsync(cancellationToken).ConfigureAwait(false);
-            Interlocked.Exchange(ref _ready, 1);
-            SetStatus(OllamaRuntimeState.Ready, "AI backend and model are ready.");
+            await EnsureConfiguredModelAsync(model, cancellationToken).ConfigureAwait(false);
+            lock (_statusGate)
+            {
+                _readyModels.Add(model.PublicAlias);
+            }
+            SetStatus(OllamaRuntimeState.Ready, "AI backend and configured models are ready.");
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            Interlocked.Exchange(ref _ready, 0);
+            lock (_statusGate)
+            {
+                _readyModels.Remove(model.PublicAlias);
+            }
             SetStatus(OllamaRuntimeState.Failed, exception.Message);
             _logger.LogError(exception, "Kadr AI backend initialization failed.");
             throw;
@@ -93,29 +117,73 @@ public sealed class OllamaRuntime : IAsyncDisposable
         }
     }
 
-    public async Task<JsonObject> ChatAsync(JsonObject publicRequest, CancellationToken cancellationToken)
+    public async Task<JsonObject> ChatAsync(
+        AiServerModelRoute model,
+        JsonObject publicRequest,
+        CancellationToken cancellationToken)
     {
-        await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
-        var backendRequest = OllamaRequestRewriter.RewriteChatRequest(
-            publicRequest,
-            _options.BackendModel);
+        await EnsureReadyAsync(model, cancellationToken).ConfigureAwait(false);
+        await _inferenceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
+            if (!string.IsNullOrWhiteSpace(_loadedBackendModel) &&
+                !string.Equals(
+                    _loadedBackendModel,
+                    model.BackendModel,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await UnloadModelAsync(
+                    _loadedBackendModel,
+                    cancellationToken).ConfigureAwait(false);
+                _loadedBackendModel = null;
+            }
+
+            var backendRequest = OllamaRequestRewriter.RewriteChatRequest(
+                publicRequest,
+                model.BackendModel);
+            backendRequest["keep_alive"] = "5m";
             var backendResponse = await PostObjectAsync(
                 "api/chat",
                 backendRequest,
                 cancellationToken).ConfigureAwait(false);
+            _loadedBackendModel = model.BackendModel;
             return OllamaRequestRewriter.MaskChatResponse(
                 backendResponse,
-                _options.PublicModelAlias);
+                model.PublicAlias);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            Interlocked.Exchange(ref _ready, 0);
+            lock (_statusGate)
+            {
+                _readyModels.Remove(model.PublicAlias);
+            }
             SetStatus(OllamaRuntimeState.Failed, exception.Message);
             throw;
         }
+        finally
+        {
+            _inferenceGate.Release();
+        }
+    }
+
+    private async Task UnloadModelAsync(
+        string backendModel,
+        CancellationToken cancellationToken)
+    {
+        _logger.LogInformation(
+            "Unloading previous Ollama role model {Model} before switching roles.",
+            backendModel);
+        await PostObjectAsync(
+            "api/generate",
+            new JsonObject
+            {
+                ["model"] = backendModel,
+                ["prompt"] = string.Empty,
+                ["stream"] = false,
+                ["keep_alive"] = 0
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<JsonObject> GetPublicTagsAsync(CancellationToken cancellationToken)
@@ -169,18 +237,20 @@ public sealed class OllamaRuntime : IAsyncDisposable
         await EnsureReadyAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task EnsureConfiguredModelAsync(CancellationToken cancellationToken)
+    private async Task EnsureConfiguredModelAsync(
+        AiServerModelRoute route,
+        CancellationToken cancellationToken)
     {
         var tags = await GetObjectAsync("api/tags", cancellationToken).ConfigureAwait(false);
         var installed = tags["models"] is JsonArray models &&
                         models.OfType<JsonObject>().Any(model =>
                             string.Equals(
                                 model["name"]?.GetValue<string>(),
-                                _options.BackendModel,
+                                route.BackendModel,
                                 StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(
                                 model["model"]?.GetValue<string>(),
-                                _options.BackendModel,
+                                route.BackendModel,
                                 StringComparison.OrdinalIgnoreCase));
 
         if (!installed)
@@ -188,18 +258,18 @@ public sealed class OllamaRuntime : IAsyncDisposable
             if (!_options.AutoPull)
             {
                 throw new AiBackendException(
-                    $"Configured model '{_options.BackendModel}' is not installed and KADR_AI_AUTO_PULL is disabled.");
+                    $"Configured model '{route.BackendModel}' is not installed and KADR_AI_AUTO_PULL is disabled.");
             }
 
             SetStatus(
                 OllamaRuntimeState.Starting,
-                $"Downloading configured model '{_options.BackendModel}'. First launch can take a long time.");
-            _logger.LogInformation("Pulling configured AI model {Model}.", _options.BackendModel);
+                $"Downloading configured model '{route.BackendModel}'. First launch can take a long time.");
+            _logger.LogInformation("Pulling configured AI model {Model}.", route.BackendModel);
             await PostObjectAsync(
                 "api/pull",
                 new JsonObject
                 {
-                    ["model"] = _options.BackendModel,
+                    ["model"] = route.BackendModel,
                     ["stream"] = false
                 },
                 cancellationToken).ConfigureAwait(false);
@@ -207,15 +277,16 @@ public sealed class OllamaRuntime : IAsyncDisposable
 
         var show = await PostObjectAsync(
             "api/show",
-            new JsonObject { ["model"] = _options.BackendModel },
+            new JsonObject { ["model"] = route.BackendModel },
             cancellationToken).ConfigureAwait(false);
 
-        if (show["capabilities"] is JsonArray capabilities &&
+        if (route.RequiresVision &&
+            show["capabilities"] is JsonArray capabilities &&
             !capabilities.Any(item =>
                 string.Equals(item?.GetValue<string>(), "vision", StringComparison.OrdinalIgnoreCase)))
         {
             throw new AiBackendException(
-                $"Configured model '{_options.BackendModel}' does not report vision capability. Kadr Studio requires a vision model.");
+                $"Configured model '{route.BackendModel}' does not report required vision capability.");
         }
     }
 
@@ -404,6 +475,7 @@ public sealed class OllamaRuntime : IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         _ensureGate.Dispose();
+        _inferenceGate.Dispose();
         if (_ownedProcess is null)
         {
             return ValueTask.CompletedTask;

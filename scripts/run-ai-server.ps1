@@ -6,6 +6,8 @@
     [string]$ApiKey,
     [string]$BackendModel = 'qwen3-vl:4b-instruct',
     [string]$PublicModelAlias = 'kadr-vision:latest',
+    [string]$PlannerModel = 'qwen3.5:9b',
+    [string]$PlannerPublicModelAlias = 'kadr-planner:latest',
     [string]$OllamaEndpoint = 'http://127.0.0.1:11436',
     [string]$ModelsRoot = (Join-Path $DataRoot 'ollama-models'),
     [string]$OllamaExe,
@@ -118,6 +120,8 @@ New-Item -ItemType Directory -Path $modelsRootFull -Force | Out-Null
 $env:KADR_AI_URLS = $Listen
 $env:KADR_AI_MODEL = $BackendModel
 $env:KADR_AI_PUBLIC_MODEL = $PublicModelAlias
+$env:KADR_AI_PLANNER_MODEL = $PlannerModel
+$env:KADR_AI_PLANNER_PUBLIC_MODEL = $PlannerPublicModelAlias
 $env:KADR_AI_OLLAMA_ENDPOINT = $OllamaEndpoint
 $env:KADR_AI_MODELS_ROOT = $modelsRootFull
 $env:KADR_AI_MANAGE_OLLAMA = $(if ($NoManageOllama) { 'false' } else { 'true' })
@@ -140,6 +144,8 @@ Write-Host "Listen:       $Listen"
 Write-Host "Ollama:       $OllamaEndpoint"
 Write-Host "Model alias:  $PublicModelAlias"
 Write-Host "Backend model:$BackendModel"
+Write-Host "Planner alias:$PlannerPublicModelAlias"
+Write-Host "Planner model:$PlannerModel"
 Write-Host "Models root:  $modelsRootFull"
 if ($resolvedOllama) {
     Write-Host "Ollama exe:   $resolvedOllama"

@@ -8,9 +8,16 @@ public enum TimelineDragOperation
     TrimRight
 }
 
+public enum TimelineToolMode
+{
+    Selection,
+    Razor
+}
+
 /// <summary>Transient pointer state, independent from project and renderer state.</summary>
 public sealed class TimelineInteractionController
 {
+    public TimelineToolMode ToolMode { get; set; } = TimelineToolMode.Selection;
     public TimelineDragOperation DragOperation { get; private set; }
     public double PointerOffsetSeconds { get; private set; }
     public bool IsDraggingPlayhead { get; private set; }

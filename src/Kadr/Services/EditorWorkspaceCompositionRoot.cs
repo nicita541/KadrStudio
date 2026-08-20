@@ -51,7 +51,7 @@ public static class EditorWorkspaceCompositionRoot
         return new EditorWorkspaceServices(
             ffmpeg,
             processes,
-            new ProjectService(),
+            new ProjectService(KadrLocalDataPaths.RecoveryRoot),
             artifacts,
             registry,
             probe,

@@ -122,6 +122,8 @@ public sealed class TimelineControl : FrameworkElement
         }
     }
 
+    public bool IsEditingLocked { get; set; }
+
     public double PixelsPerSecond
     {
         get => _pixelsPerSecond;
@@ -237,6 +239,14 @@ public sealed class TimelineControl : FrameworkElement
         if (HitTestTextOverlay(point) is { } textOverlay)
         {
             SelectTextOverlay(textOverlay);
+            if (IsEditingLocked)
+            {
+                SetPlayheadFromPoint(point);
+                BeginPlayheadDrag();
+                e.Handled = true;
+                return;
+            }
+
             if (e.ClickCount >= 2)
             {
                 TextOverlayEditRequested?.Invoke(this, new TextOverlaySelectedEventArgs(textOverlay.Id));
@@ -265,6 +275,14 @@ public sealed class TimelineControl : FrameworkElement
         TextOverlaySelected?.Invoke(this, new TextOverlaySelectedEventArgs(null));
         SelectedClipId = hit.Id;
         ClipSelected?.Invoke(this, new ClipSelectedEventArgs(hit.Id));
+        if (IsEditingLocked)
+        {
+            SetPlayheadFromPoint(point);
+            BeginPlayheadDrag();
+            e.Handled = true;
+            return;
+        }
+
         _dragClip = hit.Clone();
         _dragOriginal = hit.Clone();
         _dragLinkedClips.Clear();
@@ -316,6 +334,13 @@ public sealed class TimelineControl : FrameworkElement
             e.Handled = true;
             return;
         }
+
+        if (IsEditingLocked)
+        {
+            Cursor = point.Y <= RulerHeight ? Cursors.Hand : Cursors.Arrow;
+            return;
+        }
+
         if (_dragTextOverlay is not null && _dragTextOriginal is not null && e.LeftButton == MouseButtonState.Pressed)
         {
             ApplyTextOverlayDrag(point);
@@ -490,13 +515,24 @@ public sealed class TimelineControl : FrameworkElement
     protected override void OnDragOver(DragEventArgs e)
     {
         base.OnDragOver(e);
-        e.Effects = e.Data.GetDataPresent(MediaAssetDataFormat) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Effects = IsEditingLocked
+            ? DragDropEffects.None
+            : e.Data.GetDataPresent(MediaAssetDataFormat)
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
         e.Handled = true;
     }
 
     protected override void OnDrop(DragEventArgs e)
     {
         base.OnDrop(e);
+        if (IsEditingLocked)
+        {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+            return;
+        }
+
         if (!e.Data.GetDataPresent(MediaAssetDataFormat) ||
             e.Data.GetData(MediaAssetDataFormat) is not string idText ||
             !Guid.TryParse(idText, out var assetId))

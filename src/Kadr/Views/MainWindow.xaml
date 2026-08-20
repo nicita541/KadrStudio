@@ -159,7 +159,7 @@
                         <TextBlock Text="Медиа" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
-                <Button x:Name="AnalysisNavButton" Style="{StaticResource NavButton}" ToolTip="Чат ИИ-монтажа" Click="ShowAnalysis_Click">
+                <Button x:Name="AnalysisNavButton" Style="{StaticResource NavButton}" ToolTip="ИИ-агент монтажа" Click="ShowAnalysis_Click">
                     <StackPanel>
                         <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M3,18 L7,14 L10,16 L14,8 L18,12 L21,5" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="2" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/><Path Data="M3,21 L21,21" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.5"/></Canvas></Viewbox>
                         <TextBlock Text="ИИ" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
@@ -287,8 +287,8 @@
             <Grid Margin="12">
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <StackPanel Grid.Row="0" Margin="2,2,0,10">
-                    <TextBlock Text="ИИ-монтаж" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Опишите результат обычными словами"
+                    <TextBlock Text="ИИ-агент" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="Поставьте задачу. Агент изучит материал, при необходимости задаст вопрос, предложит план и выполнит его только после вашего утверждения."
                                Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,0" />
                 </StackPanel>
 
@@ -305,6 +305,7 @@
                              Padding="0,2,3,8"
                              ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                              ScrollViewer.VerticalScrollBarVisibility="Auto"
+                             ScrollViewer.CanContentScroll="False"
                              HorizontalContentAlignment="Stretch">
                         <ListBox.ItemContainerStyle>
                             <Style TargetType="ListBoxItem">
@@ -338,15 +339,15 @@
 
                                         <StackPanel Visibility="{Binding IsPlanVisible, Converter={StaticResource BoolToVisibility}}"
                                                     Margin="0,9,0,0">
-                                            <TextBlock Text="{Binding PlanDurationLabel}" FontWeight="SemiBold"/>
-                                            <TextBlock Text="Сохраняется" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
+                                            <TextBlock Text="{Binding PlanDurationLabel}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding PlanPrimaryLabel}" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
                                             <ItemsControl ItemsSource="{Binding RetainedItems}">
                                                 <ItemsControl.ItemTemplate><DataTemplate>
                                                     <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"/>
                                                 </DataTemplate></ItemsControl.ItemTemplate>
                                             </ItemsControl>
                                             <StackPanel Visibility="{Binding HasRemovedItems, Converter={StaticResource BoolToVisibility}}">
-                                                <TextBlock Text="Исключается" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
+                                                <TextBlock Text="{Binding PlanSecondaryLabel}" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
                                                 <ItemsControl ItemsSource="{Binding RemovedItems}">
                                                     <ItemsControl.ItemTemplate><DataTemplate>
                                                         <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"
@@ -359,7 +360,10 @@
                                                     <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Foreground="#F0C674" Margin="0,2"/>
                                                 </DataTemplate></ItemsControl.ItemTemplate>
                                             </ItemsControl>
-                                            <Button Style="{StaticResource AccentButton}" Content="Создать черновик"
+                                            <TextBlock Text="{Binding PlanHint}" TextWrapping="Wrap" FontSize="9"
+                                                       Foreground="{StaticResource MutedTextBrush}" Margin="0,8,0,0"
+                                                       Visibility="{Binding HasPlanHint, Converter={StaticResource BoolToVisibility}}"/>
+                                            <Button Style="{StaticResource AccentButton}" Content="{Binding PlanActionLabel}"
                                                     Tag="{Binding Id}" Click="AiChatCreateDraft_Click" Padding="10,7" Margin="0,9,0,0"
                                                     IsEnabled="{Binding CanCreateDraft}"/>
                                         </StackPanel>
@@ -398,6 +402,9 @@
                                                 <Button Style="{StaticResource AccentButton}" Content="Подтвердить этот кадр" Tag="{Binding Id}"
                                                         Click="AiChatConfirmFrame_Click" Padding="9,7" Margin="0,5,0,0"/>
                                             </StackPanel>
+                                            <TextBlock Text="Ответьте сообщением в поле ниже. Агент продолжит с этого же шага."
+                                                       TextWrapping="Wrap" FontSize="9" Foreground="{StaticResource MutedTextBrush}"
+                                                       Visibility="{Binding IsGenericAgentQuestion, Converter={StaticResource BoolToVisibility}}"/>
                                             <TextBlock Text="{Binding AnswerLabel}" FontWeight="SemiBold" Foreground="#CBB8FF"
                                                        Visibility="{Binding HasAnswer, Converter={StaticResource BoolToVisibility}}"/>
                                         </StackPanel>
@@ -405,7 +412,7 @@
                                         <Grid Visibility="{Binding IsDraftVisible, Converter={StaticResource BoolToVisibility}}" Margin="0,9,0,0">
                                             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                             <Button Style="{StaticResource ButtonBase}" Content="Открыть" Tag="{Binding Id}" Click="AiChatOpenDraft_Click" Padding="7"/>
-                                            <Button Grid.Column="2" Style="{StaticResource AccentButton}" Content="Принять" Tag="{Binding Id}" Click="AiChatAcceptDraft_Click" Padding="7"/>
+                                            <Button Grid.Column="2" Style="{StaticResource AccentButton}" Content="{Binding AcceptDraftLabel}" Tag="{Binding Id}" Click="AiChatAcceptDraft_Click" Padding="7"/>
                                             <Button Grid.ColumnSpan="3" Style="{StaticResource ButtonBase}" Content="Удалить черновик" Tag="{Binding Id}"
                                                     Click="AiChatDeleteDraft_Click" Padding="7" Margin="0,38,0,0"/>
                                         </Grid>
@@ -421,7 +428,7 @@
                     <Border Grid.Row="1" Background="{StaticResource PanelRaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
                             BorderThickness="1" CornerRadius="9" Padding="8">
                         <StackPanel>
-                            <Grid Margin="0,0,0,6">
+                            <Grid Margin="0,0,0,6" Visibility="Collapsed">
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                                 <ComboBox x:Name="AiChatContextComboBox" SelectedIndex="0" ToolTip="Материал для команды"/>
                                 <ComboBox x:Name="AiChatScenarioComboBox" Grid.Column="2" SelectedIndex="0" ToolTip="Сценарий монтажа">
@@ -429,11 +436,20 @@
                                 </ComboBox>
                             </Grid>
                             <Grid>
-                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="6"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="6"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
                                 <TextBox x:Name="AiChatPromptTextBox" AcceptsReturn="True" TextWrapping="Wrap"
                                          MinHeight="48" MaxHeight="110" VerticalScrollBarVisibility="Auto"
                                          PreviewKeyDown="AiChatPrompt_PreviewKeyDown"/>
-                                <Button x:Name="AiChatSendButton" Grid.Column="2" Style="{StaticResource AccentButton}"
+                                <Button x:Name="AiAgentStopTaskButton" Grid.Column="2" Style="{StaticResource ButtonBase}"
+                                        Content="Отменить задачу" Click="AiAgentStopTask_Click"
+                                        Visibility="Collapsed" Padding="9,7"/>
+                                <Button x:Name="AiChatSendButton" Grid.Column="4" Style="{StaticResource AccentButton}"
                                         Content="Отправить" Click="AiChatSend_Click" MinWidth="76" Padding="9,7"/>
                             </Grid>
                             <WrapPanel x:Name="AiChatSuggestionsPanel" Margin="0,6,0,0">

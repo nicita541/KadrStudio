@@ -14,7 +14,8 @@ public enum MediaArtifactKind
     AnalysisFrame,
     SceneFingerprint,
     SubtitleAudio,
-    AnalysisManifest
+    AnalysisManifest,
+    AgentObservation
 }
 
 public readonly record struct MediaCacheKey(

@@ -6,6 +6,12 @@ using System.Windows.Data;
 using KadrStudio.Adapters;
 using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
+using KadrStudio.Application.Automation.Agent;
+using KadrStudio.Application.Automation.Agent.Diagnostics;
+using KadrStudio.Application.Automation.Agent.Runtime;
+using KadrStudio.Application.Automation.Agent.Tools;
+using KadrStudio.Application.Automation.Agent.Tools.Editing;
+using KadrStudio.Application.Automation.Agent.Tools.ReadOnly;
 using KadrStudio.Application.Media;
 using KadrStudio.Application.Storage;
 using KadrStudio.Infrastructure.Media;
@@ -13,6 +19,7 @@ using KadrStudio.Application.Caching;
 using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Models;
 using KadrStudio.Services;
+using KadrStudio.Services.Agent;
 using CoreGameEditingProfile = KadrStudio.Core.Domain.GameEditingProfile;
 using CoreMediaAnalysisManifest = KadrStudio.Core.Domain.MediaAnalysisManifest;
 using CoreMontagePlan = KadrStudio.Core.Domain.MontagePlan;
@@ -58,6 +65,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private bool _editReviewWasDirty;
     private bool _suppressDirtyTracking;
     private long _timelinePresentationRevision;
+    private int _agentMutationDepth;
     private int _disposeState;
 
     public MainViewModel() : this(EditorWorkspaceCompositionRoot.Create())
@@ -93,6 +101,60 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AiMontageCoordinator = new AiMontageCoordinator(
             AiMontageAnalysisService,
             new OllamaMontagePlanningProvider(OllamaVideoAnalysisService));
+
+        AgentDebugLog = new FileAgentDebugLog();
+        AiAgentOrchestrator = new AiAgentOrchestrator();
+        var agentRangeInspector = new AgentMediaRangeInspector(
+            AutomationOrchestrator,
+            AutoSubtitleService,
+            OllamaVideoAnalysisService,
+            _artifactStore);
+        AgentReadOnlyToolBackend = new KadrAgentReadOnlyToolBackend(
+            () => _editorSession.State,
+            agentRangeInspector);
+        AgentToolRegistry = AgentReadOnlyToolSet.Create(AgentReadOnlyToolBackend);
+        AgentEditingToolBackend = new KadrAgentEditingToolBackend(
+            () => _editorSession.State,
+            ExecuteAgentCoreCommand);
+        AgentEditingToolSet.RegisterDefaults(
+            AgentToolRegistry,
+            AgentEditingToolBackend);
+        AgentToolExecutor = new AgentToolExecutor(
+            AgentToolRegistry,
+            debugLog: AgentDebugLog);
+        AgentModel = new OllamaAgentModel(
+            OllamaVideoAnalysisService,
+            AgentDebugLog);
+        AgentPlanningLoop = new AgentPlanningLoop(
+            AiAgentOrchestrator,
+            AgentToolRegistry,
+            AgentToolExecutor,
+            AgentModel,
+            conversationProvider: BuildAgentConversationContext,
+            debugLog: AgentDebugLog);
+        AgentExecutionLoop = new AgentExecutionLoop(
+            AiAgentOrchestrator,
+            AgentToolRegistry,
+            AgentToolExecutor,
+            AgentModel,
+            conversationProvider: BuildAgentConversationContext,
+            seedObservationProvider: () => AgentPlanningLoop.Observations,
+            debugLog: AgentDebugLog);
+        AiAgentOrchestrator.TaskChanged += (_, args) =>
+        {
+            AgentDebugLog.Write(new AgentDebugLogEntry(
+                DateTimeOffset.UtcNow,
+                "orchestrator",
+                "task_changed",
+                args.State.Id,
+                args.State.Phase.ToString(),
+                Message: args.State.UserRequest,
+                Details: DescribeAgentTaskForDebug(args.State)));
+
+            OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
+            OnPropertyChanged(nameof(CurrentAgentTask));
+        };
+
         AttachProject(_project);
         BuildMediaView();
     }
@@ -109,6 +171,19 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public AiMontageAnalysisService AiMontageAnalysisService { get; }
     public IAiMontageCoordinator AiMontageCoordinator { get; }
+    public IAgentDebugLog AgentDebugLog { get; }
+    public string? AgentDebugLogPath => AgentDebugLog.CurrentLogPath;
+    public AiAgentOrchestrator AiAgentOrchestrator { get; }
+    public KadrAgentReadOnlyToolBackend AgentReadOnlyToolBackend { get; }
+    public KadrAgentEditingToolBackend AgentEditingToolBackend { get; }
+    public AgentToolRegistry AgentToolRegistry { get; }
+    public AgentToolExecutor AgentToolExecutor { get; }
+    public IAgentModel AgentModel { get; }
+    public AgentPlanningLoop AgentPlanningLoop { get; }
+    public AgentExecutionLoop AgentExecutionLoop { get; }
+    public AgentTaskState? CurrentAgentTask => AiAgentOrchestrator.CurrentTask;
+    public bool IsAgentDraftEditingLocked =>
+        AiAgentOrchestrator.CurrentTask?.IsDraftReadOnlyForUser == true;
     public IArtifactStore ArtifactStore => _artifactStore;
     public KadrStudio.Core.Domain.ProjectState CoreState => _editorSession.State;
     public long TimelinePresentationRevision => _timelinePresentationRevision;
@@ -326,6 +401,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         IEnumerable<string> filePaths,
         CancellationToken cancellationToken = default)
     {
+        EnsureAgentAllowsManualProjectMutation();
+
         var uniquePaths = filePaths
             .Select(Path.GetFullPath)
             .Where(path => Project.Media.All(asset => !asset.Path.Equals(path, StringComparison.OrdinalIgnoreCase)))
@@ -388,6 +465,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public bool RegisterImportedMedia(MediaAsset asset)
     {
+        EnsureAgentAllowsManualProjectMutation();
         ArgumentNullException.ThrowIfNull(asset);
         if (_editorSession.State.Sources.ContainsKey(asset.Id)) return false;
         var result = _editorSession.Execute(new EditTransaction(
@@ -644,6 +722,76 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public KadrStudio.Core.Domain.AiConversation GetAiConversation()
         => _editorSession.State.AiConversation;
 
+    private static string DescribeAgentTaskForDebug(AgentTaskState task)
+    {
+        var plan = task.Plan is null
+            ? "none"
+            : $"v{task.Plan.Version}; approved={task.Plan.ApprovedAt is not null}; " +
+              $"objective={task.Plan.Objective}; steps={task.Plan.Steps.Length}";
+
+        return
+            $"project_id={task.ProjectId}\n" +
+            $"source_sequence_id={task.SourceSequenceId}\n" +
+            $"source_sequence_revision={task.SourceSequenceRevision?.ToString() ?? "null"}\n" +
+            $"draft_sequence_id={task.DraftSequenceId?.ToString() ?? "null"}\n" +
+            $"resume_phase={task.ResumePhase?.ToString() ?? "null"}\n" +
+            $"questions={task.Questions.Length}\n" +
+            $"plan={plan}\n" +
+            $"failure={task.FailureMessage ?? string.Empty}\n" +
+            $"completion={task.CompletionSummary ?? string.Empty}";
+    }
+
+    private ImmutableArray<AgentConversationContextMessage> BuildAgentConversationContext()
+    {
+        var builder = ImmutableArray.CreateBuilder<AgentConversationContextMessage>();
+
+        foreach (var message in _editorSession.State.AiConversation.Messages)
+        {
+            if (string.IsNullOrWhiteSpace(message.Text))
+            {
+                continue;
+            }
+
+            if (message.Role == KadrStudio.Core.Domain.AiChatRole.User)
+            {
+                builder.Add(new AgentConversationContextMessage(
+                    AgentConversationRole.User,
+                    message.Text.Trim(),
+                    message.CreatedAt));
+                continue;
+            }
+
+            if (message.Kind is not (
+                    KadrStudio.Core.Domain.AiChatMessageKind.Text or
+                    KadrStudio.Core.Domain.AiChatMessageKind.Question or
+                    KadrStudio.Core.Domain.AiChatMessageKind.Plan or
+                    KadrStudio.Core.Domain.AiChatMessageKind.Draft))
+            {
+                continue;
+            }
+
+            builder.Add(new AgentConversationContextMessage(
+                AgentConversationRole.Assistant,
+                message.Text.Trim(),
+                message.CreatedAt));
+
+            if (message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Question &&
+                !string.IsNullOrWhiteSpace(message.Answer) &&
+                message.AgentQuestionId is null)
+            {
+                builder.Add(new AgentConversationContextMessage(
+                    AgentConversationRole.User,
+                    $"Ответ на вопрос «{message.Text.Trim()}»: {message.Answer.Trim()}",
+                    message.CreatedAt));
+            }
+        }
+
+        // The context builder has dynamic length because messages can be filtered
+        // and one chat message may expand into multiple agent-context messages.
+        // MoveToImmutable() requires Count == Capacity; ToImmutable() is correct here.
+        return builder.ToImmutable();
+    }
+
     public void SaveAiConversation(KadrStudio.Core.Domain.AiConversation conversation)
     {
         var result = _editorSession.Execute(new EditTransaction(
@@ -655,6 +803,160 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         IsDirty = true;
         ScheduleAutosave("Диалог ИИ обновлён");
         OnPropertyChanged(nameof(CoreState));
+    }
+
+    public AgentTaskState StartAgentTask(string userRequest)
+    {
+        if (HasPendingEditReview)
+        {
+            throw new InvalidOperationException(
+                "Сначала примите или отмените текущий черновик ИИ.");
+        }
+
+        if (string.IsNullOrWhiteSpace(userRequest))
+        {
+            throw new ArgumentException(
+                "Запрос агенту не может быть пустым.",
+                nameof(userRequest));
+        }
+
+        EnsureSequenceWorkspace();
+        var sequence = _editorSession.State.ActiveSequence
+            ?? throw new InvalidOperationException(
+                "Для задачи агента нужен активный таймлайн.");
+
+        return AiAgentOrchestrator.StartTask(
+            _editorSession.State.Id,
+            sequence.Id,
+            userRequest.Trim(),
+            _editorSession.State.AiConversation.Id,
+            sequence.Revision);
+    }
+
+    public AgentTaskState BeginAgentPlanRevision()
+    {
+        var task = AiAgentOrchestrator.CurrentTask
+            ?? throw new AgentTaskTransitionException(
+                "Нет активной задачи агента.");
+
+        if (task.Phase is not (
+                AgentTaskPhase.WaitingForApproval or
+                AgentTaskPhase.Approved))
+        {
+            throw new AgentTaskTransitionException(
+                "Исправлять план можно только после его публикации.");
+        }
+
+        var source = _editorSession.State
+            .EnsureSequenceContainer()
+            .SynchronizeActiveSequence()
+            .FindSequence(task.SourceSequenceId)
+            ?? throw new AgentTaskTransitionException(
+                "Исходный таймлайн задачи больше не найден.");
+
+        return AiAgentOrchestrator.BeginInvestigation(
+            "Пользователь уточнил план; агент проверяет, что нужно изменить.",
+            source.Revision);
+    }
+
+    public AgentTaskState AnswerAgentQuestion(string answer)
+    {
+        var task = AiAgentOrchestrator.CurrentTask
+            ?? throw new AgentTaskTransitionException(
+                "Нет активной задачи агента.");
+        var question = task.Questions.LastOrDefault(item => !item.IsAnswered)
+            ?? throw new AgentTaskTransitionException(
+                "У агента нет открытого вопроса.");
+
+        return AiAgentOrchestrator.AnswerQuestion(
+            question.Id,
+            answer);
+    }
+
+    public CoreSequenceState ApproveAgentPlanAndCreateDraft()
+    {
+        var pending = AiAgentOrchestrator.CurrentTask
+            ?? throw new AgentTaskTransitionException(
+                "Нет активной задачи агента.");
+
+        if (pending.Phase != AgentTaskPhase.WaitingForApproval ||
+            pending.Plan is null)
+        {
+            throw new AgentTaskTransitionException(
+                "Для выполнения нужен последний неустаревший план агента.");
+        }
+
+        var state = _editorSession.State.EnsureSequenceContainer().SynchronizeActiveSequence();
+        if (state.Id != pending.ProjectId)
+        {
+            throw new AgentTaskTransitionException(
+                "Проект сменился после подготовки плана.");
+        }
+
+        var source = state.FindSequence(pending.SourceSequenceId)
+            ?? throw new AgentTaskTransitionException(
+                "Исходный таймлайн задачи больше не найден.");
+
+        if (pending.SourceSequenceRevision is { } expectedRevision &&
+            source.Revision != expectedRevision)
+        {
+            throw new AgentTaskTransitionException(
+                "Исходный таймлайн изменился после исследования. Напишите агенту, чтобы он обновил план перед выполнением.");
+        }
+
+        var approved = AiAgentOrchestrator.ApprovePlan();
+        var plan = approved.Plan!;
+
+        var title = string.IsNullOrWhiteSpace(plan.Objective)
+            ? "Agent Draft"
+            : $"Agent Draft · {plan.Objective.Trim()}";
+        if (title.Length > 96)
+        {
+            title = title[..96].TrimEnd();
+        }
+
+        var draft = source with
+        {
+            Id = Guid.NewGuid(),
+            Name = title,
+            Revision = 0,
+            Status = KadrStudio.Core.Domain.SequenceStatus.Draft,
+            ParentSequenceId = source.Id,
+            MontagePlanId = null
+        };
+
+        AgentEditingToolBackend.Reset(approved.Id);
+
+        if (!ExecuteAgentCoreCommand(
+                "Agent Draft создан",
+                new CreateSequenceCommand(draft, Activate: true)))
+        {
+            throw new InvalidOperationException(
+                "Не удалось создать отдельный Agent Draft.");
+        }
+
+        var executing = AiAgentOrchestrator.BeginExecution(draft.Id);
+        StatusText = "Агент выполняет утверждённый план в отдельном черновике";
+        OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
+        OnPropertyChanged(nameof(CurrentAgentTask));
+
+        return _editorSession.State.FindSequence(executing.DraftSequenceId!.Value)
+            ?? throw new InvalidOperationException(
+                "Agent Draft не найден после создания.");
+    }
+
+    public AgentTaskState StopAgentTask(string? reason = null)
+    {
+        var task = AiAgentOrchestrator.CurrentTask
+            ?? throw new AgentTaskTransitionException(
+                "Нет активной задачи агента.");
+
+        return task.IsTerminal
+            ? task
+            : AiAgentOrchestrator.Stop(
+                string.IsNullOrWhiteSpace(reason)
+                    ? "Задача остановлена пользователем."
+                    : reason);
     }
 
     public async Task<ImmutableDictionary<Guid, CoreMediaAnalysisManifest>> AnalyzeMontageSourcesAsync(
@@ -744,6 +1046,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CoreMontagePlan plan,
         IReadOnlyDictionary<Guid, CoreMediaAnalysisManifest>? manifests = null)
     {
+        EnsureAgentAllowsManualProjectMutation();
         var compilation = AiMontageCoordinator.CreateDraft(_editorSession.State, plan, manifests);
         var compiledPlan = plan with
         {
@@ -791,6 +1094,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public int BeginEditPlanReview(EditCommandPlan plan)
     {
+        if (IsAgentDraftEditingLocked)
+        {
+            throw new InvalidOperationException(
+                "Пока агент работает с Agent Draft, ручное редактирование заблокировано.");
+        }
+
         if (plan.Commands.Count == 0)
         {
             return 0;
@@ -930,6 +1239,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         ProjectHistoryEntry entry,
         CancellationToken cancellationToken = default)
     {
+        EnsureAgentAllowsManualProjectMutation();
+
         if (entry.ProjectId != Project.Id)
         {
             throw new InvalidOperationException("Эта контрольная точка относится к другому проекту.");
@@ -1014,6 +1325,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public void Undo()
     {
+        if (IsAgentDraftEditingLocked)
+        {
+            StatusText = "Undo недоступен, пока агент выполняет или проверяет Agent Draft";
+            return;
+        }
+
         if (!_editorSession.Undo())
         {
             return;
@@ -1025,6 +1342,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public void Redo()
     {
+        if (IsAgentDraftEditingLocked)
+        {
+            StatusText = "Redo недоступен, пока агент выполняет или проверяет Agent Draft";
+            return;
+        }
+
         if (!_editorSession.Redo())
         {
             return;
@@ -1036,6 +1359,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task NewProjectAsync(CancellationToken cancellationToken = default)
     {
+        EnsureAgentAllowsManualProjectMutation();
         CancelAutosave();
         ResetBackgroundAnalysis();
         await _projectService.DeleteAutosaveAsync(cancellationToken);
@@ -1055,6 +1379,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     public async Task OpenProjectAsync(string path, CancellationToken cancellationToken = default)
     {
+        EnsureAgentAllowsManualProjectMutation();
         IsBusy = true;
         try
         {
@@ -1102,6 +1427,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         RecoveryProjectInfo? recovery = null,
         CancellationToken cancellationToken = default)
     {
+        EnsureAgentAllowsManualProjectMutation();
+
         if (!await _projectService.HasAutosaveAsync(cancellationToken))
         {
             return;
@@ -1187,13 +1514,45 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(MediaView));
     }
 
+    private void EnsureAgentAllowsManualProjectMutation()
+    {
+        if (!IsAgentDraftEditingLocked)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "Agent Draft сейчас принадлежит агенту. Остановите задачу, прежде чем менять проект вручную.");
+    }
+
     private bool ExecuteCoreCommand(string description, IEditCommand command, Guid? selectedClipId = null)
     {
+        if (IsAgentDraftEditingLocked && _agentMutationDepth == 0)
+        {
+            StatusText = "Agent Draft сейчас принадлежит агенту; ручное редактирование временно заблокировано";
+            return false;
+        }
+
         var result = _editorSession.Execute(new EditTransaction(description, command));
         if (!result.Changed) return false;
         RestoreFromCoreState(result.State, selectedClipId, description);
         StatusText = description;
         return true;
+    }
+
+    private bool ExecuteAgentCoreCommand(
+        string description,
+        IEditCommand command)
+    {
+        _agentMutationDepth++;
+        try
+        {
+            return ExecuteCoreCommand(description, command);
+        }
+        finally
+        {
+            _agentMutationDepth--;
+        }
     }
 
     public bool ApplyTimelineEdit(TimelineEditIntent intent)

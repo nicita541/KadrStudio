@@ -139,6 +139,92 @@ public sealed class OllamaVideoAnalysisService : IDisposable
         _verifiedModels.TryAdd(model, 0);
     }
 
+    internal async Task<string> RunAgentStructuredTurnAsync(
+        JsonElement schema,
+        string systemPrompt,
+        string userPrompt,
+        CancellationToken cancellationToken = default)
+    {
+        if (schema.ValueKind != JsonValueKind.Object)
+            throw new ArgumentException(
+                "Agent response schema must be a JSON object.",
+                nameof(schema));
+
+        if (string.IsNullOrWhiteSpace(systemPrompt))
+            throw new ArgumentException(
+                "Agent system prompt cannot be empty.",
+                nameof(systemPrompt));
+
+        if (string.IsNullOrWhiteSpace(userPrompt))
+            throw new ArgumentException(
+                "Agent turn payload cannot be empty.",
+                nameof(userPrompt));
+
+        await EnsureServerAsync(cancellationToken).ConfigureAwait(false);
+        if (!IsRemote)
+            await EnsureRecommendedModelAsync(cancellationToken).ConfigureAwait(false);
+
+        var model = PreferredModel;
+        using var response = await _httpClient.PostAsJsonAsync(
+            "api/chat",
+            new
+            {
+                model,
+                stream = false,
+                think = false,
+                format = schema,
+                messages = new object[]
+                {
+                    new { role = "system", content = systemPrompt },
+                    new { role = "user", content = userPrompt }
+                },
+                options = new
+                {
+                    temperature = 0,
+                    num_ctx = 24576,
+                    num_predict = 2048
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        await EnsureSuccessAsync(
+            response,
+            $"ИИ-модель {model} не выполнила шаг AI-агента",
+            cancellationToken).ConfigureAwait(false);
+
+        var responseJson = await response.Content
+            .ReadAsStringAsync(cancellationToken)
+            .ConfigureAwait(false);
+        using var envelope = JsonDocument.Parse(responseJson);
+
+        var raw = envelope.RootElement
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString() ?? string.Empty;
+
+        var doneReason =
+            envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
+                ? doneReasonElement.GetString()
+                : null;
+
+        var evalCount =
+            envelope.RootElement.TryGetProperty("eval_count", out var evalCountElement) &&
+            evalCountElement.TryGetInt32(out var parsedEvalCount)
+                ? parsedEvalCount
+                : 0;
+
+        if (string.IsNullOrWhiteSpace(raw))
+            throw new InvalidOperationException(
+                $"ИИ вернул пустой шаг AI-агента. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+
+        if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
+            !raw.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"ИИ оборвал JSON шага AI-агента. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+
+        return ExtractJson(raw);
+    }
+
     public async Task<OllamaAnalysisEnhancement> EnhanceAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
@@ -217,6 +303,253 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             {
                 TryDelete(path);
             }
+        }
+    }
+
+    public async Task<OllamaRangeInspection> InspectRangeAsync(
+        MediaAsset asset,
+        VideoAnalysisResult baseline,
+        string query,
+        string model,
+        IProgress<VideoAnalysisProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(model))
+            throw new ArgumentException("A vision model is required.", nameof(model));
+
+        await EnsureServerAsync(cancellationToken).ConfigureAwait(false);
+        var capabilities = await GetCapabilitiesAsync(model, cancellationToken).ConfigureAwait(false);
+        if (!capabilities.Contains("vision", StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Модель {model} не поддерживает анализ изображений.");
+
+        var duration = Math.Max(0.1, baseline.SourceEnd - baseline.SourceStart);
+        var sheetCount = Math.Clamp((int)Math.Ceiling(duration / 180d), 1, 4);
+        var window = duration / sheetCount;
+        var specs = new List<ContactSheetSpec>(sheetCount);
+        for (var index = 0; index < sheetCount; index++)
+        {
+            var start = baseline.SourceStart + index * window;
+            var end = index == sheetCount - 1
+                ? baseline.SourceEnd
+                : Math.Min(baseline.SourceEnd, start + window);
+            specs.Add(new ContactSheetSpec(
+                start,
+                end,
+                duration >= 3 ? 16 : 4,
+                $"часть {index + 1}/{sheetCount}"));
+        }
+
+        var paths = new List<string>();
+        var images = new List<string>();
+        try
+        {
+            for (var index = 0; index < specs.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                progress?.Report(new VideoAnalysisProgress(
+                    90 + 5d * index / Math.Max(1, specs.Count),
+                    $"Agent vision: диапазон {index + 1}/{specs.Count}"));
+                var spec = specs[index];
+                var path = await CreateContactSheetAsync(
+                    asset.Path,
+                    spec.Start,
+                    spec.End,
+                    spec.FrameCount,
+                    cancellationToken).ConfigureAwait(false);
+                paths.Add(path);
+                images.Add(Convert.ToBase64String(
+                    await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false)));
+            }
+
+            using var schema = JsonDocument.Parse(
+                """
+                {
+                  "type": "object",
+                  "properties": {
+                    "summary": { "type": "string" },
+                    "observations": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "start": { "type": "number" },
+                          "end": { "type": "number" },
+                          "title": { "type": "string" },
+                          "description": { "type": "string" },
+                          "confidence": { "type": "number" },
+                          "tags": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                          }
+                        },
+                        "required": [
+                          "start",
+                          "end",
+                          "title",
+                          "description",
+                          "confidence",
+                          "tags"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": ["summary", "observations"],
+                  "additionalProperties": false
+                }
+                """);
+
+            var sheetDescription = string.Join(
+                Environment.NewLine,
+                specs.Select((spec, index) =>
+                {
+                    var step = Math.Max(0.001, (spec.End - spec.Start) / spec.FrameCount);
+                    return
+                        $"- image {index + 1}: {Format(spec.Start)}–{Format(spec.End)} sec, " +
+                        $"{spec.FrameCount} frames left-to-right/top-to-bottom; " +
+                        $"approx frame N time = {Format(spec.Start)} + (N-0.5)*{Format(step)} sec";
+                }));
+
+            var technicalRanges = string.Join(
+                Environment.NewLine,
+                baseline.Ranges
+                    .Where(item => item.Kind is MarkerKind.Scene or MarkerKind.BlackFrame or
+                        MarkerKind.Silence or MarkerKind.Freeze)
+                    .OrderBy(item => item.SourceStart)
+                    .Take(80)
+                    .Select(item =>
+                        $"- {item.Kind}: {Format(item.SourceStart)}–" +
+                        $"{Format(item.SourceStart + item.Duration)}, confidence {Format(item.Confidence)}"));
+
+            var messages = new object[]
+            {
+                new
+                {
+                    role = "system",
+                    content =
+                        "/no_think\n" +
+                        "Ты визуальный исследователь материала для монтажного AI-агента. " +
+                        "Верни только JSON строго по JSON Schema. " +
+                        "Отвечай на конкретный вопрос агента, используя только видимое на приложенных кадрах " +
+                        "и технические факты. Не решай, что удалять или как монтировать: твоя задача — наблюдения. " +
+                        "Не выдумывай события между редкими кадрами. start/end — абсолютные секунды исходника " +
+                        "и должны оставаться внутри анализируемого диапазона. " +
+                        "Создавай observations только для фактов, полезных для вопроса; максимум 24."
+                },
+                new
+                {
+                    role = "user",
+                    content =
+                        $"Файл: {asset.Name}\n" +
+                        $"Вопрос агента: {(string.IsNullOrWhiteSpace(query) ? "Опиши значимые визуальные факты диапазона." : query.Trim())}\n" +
+                        $"Диапазон: {Format(baseline.SourceStart)}–{Format(baseline.SourceEnd)} сек.\n" +
+                        $"Техническая сводка: {baseline.Summary}\n" +
+                        $"Технические события:\n{technicalRanges}\n" +
+                        $"Контактные листы:\n{sheetDescription}",
+                    images = images.ToArray()
+                }
+            };
+
+            progress?.Report(new VideoAnalysisProgress(96, $"Agent vision: смысловая проверка ({model})"));
+            using var response = await _httpClient.PostAsJsonAsync(
+                "api/chat",
+                new
+                {
+                    model,
+                    stream = false,
+                    think = false,
+                    format = schema.RootElement,
+                    messages,
+                    options = new
+                    {
+                        temperature = 0,
+                        num_ctx = 16384,
+                        num_predict = 4096
+                    }
+                },
+                cancellationToken).ConfigureAwait(false);
+
+            await EnsureSuccessAsync(
+                response,
+                $"ИИ-модель {model} не выполнила анализ диапазона",
+                cancellationToken).ConfigureAwait(false);
+
+            var responseJson = await response.Content.ReadAsStringAsync(cancellationToken)
+                .ConfigureAwait(false);
+            using var envelope = JsonDocument.Parse(responseJson);
+            var raw = envelope.RootElement
+                .GetProperty("message")
+                .GetProperty("content")
+                .GetString() ?? string.Empty;
+
+            var doneReason = envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
+                ? doneReasonElement.GetString()
+                : null;
+            if (string.IsNullOrWhiteSpace(raw))
+                throw new InvalidOperationException(
+                    $"ИИ вернул пустой анализ диапазона. done_reason={doneReason ?? "unknown"}.");
+            if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
+                !raw.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"ИИ оборвал JSON анализа диапазона. done_reason={doneReason ?? "unknown"}.");
+
+            using var document = JsonDocument.Parse(ExtractJson(raw));
+            var summary = GetString(document.RootElement, "summary");
+            var observations = new List<OllamaRangeObservation>();
+
+            if (document.RootElement.TryGetProperty("observations", out var items) &&
+                items.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in items.EnumerateArray().Take(24))
+                {
+                    if (!TryGetNumber(item, "start", out var start) ||
+                        !TryGetNumber(item, "end", out var end))
+                        continue;
+
+                    start = Math.Clamp(start, baseline.SourceStart, baseline.SourceEnd);
+                    end = Math.Clamp(end, baseline.SourceStart, baseline.SourceEnd);
+                    if (end <= start + 0.05)
+                        continue;
+
+                    var confidence = TryGetNumber(item, "confidence", out var parsedConfidence)
+                        ? Math.Clamp(parsedConfidence, 0, 1)
+                        : 0.5;
+                    var tags = item.TryGetProperty("tags", out var tagsElement) &&
+                               tagsElement.ValueKind == JsonValueKind.Array
+                        ? tagsElement.EnumerateArray()
+                            .Where(tag => tag.ValueKind == JsonValueKind.String)
+                            .Select(tag => tag.GetString()?.Trim())
+                            .Where(tag => !string.IsNullOrWhiteSpace(tag))
+                            .Select(tag => tag!)
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .Take(12)
+                            .ToArray()
+                        : Array.Empty<string>();
+
+                    observations.Add(new OllamaRangeObservation(
+                        start,
+                        end,
+                        GetString(item, "title"),
+                        GetString(item, "description"),
+                        confidence,
+                        tags));
+                }
+            }
+
+            progress?.Report(new VideoAnalysisProgress(100, "Agent vision: диапазон исследован"));
+            return new OllamaRangeInspection(
+                summary,
+                observations
+                    .OrderBy(item => item.Start)
+                    .ThenByDescending(item => item.Confidence)
+                    .ToArray(),
+                model,
+                UsedVision: true);
+        }
+        finally
+        {
+            foreach (var path in paths)
+                TryDelete(path);
         }
     }
 
@@ -561,6 +894,66 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 contextText.AppendLine($"- {item.Id:N}");
         }
 
+        using var montageSchema = JsonDocument.Parse(
+            """
+            {
+              "type": "object",
+              "properties": {
+                "summary": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "segment_id": {
+                        "type": "string"
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "hook",
+                          "setup",
+                          "development",
+                          "payoff",
+                          "ending"
+                        ]
+                      },
+                      "transition_after": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "cross_dissolve",
+                          "dip_to_black"
+                        ]
+                      },
+                      "volume": {
+                        "type": "number"
+                      },
+                      "subtitles": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "segment_id",
+                      "role",
+                      "transition_after",
+                      "volume",
+                      "subtitles"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "summary",
+                "items"
+              ],
+              "additionalProperties": false
+            }
+            """);
+
         using var response = await _httpClient.PostAsJsonAsync(
             "api/chat",
             new
@@ -568,29 +961,75 @@ public sealed class OllamaVideoAnalysisService : IDisposable
                 model,
                 stream = false,
                 think = false,
-                format = "json",
+                format = montageSchema.RootElement,
                 messages = new object[]
                 {
                     new
                     {
                         role = "system",
                         content =
-                            "Ты универсальный режиссёр монтажа. Материал может быть любым: разговор, фильм, аниме, игра, обучение, блог или запись события. " +
-                            "Ты не меняешь таймлайн, а возвращаешь декларативный план JSON без Markdown: " +
-                            "{\"summary\":\"...\",\"items\":[{\"segment_id\":\"32 hex\",\"role\":\"hook|setup|development|payoff|ending\"," +
-                            "\"reason\":\"почему\",\"transition_after\":\"none|cross_dissolve|dip_to_black\",\"volume\":1.0,\"subtitles\":true}]}. " +
-                            "Используй только переданные segment_id, каждый максимум один раз. Обязательные элементы включай всегда. " +
-                            "Строй понятную причинно-следственную историю и соблюдай целевую длительность."
+                            "Ты универсальный режиссёр монтажа. " +
+                            "Верни только JSON строго по переданной JSON Schema, без Markdown и без текста вокруг JSON. " +
+                            "Используй только переданные segment_id и каждый не более одного раза. " +
+                            "Порядок items — итоговый порядок монтажа. " +
+                            "Обязательные элементы включай всегда. " +
+                            "Не используй все кандидаты без необходимости: выбери материал под целевую длительность. " +
+                            "Роли: hook, setup, development, payoff, ending."
                     },
-                    new { role = "user", content = contextText.ToString() }
+                    new
+                    {
+                        role = "user",
+                        content = contextText.ToString()
+                    }
                 },
-                options = new { temperature = 0.12, num_ctx = 16384, num_predict = 4096 }
+                options = new
+                {
+                    temperature = 0,
+                    num_ctx = 32768,
+                    num_predict = 8192
+                }
             },
             cancellationToken);
-        await EnsureSuccessAsync(response, $"ИИ-модель {model} не составила план монтажа", cancellationToken);
+
+        await EnsureSuccessAsync(
+            response,
+            $"ИИ-модель {model} не составила план монтажа",
+            cancellationToken);
+
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
         using var envelope = JsonDocument.Parse(responseJson);
-        var rawContent = envelope.RootElement.GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
+
+        var rawContent =
+            envelope.RootElement
+                .GetProperty("message")
+                .GetProperty("content")
+                .GetString()
+            ?? string.Empty;
+
+        var doneReason =
+            envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
+                ? doneReasonElement.GetString()
+                : null;
+
+        var evalCount =
+            envelope.RootElement.TryGetProperty("eval_count", out var evalCountElement) &&
+            evalCountElement.TryGetInt32(out var parsedEvalCount)
+                ? parsedEvalCount
+                : 0;
+
+        if (string.IsNullOrWhiteSpace(rawContent))
+        {
+            throw new InvalidOperationException(
+                $"ИИ вернул пустой монтажный план. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+        }
+
+        if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
+            !rawContent.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"ИИ оборвал JSON до завершения. done_reason={doneReason ?? "unknown"}, eval_count={evalCount}.");
+        }
+
         using var result = JsonDocument.Parse(ExtractJson(rawContent));
         var summary = GetString(result.RootElement, "summary");
         var items = new List<CoreMontagePlanItem>();
@@ -1647,29 +2086,11 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             return Path.GetFullPath(configured);
         }
 
-        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
-        {
-            var directory = new DirectoryInfo(start);
-            for (var level = 0; directory is not null && level < 8; level++, directory = directory.Parent)
-            {
-                var candidate = Path.Combine(directory.FullName, ".ollama", "models");
-                if (Directory.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
-        }
-
-        var standardRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
-        if (Directory.Exists(standardRoot))
-            return standardRoot;
-
-        var applicationRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "KadrStudio", "AI", "models");
-        Directory.CreateDirectory(applicationRoot);
-        return applicationRoot;
+        // Kadr's bundled Ollama is intentionally portable. Do not silently
+        // place multi-gigabyte models in %LOCALAPPDATA% or %USERPROFILE%.
+        // During development this resolves to the repository root; in a
+        // standalone portable build it resolves next to KadrStudio.exe.
+        return KadrLocalDataPaths.AiModelsRoot;
     }
 
     private static string FindOllamaExecutable()
@@ -1755,5 +2176,20 @@ public sealed record OllamaModelInfo(string Name, long SizeBytes, bool SupportsV
 public sealed record OllamaAnalysisEnhancement(
     string Summary,
     IReadOnlyList<DetectedVideoRange> Ranges,
+    string Model,
+    bool UsedVision);
+
+
+public sealed record OllamaRangeObservation(
+    double Start,
+    double End,
+    string Title,
+    string Description,
+    double Confidence,
+    IReadOnlyList<string> Tags);
+
+public sealed record OllamaRangeInspection(
+    string Summary,
+    IReadOnlyList<OllamaRangeObservation> Observations,
     string Model,
     bool UsedVision);

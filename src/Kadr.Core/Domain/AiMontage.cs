@@ -475,7 +475,10 @@ public sealed record AiChatMessage(
     Guid? SequenceId = null,
     string Answer = "",
     AiPlanCardSnapshot? PlanSnapshot = null,
-    ImmutableArray<AiChatEditCommand> EditCommands = default)
+    ImmutableArray<AiChatEditCommand> EditCommands = default,
+    Guid? AgentTaskId = null,
+    int? AgentPlanVersion = null,
+    Guid? AgentQuestionId = null)
 {
     public ImmutableArray<AiChatEditCommand> EditCommands { get; init; } =
         EditCommands.IsDefault ? [] : EditCommands;

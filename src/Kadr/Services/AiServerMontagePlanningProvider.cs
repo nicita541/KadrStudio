@@ -3,8 +3,8 @@ using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Services;
 
-public sealed class OllamaMontagePlanningProvider(
-    OllamaVideoAnalysisService ollama,
+public sealed class AiServerMontagePlanningProvider(
+    AiVideoAnalysisService aiServer,
     IMontagePlanningProvider? fallback = null) : IMontagePlanningProvider
 {
     private readonly IMontagePlanningProvider _fallback = fallback ?? new EvidenceMontagePlanningProvider();
@@ -26,7 +26,7 @@ public sealed class OllamaMontagePlanningProvider(
     {
         try
         {
-            return await ollama.PlanMontageAsync(context, cancellationToken).ConfigureAwait(false);
+            return await aiServer.PlanMontageAsync(context, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

@@ -98,6 +98,33 @@ public sealed class AgentToolApiTests
     }
 
     [Fact]
+    public async Task Inspect_range_rejects_semantic_query_with_structure_only_summary()
+    {
+        var backend = new FakeBackend();
+        var registry = AgentReadOnlyToolSet.Create(backend);
+        var executor = new AgentToolExecutor(registry);
+        var task = CreateTask();
+        var arguments = AgentToolJson.ToElement(new
+        {
+            target_kind = "sequence",
+            target_id = task.SourceSequenceId,
+            start_seconds = 0,
+            end_seconds = 120,
+            detail = "summary",
+            query = "Где заканчивается опенинг?"
+        });
+
+        var result = await executor.ExecuteAsync(
+            task,
+            AgentToolCall.Create(task.Id, "inspect_range", arguments));
+
+        Assert.Equal(AgentToolResultStatus.Rejected, result.Status);
+        Assert.Equal("invalid_arguments", result.ErrorCode);
+        Assert.Contains("frames, audio, transcript or all", result.Summary, StringComparison.Ordinal);
+        Assert.Equal(0, backend.RangeCalls);
+    }
+
+    [Fact]
     public async Task Unknown_tool_is_rejected_without_throwing()
     {
         var registry = AgentReadOnlyToolSet.Create(new FakeBackend());

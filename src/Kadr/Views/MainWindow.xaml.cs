@@ -51,7 +51,7 @@ public partial class MainWindow : Window
     private readonly PreviewPresenter _previewPresenter;
     private readonly string? _initialProjectPath;
     private CancellationTokenSource? _analysisCancellation;
-    private readonly ObservableCollection<OllamaModelInfo> _localAiModels = [];
+    private readonly ObservableCollection<AiModelInfo> _localAiModels = [];
     private readonly ObservableCollection<ProjectHistoryEntry> _inlineHistoryEntries = [];
     private readonly ObservableCollection<AiPlanItemRow> _aiPlanRows = [];
     private readonly ObservableCollection<AiStructuralSegmentRow> _aiStructuralRows = [];
@@ -118,22 +118,6 @@ public partial class MainWindow : Window
         AiSequencesListBox.ItemsSource = _aiSequenceRows;
         AiAnnotationsListBox.ItemsSource = _aiAnnotationRows;
         AiChatMessagesListBox.ItemsSource = _aiChatRows;
-        AiChatScenarioComboBox.ItemsSource = new[]
-        {
-            new AiChatScenarioOption(null, "Авто · Универсальный"),
-            new AiChatScenarioOption(
-                KadrStudio.Application.Automation.AutomationPresets.AnimeMergeEpisodes.Id,
-                "Пресет · Аниме: объединить серии")
-        };
-        AiChatScenarioComboBox.SelectedIndex = 0;
-        AiChatContextComboBox.ItemsSource = new[]
-        {
-            new AiChatContextOption(null, "Контекст · Авто"),
-            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary, "Вся медиатека"),
-            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence, "Текущий таймлайн"),
-            new AiChatContextOption(KadrStudio.Core.Domain.MontageScopeKind.SelectedClips, "Выбранный клип")
-        };
-        AiChatContextComboBox.SelectedIndex = 0;
         RefreshAiChatRows();
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
         _viewModel.AiAgentOrchestrator.TaskChanged += AgentTaskChanged;
@@ -625,7 +609,7 @@ public partial class MainWindow : Window
     private void About_Click(object sender, RoutedEventArgs e)
         => MessageBox.Show(
             this,
-            "Kadr Studio\nНативный локальный видеоредактор\nFFmpeg + Ollama Vision",
+            "Kadr Studio\nНативный локальный видеоредактор\nFFmpeg + Kadr AI Server",
             "О программе",
             MessageBoxButton.OK,
             MessageBoxImage.Information);
@@ -1050,18 +1034,6 @@ public partial class MainWindow : Window
         Color = "#FFFFFF"
     };
 
-    private void UseSelectedClipRange_Click(object sender, RoutedEventArgs e)
-    {
-        if (_viewModel.SelectedClip is null)
-        {
-            _viewModel.StatusText = "Сначала выберите клип на таймлайне";
-            return;
-        }
-
-        AnalysisAssetComboBox.SelectedItem = _viewModel.SelectedClipAsset;
-        SetAnalysisRangeFromClip(_viewModel.SelectedClip);
-    }
-
     private void SetAnalysisRangeFromClip(TimelineClip clip)
     {
         AnalysisStartTextBox.Text = FormatEditorTime(clip.SourceStart);
@@ -1129,7 +1101,7 @@ public partial class MainWindow : Window
             var query = AnalysisPromptTextBox.Text?.Trim() ?? string.Empty;
             var pipeline = await _viewModel.AutomationOrchestrator.AnalyzeAsync(
                 new VideoAnalysisRequest(asset, sourceStart, sourceEnd, query),
-                UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo selectedModel
+                UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is AiModelInfo selectedModel
                     ? selectedModel.Name
                     : null,
                 progress,
@@ -1205,13 +1177,12 @@ public partial class MainWindow : Window
 
         _isRefreshingLocalAiModels = true;
         RefreshLocalAiModelsButton.IsEnabled = false;
-        LocalAiStatusTextBlock.Text = _viewModel.OllamaVideoAnalysisService.IsRemote
-            ? $"Подключение к ИИ-серверу {_viewModel.OllamaVideoAnalysisService.Endpoint.Host}…"
-            : "Запуск локального ИИ-сервера и подготовка модели…";
+        LocalAiStatusTextBlock.Text =
+            $"Подключение к ИИ-серверу {_viewModel.AiVideoAnalysisService.Endpoint.Host}…";
         try
         {
-            var selectedName = (LocalAiModelComboBox.SelectedItem as OllamaModelInfo)?.Name;
-            var models = await _viewModel.OllamaVideoAnalysisService.GetModelsAsync();
+            var selectedName = (LocalAiModelComboBox.SelectedItem as AiModelInfo)?.Name;
+            var models = await _viewModel.AiVideoAnalysisService.GetModelsAsync();
             _localAiModels.Clear();
             foreach (var model in models)
             {
@@ -1220,8 +1191,7 @@ public partial class MainWindow : Window
 
             var preferred = _localAiModels.FirstOrDefault(model => model.Name.Equals(selectedName, StringComparison.OrdinalIgnoreCase))
                 ?? _localAiModels.FirstOrDefault(model => model.Name.Equals(
-                    _viewModel.OllamaVideoAnalysisService.PreferredModel, StringComparison.OrdinalIgnoreCase))
-                ?? _localAiModels.FirstOrDefault(model => model.Name.Equals("qwen3-vl:4b-instruct", StringComparison.OrdinalIgnoreCase))
+                    _viewModel.AiVideoAnalysisService.PreferredModel, StringComparison.OrdinalIgnoreCase))
                 ?? _localAiModels.FirstOrDefault(model => model.SupportsVision)
                 ?? _localAiModels.FirstOrDefault();
             LocalAiModelComboBox.SelectedItem = preferred;
@@ -1229,7 +1199,7 @@ public partial class MainWindow : Window
             LocalAiModelComboBox.IsEnabled = preferred is not null;
             LocalAiStatusTextBlock.Text = preferred is null
                 ? "ИИ-сервер не вернул доступных моделей."
-                : $"Готово: {preferred.Name} · {_viewModel.OllamaVideoAnalysisService.ModelRoot}";
+                : $"Готово: {preferred.Name} · {_viewModel.AiVideoAnalysisService.Endpoint}";
         }
         catch (Exception exception)
         {
@@ -1238,7 +1208,7 @@ public partial class MainWindow : Window
             LocalAiStatusTextBlock.Text = $"ИИ недоступен: {exception.Message}";
             if (showError)
             {
-                ShowError("Не удалось подключить локальный ИИ", exception);
+                ShowError("Не удалось подключить Kadr AI Server", exception);
             }
         }
         finally
@@ -1860,208 +1830,6 @@ public partial class MainWindow : Window
                 message with { AgentTaskId = taskId }));
     }
 
-    private async Task PreparePresetChatPlanAsync(
-        string prompt,
-        KadrStudio.Core.Domain.AutomationPreset preset,
-        Guid progressMessageId,
-        CancellationToken token)
-    {
-        var model = await ResolveChatModelAsync(requireVision: true, token);
-        var profile = _viewModel.GetGameEditingProfiles().First(item => item.Id == preset.ProfileId);
-        var mergeEpisodes = preset.Recipe == KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
-        var scope = ResolveChatScope(useAllSources: mergeEpisodes);
-        if (mergeEpisodes && scope.SourceIds.Length < 2)
-            throw new InvalidOperationException("Для объединения добавьте в медиатеку минимум две серии.");
-        var request = BuildChatMontageRequest(prompt, scope, profile, preset);
-        var progress = new Progress<double>(value =>
-            UpdateChatProgress(progressMessageId, value,
-                value < 0.35 ? "Технический анализ серий…" :
-                value < 0.75 ? "ИИ проверяет структуру и повторяющиеся блоки…" :
-                "Уточняю покадровые границы и собираю план…"));
-        var result = await _viewModel.PrepareMontagePlanAsync(
-            new MediaAnalysisRequest(scope.SourceIds, profile, model.Name, DeepAnalysis: true),
-            request, progress, token);
-        _aiManifests = result.Manifests;
-        _activeMontagePlan = result.Plan;
-        CompleteChatProgress(progressMessageId, "Анализ завершён.",
-            KadrStudio.Core.Domain.AiChatMessageKind.Text,
-            KadrStudio.Core.Domain.AiChatOperationState.Completed);
-        AppendChatPlan(result.Plan);
-    }
-
-    private async Task PrepareGenericChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
-    {
-        var model = await ResolveChatModelAsync(requireVision: false, token);
-        var profile = _viewModel.GetGameEditingProfiles()
-            .FirstOrDefault(item => item.Id == "universal")
-            ?? _viewModel.GetGameEditingProfiles().First();
-        var scope = ResolveChatScope(useAllSources: false);
-        if (scope.SourceIds.IsDefaultOrEmpty)
-            throw new InvalidOperationException("Добавьте видео в медиатеку или на таймлайн.");
-        var request = BuildChatMontageRequest(prompt, scope, profile, null);
-        var progress = new Progress<double>(value =>
-            UpdateChatProgress(progressMessageId, value,
-                value < 0.75 ? "Анализирую материал…" : "Собираю подробный план…"));
-        _aiManifests = await _viewModel.AnalyzeMontageSourcesAsync(
-            new MediaAnalysisRequest(scope.SourceIds, profile, model.Name, DeepAnalysis: model.SupportsVision),
-            progress, token);
-        _activeMontagePlan = await _viewModel.CreateMontagePlanAsync(request, _aiManifests, token);
-        CompleteChatProgress(progressMessageId, "Анализ завершён.",
-            KadrStudio.Core.Domain.AiChatMessageKind.Text,
-            KadrStudio.Core.Domain.AiChatOperationState.Completed);
-        AppendChatPlan(_activeMontagePlan);
-    }
-
-    private async Task ReviseChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
-    {
-        if (_activeMontagePlan is null) return;
-        var sourceIds = _activeMontagePlan.Dependencies.SourceFingerprints.Keys.ToImmutableArray();
-        if (sourceIds.Any(id => !_aiManifests.ContainsKey(id)))
-        {
-            var model = await ResolveChatModelAsync(requireVision: false, token);
-            _aiManifests = await _viewModel.AnalyzeMontageSourcesAsync(
-                new MediaAnalysisRequest(sourceIds, _activeMontagePlan.ProfileSnapshot, model.Name, model.SupportsVision),
-                new Progress<double>(value => UpdateChatProgress(progressMessageId, value, "Проверяю зависимые фрагменты…")),
-                token);
-        }
-        _activeMontagePlan = await _viewModel.ReviseMontagePlanAsync(
-            _activeMontagePlan, prompt, _aiManifests, token);
-        CompleteChatProgress(progressMessageId, "План исправлен.",
-            KadrStudio.Core.Domain.AiChatMessageKind.Text,
-            KadrStudio.Core.Domain.AiChatOperationState.Completed);
-        AppendChatPlan(_activeMontagePlan);
-    }
-
-    private async Task PrepareTimelineCommandChatPlanAsync(string prompt, Guid progressMessageId, CancellationToken token)
-    {
-        EditCommandPlan plan;
-        var selected = _viewModel.SelectedClip is { } clip
-            ? _viewModel.CoreState.FindMediaClip(clip.Id)
-            : null;
-        if (EditingCommandPlanner.TryCreateDeterministic(_viewModel.CoreState, prompt, selected, out var deterministic))
-        {
-            plan = deterministic;
-        }
-        else
-        {
-            var model = await ResolveChatModelAsync(requireVision: false, token);
-            plan = await _viewModel.OllamaVideoAnalysisService.PlanEditsAsync(
-                _viewModel.CoreState, prompt, model.Name, selected, token);
-        }
-
-        var commands = plan.Commands.Select(command => new KadrStudio.Core.Domain.AiChatEditCommand(
-            command.Type switch
-            {
-                EditCommandType.DeleteRange => KadrStudio.Core.Domain.AiChatEditCommandKind.DeleteRange,
-                EditCommandType.SplitAt => KadrStudio.Core.Domain.AiChatEditCommandKind.SplitAt,
-                _ => KadrStudio.Core.Domain.AiChatEditCommandKind.DeleteSelected
-            }, command.Start, command.End, command.Reason)).ToImmutableArray();
-        var details = plan.Commands.Select(FormatEditCommand).ToImmutableArray();
-        var snapshot = new KadrStudio.Core.Domain.AiPlanCardSnapshot(
-            "Команда текущему таймлайну", plan.Summary,
-            KadrStudio.Core.Domain.TimelineTime.Zero, details, [], [], commands.Length > 0);
-        CompleteChatProgress(progressMessageId, "Команда разобрана. Таймлайн пока не изменён.",
-            KadrStudio.Core.Domain.AiChatMessageKind.Text,
-            KadrStudio.Core.Domain.AiChatOperationState.Completed);
-        var message = new KadrStudio.Core.Domain.AiChatMessage(
-            Guid.NewGuid(), KadrStudio.Core.Domain.AiChatRole.Assistant,
-            KadrStudio.Core.Domain.AiChatMessageKind.Plan, plan.Summary, DateTimeOffset.UtcNow,
-            PlanSnapshot: snapshot, EditCommands: commands);
-        SaveAiConversation(_aiChatCoordinator.Append(_viewModel.GetAiConversation(), message));
-    }
-
-    private KadrStudio.Core.Domain.MontageScope ResolveChatScope(bool useAllSources)
-    {
-        var selectedKind = (AiChatContextComboBox.SelectedItem as AiChatContextOption)?.Kind;
-        var kind = selectedKind ?? (useAllSources
-            ? KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary
-            : _viewModel.SelectedClip is not null
-                ? KadrStudio.Core.Domain.MontageScopeKind.SelectedClips
-                : KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence);
-        IEnumerable<KadrStudio.Core.Domain.MediaClip> clips = _viewModel.CoreState.MediaClips;
-        Guid? sequenceId = null;
-        if (kind == KadrStudio.Core.Domain.MontageScopeKind.SelectedClips)
-        {
-            clips = _viewModel.SelectedClip is { } selected ? clips.Where(item => item.Id == selected.Id) : [];
-            sequenceId = _viewModel.CoreState.ActiveSequenceId;
-        }
-        else if (kind == KadrStudio.Core.Domain.MontageScopeKind.CurrentSequence)
-        {
-            sequenceId = _viewModel.CoreState.ActiveSequenceId;
-        }
-
-        ImmutableArray<Guid> sourceIds;
-        ImmutableArray<Guid> clipIds = [];
-        if (kind == KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary)
-        {
-            sourceIds = _viewModel.CoreState.Sources.Values
-                .Where(source => source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
-                .Select(source => source.Id).ToImmutableArray();
-        }
-        else
-        {
-            var material = clips.Where(clip =>
-                    _viewModel.CoreState.Sources.TryGetValue(clip.SourceId, out var source) &&
-                    source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
-                .ToImmutableArray();
-            sourceIds = material.Select(clip => clip.SourceId).Distinct().ToImmutableArray();
-            clipIds = material.Select(clip => clip.Id).ToImmutableArray();
-            if (sourceIds.IsDefaultOrEmpty && selectedKind is null)
-            {
-                kind = KadrStudio.Core.Domain.MontageScopeKind.MediaLibrary;
-                sequenceId = null;
-                sourceIds = _viewModel.CoreState.Sources.Values
-                    .Where(source => source.Kind == KadrStudio.Core.Domain.MediaKind.Video)
-                    .Select(source => source.Id).ToImmutableArray();
-            }
-        }
-        return new KadrStudio.Core.Domain.MontageScope(kind, sourceIds, sequenceId, clipIds);
-    }
-
-    private KadrStudio.Core.Domain.MontageRequest BuildChatMontageRequest(
-        string prompt,
-        KadrStudio.Core.Domain.MontageScope scope,
-        CoreGameProfile profile,
-        KadrStudio.Core.Domain.AutomationPreset? preset)
-    {
-        var mergeEpisodes = preset?.Recipe == KadrStudio.Core.Domain.AutomationRecipeKind.MergeEpisodes;
-        var total = Math.Max(1, scope.SourceIds
-            .Where(_viewModel.CoreState.Sources.ContainsKey)
-            .Sum(id => _viewModel.CoreState.Sources[id].Duration.TotalSeconds));
-        var target = mergeEpisodes ? total : Math.Clamp(total * 0.35, 30, 720);
-        var sourceIds = scope.SourceIds.ToHashSet();
-        var constraints = _viewModel.CoreState.SourceAnnotations
-            .Where(item => sourceIds.Contains(item.SourceId))
-            .Select(item => new KadrStudio.Core.Domain.MontageConstraint(
-                item.Id, item.SourceId, item.Kind, item.SourceRange, item.Note, IsHard: true))
-            .ToImmutableArray();
-        return new KadrStudio.Core.Domain.MontageRequest(
-            Guid.NewGuid(), scope,
-            mergeEpisodes ? KadrStudio.Core.Domain.MontageTargetFormat.Source : KadrStudio.Core.Domain.MontageTargetFormat.YouTube,
-            KadrStudio.Core.Domain.TimelineTime.FromSeconds(mergeEpisodes ? 1 : Math.Min(30, target)),
-            KadrStudio.Core.Domain.TimelineTime.FromSeconds(target),
-            KadrStudio.Core.Domain.TimelineTime.FromSeconds(mergeEpisodes ? total : Math.Max(target, Math.Min(1200, total))),
-            prompt, profile, constraints, preset);
-    }
-
-    private async Task<OllamaModelInfo> ResolveChatModelAsync(
-        bool requireVision,
-        CancellationToken cancellationToken = default)
-    {
-        if (_localAiModels.Count == 0) await RefreshLocalAiModelsAsync(showError: false);
-        var model = requireVision
-            ? _localAiModels.FirstOrDefault(item => item.SupportsVision)
-            : _localAiModels.FirstOrDefault(item => item.SupportsVision) ?? _localAiModels.FirstOrDefault();
-        if (model is null)
-            throw new InvalidOperationException(requireVision
-                ? "Для точного анализа нужна доступная vision-модель на ИИ-сервере."
-                : "ИИ-модель недоступна. Проверьте подключение к серверу.");
-        await _viewModel.OllamaVideoAnalysisService.VerifyModelAsync(model.Name, cancellationToken);
-        LocalAiModelComboBox.SelectedItem = model;
-        UseLocalAiCheckBox.IsChecked = true;
-        return model;
-    }
-
     private void AppendChatPlan(CoreMontagePlan plan)
     {
         var validation = _viewModel.AiMontageCoordinator.ValidatePlan(_viewModel.CoreState, plan);
@@ -2117,8 +1885,6 @@ public partial class MainWindow : Window
         _isAiChatBusy = busy;
         AiChatSendButton.Content = busy ? "Остановить" : "Отправить";
         AiChatPromptTextBox.IsEnabled = !busy;
-        AiChatScenarioComboBox.IsEnabled = !busy;
-        AiChatContextComboBox.IsEnabled = !busy;
         UpdateAgentTaskControls();
     }
 
@@ -2668,13 +2434,13 @@ public partial class MainWindow : Window
             }
             else
             {
-                if (LocalAiModelComboBox.SelectedItem is not OllamaModelInfo model)
+                if (LocalAiModelComboBox.SelectedItem is not AiModelInfo model)
                 {
                     throw new InvalidOperationException(
                         "Для свободной команды выберите локальную модель. Простые команды с точным временем работают и без ИИ.");
                 }
 
-                plan = await _viewModel.OllamaVideoAnalysisService.PlanEditsAsync(
+                plan = await _viewModel.AiVideoAnalysisService.PlanEditsAsync(
                     _viewModel.CoreState,
                     prompt,
                     model.Name,
@@ -2796,7 +2562,7 @@ public partial class MainWindow : Window
             if (!request.Scope.SourceIds.Any())
                 throw new InvalidOperationException("В выбранной области нет видеоисходников.");
             if (UseLocalAiCheckBox.IsChecked != true ||
-                LocalAiModelComboBox.SelectedItem is not OllamaModelInfo { SupportsVision: true } model)
+                LocalAiModelComboBox.SelectedItem is not AiModelInfo { SupportsVision: true } model)
                 throw new InvalidOperationException(
                     "Для точного аниме-пресета выберите локальную vision-модель. Без неё вероятностное удаление не выполняется.");
 
@@ -3301,7 +3067,7 @@ public partial class MainWindow : Window
         _analysisCancellation = new CancellationTokenSource();
         var selectedProfile = profile ?? GetSelectedAiProfile();
         var ids = sourceIds ?? ResolveAiScope().SourceIds;
-        var model = UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is OllamaModelInfo selectedModel
+        var model = UseLocalAiCheckBox.IsChecked == true && LocalAiModelComboBox.SelectedItem is AiModelInfo selectedModel
             ? selectedModel.Name
             : string.Empty;
         var progress = new Progress<double>(value =>
@@ -4218,22 +3984,6 @@ public partial class MainWindow : Window
         TimelineEditor.InvalidateVisual();
     }
 
-    private TimelineClip? FindActiveClip(TrackKind track, double time)
-    {
-        var clips = _viewModel.Project.Clips
-            .Where(clip => clip.Track == track)
-            .OrderByDescending(clip => clip.TrackIndex)
-            .ThenBy(clip => clip.Start)
-            .ToList();
-        var active = clips.FirstOrDefault(clip => time >= clip.Start && time < clip.End);
-        if (active is null && clips.Count > 0 && Math.Abs(time - _viewModel.Project.Duration) < 0.02)
-        {
-            active = clips.LastOrDefault(clip => time >= clip.Start && time <= clip.End + 0.02);
-        }
-        return active;
-    }
-
-
     private void PreviewQuality_Changed(object sender, SelectionChangedEventArgs e)
     {
         if (!IsLoaded) return;
@@ -4322,15 +4072,6 @@ public partial class MainWindow : Window
     }
 
     private void UpdateWindowTitle() => Title = $"{_viewModel.ProjectTitle} — Kadr Studio";
-
-    private sealed record AiChatScenarioOption(string? PresetId, string DisplayName);
-
-    private sealed record AiChatContextOption(
-        KadrStudio.Core.Domain.MontageScopeKind? Kind,
-        string DisplayName)
-    {
-        public override string ToString() => DisplayName;
-    }
 
     private sealed record AiChatQuestionOptionRow(
         Guid MessageId,

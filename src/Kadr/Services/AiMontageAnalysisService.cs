@@ -12,7 +12,7 @@ namespace KadrStudio.Services;
 public sealed class AiMontageAnalysisService(
     AutomationOrchestrator orchestrator,
     AutoSubtitleService subtitles,
-    OllamaVideoAnalysisService ollama,
+    AiVideoAnalysisService aiServer,
     IArtifactStore artifacts,
     AnimeFingerprintService fingerprintService) : IMediaAnalysisPipeline
 {
@@ -153,7 +153,7 @@ public sealed class AiMontageAnalysisService(
             }
             else
             {
-                var semantic = await ollama.AnalyzeMaterialAsync(
+                var semantic = await aiServer.AnalyzeMaterialAsync(
                     asset, technicalResult, request.Profile, request.Model, progress, cancellationToken)
                     .ConfigureAwait(false);
                 segments.AddRange(semantic);
@@ -207,7 +207,7 @@ public sealed class AiMontageAnalysisService(
         var pipeline = await orchestrator.AnalyzeAsync(
             new VideoAnalysisRequest(
                 asset, 0, source.Duration.TotalSeconds, BuildBaselineQuery(request.Profile)),
-            ollamaModel: null,
+            aiModel: null,
             progress,
             cancellationToken,
             request.IsBackground ? JobPriority.Background : JobPriority.UserInitiated).ConfigureAwait(false);

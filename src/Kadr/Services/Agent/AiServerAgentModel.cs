@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Unicode;
@@ -9,11 +10,11 @@ using KadrStudio.Application.Automation.Agent.Tools;
 namespace KadrStudio.Services.Agent;
 
 /// <summary>
-/// Current Ollama implementation of the model-agnostic agent contract.
+/// Kadr AI Server implementation of the model-agnostic agent contract.
 /// The model chooses exactly one externally visible action per turn and never
 /// receives direct access to project objects.
 /// </summary>
-public sealed class OllamaAgentModel : IAgentModel
+public sealed class AiServerAgentModel : IAgentModel
 {
     private const int MaximumPlanConstraints = 24;
     private const int MaximumPlanSteps = 24;
@@ -58,9 +59,14 @@ public sealed class OllamaAgentModel : IAgentModel
                 "type": "object",
                 "properties": {
                   "title": { "type": "string" },
-                  "description": { "type": "string" }
+                  "description": { "type": "string" },
+                  "expected_editing_tool": { "type": "string" },
+                  "evidence_observation_sequences": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 1 }
+                  }
                 },
-                "required": ["title", "description"],
+                "required": ["title", "description", "expected_editing_tool", "evidence_observation_sequences"],
                 "additionalProperties": false
               }
             },
@@ -83,14 +89,14 @@ public sealed class OllamaAgentModel : IAgentModel
         }
         """);
 
-    private readonly OllamaVideoAnalysisService _ollama;
+    private readonly AiVideoAnalysisService _aiServer;
     private readonly IAgentDebugLog _debugLog;
 
-    public OllamaAgentModel(
-        OllamaVideoAnalysisService ollama,
+    public AiServerAgentModel(
+        AiVideoAnalysisService aiServer,
         IAgentDebugLog? debugLog = null)
     {
-        _ollama = ollama ?? throw new ArgumentNullException(nameof(ollama));
+        _aiServer = aiServer ?? throw new ArgumentNullException(nameof(aiServer));
         _debugLog = debugLog ?? NullAgentDebugLog.Instance;
     }
 
@@ -106,17 +112,17 @@ public sealed class OllamaAgentModel : IAgentModel
 
         _debugLog.Write(new AgentDebugLogEntry(
             startedAt,
-            "ollama_agent_model",
+            "ai_server_agent_model",
             "request",
             request.Task.Id,
             request.Task.Phase.ToString(),
             request.TurnIndex,
-            $"Sending {request.Mode} turn to Ollama.",
+            $"Sending {request.Mode} turn to Kadr AI Server.",
             $"system_prompt:\n{systemPrompt}\n\nturn_payload:\n{turnPayload}"));
 
         try
         {
-            var raw = await _ollama.RunAgentStructuredTurnAsync(
+            var raw = await _aiServer.RunAgentStructuredTurnAsync(
                 DecisionSchema,
                 systemPrompt,
                 turnPayload,
@@ -124,12 +130,12 @@ public sealed class OllamaAgentModel : IAgentModel
 
             _debugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
-                "ollama_agent_model",
+                "ai_server_agent_model",
                 "response",
                 request.Task.Id,
                 request.Task.Phase.ToString(),
                 request.TurnIndex,
-                $"Ollama returned a structured response in {(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds:0} ms.",
+                $"Kadr AI Server returned a structured response in {(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds:0} ms.",
                 raw));
 
             try
@@ -140,7 +146,7 @@ public sealed class OllamaAgentModel : IAgentModel
             {
                 _debugLog.Write(new AgentDebugLogEntry(
                     DateTimeOffset.UtcNow,
-                    "ollama_agent_model",
+                    "ai_server_agent_model",
                     "response_parse_failed",
                     request.Task.Id,
                     request.Task.Phase.ToString(),
@@ -155,19 +161,19 @@ public sealed class OllamaAgentModel : IAgentModel
         {
             _debugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
-                "ollama_agent_model",
+                "ai_server_agent_model",
                 "cancelled",
                 request.Task.Id,
                 request.Task.Phase.ToString(),
                 request.TurnIndex,
-                "Ollama agent turn was cancelled."));
+                "Kadr AI Server agent turn was cancelled."));
             throw;
         }
         catch (Exception exception)
         {
             _debugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
-                "ollama_agent_model",
+                "ai_server_agent_model",
                 "request_failed",
                 request.Task.Id,
                 request.Task.Phase.ToString(),
@@ -190,6 +196,10 @@ public sealed class OllamaAgentModel : IAgentModel
                 Не выполняй монтаж. Используй только read-only tools.
                 publish_plan делай только когда данных достаточно для конкретного,
                 проверяемого и понятного пользователю плана.
+                Для каждого шага монтажа укажи точное имя editing tool в expected_editing_tool
+                и номера observations, доказывающих границы, в evidence_observation_sequences.
+                Для шага без монтажа верни expected_editing_tool="". Смысловое удаление нельзя
+                обосновать одним inspect_timeline: нужен inspect_range с frames/audio/transcript/all.
                 """,
             AgentModelTurnMode.Execution =>
                 """
@@ -274,7 +284,9 @@ public sealed class OllamaAgentModel : IAgentModel
                 {
                     order = step.Order,
                     title = step.Title,
-                    description = step.Description
+                    description = step.Description,
+                    expected_editing_tool = step.ExpectedEditingTool,
+                    evidence_observation_sequences = step.EvidenceObservationSequences
                 }).ToArray(),
                 approved = plan.ApprovedAt is not null
             };
@@ -439,7 +451,17 @@ public sealed class OllamaAgentModel : IAgentModel
 
                 steps.Add(new AgentPlanStepDraft(
                     title,
-                    description));
+                    description,
+                    ReadString(item, "expected_editing_tool"),
+                    item.TryGetProperty("evidence_observation_sequences", out var evidenceElement) &&
+                    evidenceElement.ValueKind == JsonValueKind.Array
+                        ? evidenceElement.EnumerateArray()
+                            .Where(value => value.TryGetInt32(out _))
+                            .Select(value => value.GetInt32())
+                            .Where(value => value > 0)
+                            .Distinct()
+                            .ToImmutableArray()
+                        : ImmutableArray<int>.Empty));
             }
         }
 

@@ -1,6 +1,6 @@
 # Kadr Studio
 
-Kadr Studio — нативный локальный видеоредактор для Windows на C# и WPF. В проекте нет Electron, HTML и облачной обработки; исходные медиа остаются на компьютере пользователя.
+Kadr Studio — нативный видеоредактор для Windows на C# и WPF. Исходные медиа, timeline и фактический монтаж остаются на компьютере пользователя; AI inference вынесен в независимый Kadr AI Server, который может работать на том же ПК или на отдельной GPU-машине.
 
 ## Ядро
 
@@ -12,7 +12,7 @@ Kadr Studio — нативный локальный видеоредактор �
 - многодорожечная композиция: верхние V перекрывают нижние, активные A микшируются;
 - общий `TimelineViewport` для линейки, клипов, кадров, waveform, маркеров, playhead и скролла;
 - многоуровневая stereo min/max/RMS-пирамида waveform с детализацией по масштабу;
-- локальный FFmpeg/FFprobe и встроенный Ollama-совместимый ИИ-сервер, SQLite-проекты и контрольные точки истории;
+- локальный FFmpeg/FFprobe и независимый Kadr AI Server с server-managed inference backend, SQLite-проекты и контрольные точки истории;
 - безопасный универсальный ИИ-монтаж любого видеоматериала, дополнительные пресеты, source-level анализ, проверяемый план и независимые последовательности;
 - MP4-экспорт H.264/AAC в 480p, 720p и 1080p с NVENC/fallback на CPU.
 
@@ -26,12 +26,12 @@ Kadr Studio — нативный локальный видеоредактор �
 Для разработки:
 
 ```powershell
-dotnet restore KadrStudio.sln --disable-parallel
-dotnet build KadrStudio.sln -c Debug --no-restore -m:1 -warnaserror
-dotnet test KadrStudio.sln -c Debug --no-build --no-restore -m:1
+dotnet restore KadrStudio.sln --disable-parallel -m:1 -nr:false
+dotnet build KadrStudio.sln -c Debug --no-restore -m:1 -nr:false -warnaserror
+dotnet test KadrStudio.sln -c Debug --no-build --no-restore -m:1 -nr:false
 ```
 
-Архитектура описана в [ARCHITECTURE.md](ARCHITECTURE.md), предпросмотр — в [docs/PREVIEW_ARCHITECTURE.md](docs/PREVIEW_ARCHITECTURE.md), тестовый gate — в [docs/TESTING.md](docs/TESTING.md), работа в редакторе — в [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+Архитектура описана в [ARCHITECTURE.md](ARCHITECTURE.md), AI-сервер — в [docs/REMOTE_AI_SERVER.md](docs/REMOTE_AI_SERVER.md), предпросмотр — в [docs/PREVIEW_ARCHITECTURE.md](docs/PREVIEW_ARCHITECTURE.md), тестовый gate — в [docs/TESTING.md](docs/TESTING.md), работа в редакторе — в [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 ## Структура
 
@@ -39,6 +39,7 @@ dotnet test KadrStudio.sln -c Debug --no-build --no-restore -m:1
 - `src/Kadr.Application` — команды, транзакции, render plan, preview-контракты;
 - `src/Kadr.Infrastructure` — SQLite, FFmpeg-композиция, кэш и планировщик;
 - `src/Kadr` — WPF-представления и внешние адаптеры;
+- `src/Kadr.AiServer` — независимый HTTP AI runtime, model routing/auth и Ollama backend;
 - `tests` — unit, архитектурные и реальные FFmpeg integration-тесты;
 - `tools/win-x64` — локальные FFmpeg и FFprobe;
 - `scripts` — проверка, publish и упаковка.

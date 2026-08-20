@@ -11,9 +11,8 @@ public sealed class AnimePresetUiSourceTests
 
         Assert.Contains("x:Name=\"AiChatMessagesListBox\"", mainWindow, StringComparison.Ordinal);
         Assert.Contains("x:Name=\"AiChatPromptTextBox\"", mainWindow, StringComparison.Ordinal);
-        Assert.Contains("x:Name=\"AiChatScenarioComboBox\"", mainWindow, StringComparison.Ordinal);
-        Assert.Contains("Авто · Универсальный", File.ReadAllText(
-            Path.Combine(root, "Kadr", "Views", "MainWindow.xaml.cs")), StringComparison.Ordinal);
+        Assert.DoesNotContain("AiChatScenarioComboBox", mainWindow, StringComparison.Ordinal);
+        Assert.DoesNotContain("AiChatContextComboBox", mainWindow, StringComparison.Ordinal);
         Assert.Contains("PreviewKeyDown=\"AiChatPrompt_PreviewKeyDown\"", mainWindow, StringComparison.Ordinal);
         Assert.Contains("Click=\"AiChatQuestionOption_Click\"", mainWindow, StringComparison.Ordinal);
         Assert.Contains("Content=\"−1 кадр\"", mainWindow, StringComparison.Ordinal);

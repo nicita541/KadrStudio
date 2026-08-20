@@ -350,6 +350,49 @@ public sealed class AgentPlanningLoopTests
         Assert.Equal(AgentToolAccess.ReadOnly, descriptor.Access);
     }
 
+    [Fact]
+    public async Task Opening_and_ending_removal_cannot_be_planned_from_timeline_structure_alone()
+    {
+        var orchestrator = new AiAgentOrchestrator();
+        orchestrator.StartTask(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            "Удали опенинг и эндинг, остальное не трогай.");
+        var registry = new AgentToolRegistry();
+        registry.Register(new CountingReadTool());
+        registry.Register(new FakeEditingTool());
+        var unsupportedPlan = AgentPlanDraft.Create(
+            "Удалить опенинг и эндинг.",
+            "Границы якобы определены по структуре таймлайна.",
+            ["Остальное не менять."],
+            [new AgentPlanStepDraft(
+                "Удалить диапазоны",
+                "Удалить начало и конец.",
+                "fake_edit",
+                [1])]);
+        var model = new ScriptedAgentModel(
+            AgentModelDecision.UseTool("inspect_counter", AgentToolJson.EmptyObject()),
+            AgentModelDecision.PublishPlan(unsupportedPlan),
+            AgentModelDecision.AskUser(
+                "Уточните границы или разрешите визуально исследовать узкие диапазоны.",
+                "Одной структуры таймлайна недостаточно."));
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var waiting = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, waiting.Phase);
+        Assert.Null(waiting.Plan);
+        Assert.Contains(loop.Observations, item => item.ErrorCode == "plan_evidence_required");
+        Assert.Contains(
+            "визуально",
+            Assert.Single(waiting.Questions.Where(item => !item.IsAnswered)).Prompt,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
     private static AiAgentOrchestrator CreateStartedTask()
     {
         var orchestrator = new AiAgentOrchestrator();

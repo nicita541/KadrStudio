@@ -76,8 +76,3 @@ public sealed record WaveformPyramid(
             minR, maxR, (float)Math.Sqrt(rmsR / peaks.Length));
     }
 }
-
-public interface IWaveformExtractor
-{
-    Task<WaveformPyramid> ExtractAsync(string path, CancellationToken cancellationToken = default);
-}

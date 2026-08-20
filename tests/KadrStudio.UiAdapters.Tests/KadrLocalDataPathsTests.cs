@@ -5,7 +5,7 @@ namespace KadrStudio.UiAdapters.Tests;
 public sealed class KadrLocalDataPathsTests
 {
     [Fact]
-    public void Workspace_root_is_used_instead_of_local_app_data()
+    public void Workspace_root_is_never_used_for_runtime_data()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -18,13 +18,15 @@ public sealed class KadrLocalDataPathsTests
             Directory.CreateDirectory(nested);
             File.WriteAllText(Path.Combine(root, "KadrStudio.sln"), string.Empty);
 
+            var localData = Path.Combine(root, "outside-workspace");
             var resolved = KadrLocalDataPaths.ResolveRoot(
                 configuredRoot: null,
                 currentDirectory: nested,
-                baseDirectory: nested);
+                baseDirectory: nested,
+                localDataDirectory: localData);
 
             Assert.Equal(
-                Path.GetFullPath(root),
+                Path.GetFullPath(Path.Combine(localData, "KadrStudio")),
                 resolved);
         }
         finally
@@ -58,7 +60,7 @@ public sealed class KadrLocalDataPathsTests
     }
 
     [Fact]
-    public void Portable_build_falls_back_to_application_directory()
+    public void Missing_local_app_data_falls_back_to_temporary_user_directory()
     {
         var portable = Path.Combine(
             Path.GetTempPath(),
@@ -68,10 +70,11 @@ public sealed class KadrLocalDataPathsTests
         var resolved = KadrLocalDataPaths.ResolveRoot(
             configuredRoot: null,
             currentDirectory: null,
-            baseDirectory: portable);
+            baseDirectory: portable,
+            localDataDirectory: null);
 
         Assert.Equal(
-            Path.GetFullPath(portable),
+            Path.GetFullPath(Path.Combine(Path.GetTempPath(), "KadrStudio", Environment.UserName)),
             resolved);
     }
 }

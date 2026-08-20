@@ -1,13 +1,12 @@
 namespace KadrStudio.Services;
 
 /// <summary>
-/// Resolves local Kadr data next to the active workspace/application instead
-/// of placing large AI data and debug logs on the system drive.
+/// Resolves mutable desktop data outside the source workspace.
 ///
 /// Resolution order:
 /// 1. KADR_STUDIO_DATA_ROOT environment override.
-/// 2. Nearest KadrStudio workspace root (KadrStudio.sln or .git).
-/// 3. Application directory for a portable build.
+/// 2. Per-user local application data.
+/// 3. A temporary per-user fallback.
 /// </summary>
 public static class KadrLocalDataPaths
 {
@@ -15,10 +14,8 @@ public static class KadrLocalDataPaths
         ResolveRoot(
             Environment.GetEnvironmentVariable("KADR_STUDIO_DATA_ROOT"),
             Directory.GetCurrentDirectory(),
-            AppContext.BaseDirectory);
-
-    public static string AiModelsRoot =>
-        EnsureDirectory(Path.Combine(Root, "AI", "models"));
+            AppContext.BaseDirectory,
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
 
     public static string AgentLogsRoot =>
         EnsureDirectory(Path.Combine(Root, "Logs", "Agent"));
@@ -26,56 +23,23 @@ public static class KadrLocalDataPaths
     public static string ResolveRoot(
         string? configuredRoot,
         string? currentDirectory,
-        string? baseDirectory)
+        string? baseDirectory,
+        string? localDataDirectory = null)
     {
         if (!string.IsNullOrWhiteSpace(configuredRoot))
         {
             return Path.GetFullPath(configuredRoot.Trim());
         }
 
-        foreach (var start in new[] { currentDirectory, baseDirectory }
-                     .Where(value => !string.IsNullOrWhiteSpace(value))
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        if (!string.IsNullOrWhiteSpace(localDataDirectory))
         {
-            var workspace = FindWorkspaceRoot(start!);
-            if (workspace is not null)
-            {
-                return workspace;
-            }
+            return Path.GetFullPath(Path.Combine(localDataDirectory, "KadrStudio"));
         }
 
-        var fallback = string.IsNullOrWhiteSpace(baseDirectory)
-            ? AppContext.BaseDirectory
-            : baseDirectory;
-
-        return Path.GetFullPath(fallback!);
-    }
-
-    private static string? FindWorkspaceRoot(string start)
-    {
-        DirectoryInfo? directory;
-
-        try
-        {
-            directory = new DirectoryInfo(Path.GetFullPath(start));
-        }
-        catch
-        {
-            return null;
-        }
-
-        for (var level = 0; directory is not null && level < 10; level++)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "KadrStudio.sln")) ||
-                Directory.Exists(Path.Combine(directory.FullName, ".git")))
-            {
-                return directory.FullName;
-            }
-
-            directory = directory.Parent;
-        }
-
-        return null;
+        return Path.GetFullPath(Path.Combine(
+            Path.GetTempPath(),
+            "KadrStudio",
+            Environment.UserName));
     }
 
     private static string EnsureDirectory(string path)

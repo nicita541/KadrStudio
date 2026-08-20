@@ -6,7 +6,7 @@ public sealed class InspectRangeTool : IAgentTool
 {
     private static readonly AgentToolDescriptor ToolDescriptor = new(
         "inspect_range",
-        "Inspect only a requested time range of media or a sequence. Use this instead of analyzing an entire file when the task only needs local context. The requested detail controls the evidence channel. Optional query tells the analysis backend what semantic question the agent is trying to answer.",
+        "Inspect only a requested time range of media or a sequence. summary returns structure only and cannot answer semantic questions. Use frames/audio/transcript/all as evidence and narrow large ranges before semantic analysis.",
         AgentToolAccess.ReadOnly,
         AgentToolJson.ParseObject(
             """
@@ -96,6 +96,12 @@ public sealed class InspectRangeTool : IAgentTool
         var detail = ParseDetail(
             AgentToolJson.OptionalString(arguments, "detail"));
         var query = AgentToolJson.OptionalString(arguments, "query") ?? string.Empty;
+        if (detail == AgentRangeInspectionDetail.Summary &&
+            !string.IsNullOrWhiteSpace(query))
+        {
+            throw new AgentToolInputException(
+                "'summary' returns structure only and cannot answer a semantic query. Narrow the range and choose frames, audio, transcript or all.");
+        }
 
         var request = new AgentRangeInspectionRequest(
             targetKind,

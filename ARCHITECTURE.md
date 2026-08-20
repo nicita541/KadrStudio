@@ -9,6 +9,7 @@ Kadr (WPF views, view-models, composition root)
   -> Kadr.Core (immutable ProjectState v4, exact time, validation)
 
 Kadr.MediaHost -> Application + Core + Infrastructure
+Kadr.AiServer -> independent HTTP inference boundary -> Ollama/backend
 ```
 
 ## Единственное состояние проекта
@@ -43,6 +44,8 @@ Recovery хранит до 20 checksum-защищённых состояний �
 
 Технический FFmpeg/Whisper-слой кэшируется независимо от игры и модели и может запускаться после импорта с фоновым приоритетом. Профильный vision-проход использует контактные листы и уточняет перспективные границы плотным FFmpeg-проходом. Один индекс можно использовать для YouTube и Shorts; 9:16 выполняется статическим crop/reframe через существующие `VideoParameters`.
 
+`KadrStudio.AiServer` — отдельный процесс/сервис и граница доверия для inference. Desktop отправляет ему только prompt/schema и подготовленные локально кадры/contact sheets; сервер не получает путь к исходному видео, `ProjectState`, файловую систему или editor tools. Модель возвращает структурированное решение, а разрешённые tool-вызовы и изменения timeline исполняются только локальным Kadr. Настоящее имя backend-модели и её model store принадлежат серверу и не выбираются desktop-клиентом.
+
 Активная последовательность зеркалируется в верхнеуровневых timeline-полях для совместимости рендера. При переключении текущий вариант сначала синхронизируется, затем live timeline атомарно заменяется снимком выбранного варианта. Исходная последовательность, принятые версии и черновики независимы и участвуют в обычных Undo/Redo, recovery и checkpoints.
 
 ## Границы ответственности
@@ -51,7 +54,8 @@ Recovery хранит до 20 checksum-защищённых состояний �
 - View не изменяет `ProjectState`; timeline interaction-controller выдаёт intents.
 - Render/cache/playback не читают WPF-модели.
 - Автоматизация работает со snapshot и возвращает proposal; stale proposal не применяется.
-- Ollama даёт смысловые названия, но frame-exact границы определяет визуальный многошаговый анализ.
+- Kadr AI Server выполняет model inference, но не редактирует проект: frame-exact анализ и разрешённые editor tools остаются на стороне desktop.
+- Desktop использует только `GET /v1/models` и `POST /v1/inference/structured`; Ollama является приватной реализацией backend и не входит во внешний контракт.
 - Recording удалён. Реализованные переходы являются типизированными сущностями, а не UI-заглушками.
 
 Эти правила закреплены `ArchitectureBoundaryTests` и `SourceArchitectureTests`. Полный gate описан в [docs/TESTING.md](docs/TESTING.md).

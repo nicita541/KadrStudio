@@ -28,7 +28,10 @@ public sealed class AgentExecutionLoop
     private string? _lastToolSignature;
     private int _consecutiveIdenticalToolCalls;
     private int _successfulVerificationReads;
+    private int _successfulEditingActions;
+    private int _prematureTerminalDecisions;
     private bool _verificationEditLogObserved;
+    private readonly List<string> _successfulEditingToolNames = [];
 
     public AgentExecutionLoop(
         AiAgentOrchestrator orchestrator,
@@ -191,8 +194,21 @@ public sealed class AgentExecutionLoop
                             break;
                         }
 
+                        if (_successfulEditingActions <= 0)
+                        {
+                            if (RejectPrematureTerminalDecision(
+                                    "Verification cannot start before at least one approved editing action succeeds.",
+                                    "successful_edit_required"))
+                            {
+                                return FailTask(
+                                    "Agent repeatedly tried to verify a draft without making any approved edit. The task was stopped instead of claiming changes that did not happen.");
+                            }
+                            break;
+                        }
+
                         _successfulVerificationReads = 0;
                         _verificationEditLogObserved = false;
+                        _prematureTerminalDecisions = 0;
                         _orchestrator.BeginVerification(
                             string.IsNullOrWhiteSpace(decision.Progress)
                                 ? "Agent started checking the finished draft."
@@ -212,21 +228,26 @@ public sealed class AgentExecutionLoop
 
                         if (!_verificationEditLogObserved)
                         {
-                            AddSyntheticObservation(
-                                "inspect_agent_edits",
-                                AgentToolResultStatus.Rejected,
-                                "Completion requires a successful inspect_agent_edits observation after the final edit.",
-                                "verification_edit_log_required");
+                            if (RejectPrematureTerminalDecision(
+                                    "Completion requires a successful inspect_agent_edits observation matching the successful editing actions.",
+                                    "verification_edit_log_required",
+                                    "inspect_agent_edits"))
+                            {
+                                return FailTask(
+                                    "Agent repeatedly tried to complete the task without a matching edit log. No unverified completion was accepted.");
+                            }
                             break;
                         }
 
                         if (_successfulVerificationReads <= 0)
                         {
-                            AddSyntheticObservation(
-                                string.Empty,
-                                AgentToolResultStatus.Rejected,
-                                "Completion requires at least one successful read-only inspection of the final draft in addition to the edit log.",
-                                "verification_observation_required");
+                            if (RejectPrematureTerminalDecision(
+                                    "Completion requires at least one successful read-only inspection of the final draft in addition to the edit log.",
+                                    "verification_observation_required"))
+                            {
+                                return FailTask(
+                                    "Agent repeatedly tried to complete the task before inspecting the final Agent Draft.");
+                            }
                             break;
                         }
 
@@ -308,6 +329,26 @@ public sealed class AgentExecutionLoop
         }
 
         var task = RequireCurrentTask();
+        if (_registry.TryGet(decision.ToolName, out var requestedTool) &&
+            requestedTool is not null &&
+            requestedTool.Descriptor.Access == AgentToolAccess.Editing)
+        {
+            var approvedActions = task.Plan?.Steps
+                .Select(step => step.ExpectedEditingTool)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Select(name => name!)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? [];
+            if (approvedActions.Count > 0 && !approvedActions.Contains(decision.ToolName))
+            {
+                AddSyntheticObservation(
+                    decision.ToolName,
+                    AgentToolResultStatus.Rejected,
+                    $"Editing action '{decision.ToolName}' is not listed in the approved machine-checkable plan.",
+                    "editing_action_not_approved");
+                return;
+            }
+        }
+
         var call = AgentToolCall.Create(
             task.Id,
             decision.ToolName,
@@ -322,6 +363,16 @@ public sealed class AgentExecutionLoop
             _nextObservationSequence++,
             result));
 
+        if (result.IsSuccess &&
+            _registry.TryGet(result.ToolName, out var executedTool) &&
+            executedTool is not null &&
+            executedTool.Descriptor.Access == AgentToolAccess.Editing)
+        {
+            _successfulEditingActions++;
+            _successfulEditingToolNames.Add(result.ToolName);
+            _prematureTerminalDecisions = 0;
+        }
+
         if (task.Phase == AgentTaskPhase.Verifying &&
             result.IsSuccess &&
             _registry.TryGet(result.ToolName, out var tool) &&
@@ -334,7 +385,15 @@ public sealed class AgentExecutionLoop
                         "inspect_agent_edits",
                         StringComparison.OrdinalIgnoreCase))
                 {
-                    _verificationEditLogObserved = true;
+                    _verificationEditLogObserved = EditLogMatchesSuccessfulActions(result);
+                    if (!_verificationEditLogObserved)
+                    {
+                        AddSyntheticObservation(
+                            result.ToolName,
+                            AgentToolResultStatus.Rejected,
+                            "The Agent Draft edit log does not match the editing actions that succeeded in this run.",
+                            "verification_edit_log_mismatch");
+                    }
                 }
                 else if (IsFinalDraftInspection(task, result))
                 {
@@ -475,7 +534,51 @@ public sealed class AgentExecutionLoop
         _lastToolSignature = null;
         _consecutiveIdenticalToolCalls = 0;
         _successfulVerificationReads = 0;
+        _successfulEditingActions = 0;
+        _prematureTerminalDecisions = 0;
         _verificationEditLogObserved = false;
+        _successfulEditingToolNames.Clear();
+    }
+
+    private bool RejectPrematureTerminalDecision(
+        string summary,
+        string errorCode,
+        string toolName = "")
+    {
+        _prematureTerminalDecisions++;
+        AddSyntheticObservation(
+            toolName,
+            AgentToolResultStatus.Rejected,
+            summary,
+            errorCode);
+        return _prematureTerminalDecisions >= _options.MaxPrematureTerminalDecisions;
+    }
+
+    private bool EditLogMatchesSuccessfulActions(AgentToolResult result)
+    {
+        if (result.Data is not { } data ||
+            data.ValueKind != JsonValueKind.Object ||
+            !data.TryGetProperty("edit_count", out var countElement) ||
+            !countElement.TryGetInt32(out var editCount) ||
+            !data.TryGetProperty("edits", out var editsElement) ||
+            editsElement.ValueKind != JsonValueKind.Array)
+        {
+            // Lightweight test backends and old persisted sessions may not expose
+            // the structured log yet; they still cannot pass without a successful edit.
+            return _successfulEditingActions > 0;
+        }
+
+        var loggedTools = editsElement.EnumerateArray()
+            .Select(edit => edit.TryGetProperty("toolName", out var toolName)
+                ? toolName.GetString()
+                : null)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .ToArray();
+        return editCount == _successfulEditingToolNames.Count &&
+               loggedTools.SequenceEqual(
+                   _successfulEditingToolNames,
+                   StringComparer.OrdinalIgnoreCase);
     }
 
     private void AddSyntheticObservation(

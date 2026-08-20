@@ -35,18 +35,6 @@ public sealed record ReplaceAiConversationCommand(AiConversation Conversation) :
     }
 }
 
-public sealed record DeleteMontagePlanCommand(Guid PlanId) : IEditCommand
-{
-    public string Description => "Удалить план ИИ-монтажа";
-
-    public ProjectState Apply(ProjectState project)
-    {
-        if (project.Sequences.Any(item => item.MontagePlanId == PlanId))
-            throw new EditRejectedException("Нельзя удалить план, пока существует связанный вариант монтажа.");
-        return project with { MontagePlans = project.MontagePlans.Where(item => item.Id != PlanId).ToImmutableArray() };
-    }
-}
-
 public sealed record UpsertSourceAnnotationCommand(SourceAnnotation Annotation) : IEditCommand
 {
     public string Description => "Изменить указание для ИИ";

@@ -176,7 +176,12 @@ public sealed class AgentPlanningLoop
                         return HandleQuestionDecision(decision);
 
                     case AgentModelActionKind.PublishPlan:
-                        return HandlePlanDecision(decision);
+                        var planState = HandlePlanDecision(decision);
+                        if (planState is not null)
+                        {
+                            return planState;
+                        }
+                        break;
 
                     default:
                         return FailTask(
@@ -277,7 +282,7 @@ public sealed class AgentPlanningLoop
                 : LimitText(decision.QuestionContext, 4_000));
     }
 
-    private AgentTaskState HandlePlanDecision(
+    private AgentTaskState? HandlePlanDecision(
         AgentModelDecision decision)
     {
         if (decision.Plan is null)
@@ -287,6 +292,16 @@ public sealed class AgentPlanningLoop
         }
 
         var task = RequireCurrentTask();
+        if (!ValidateMachineCheckablePlan(task, decision.Plan, out var validationError))
+        {
+            AddSyntheticObservation(
+                "publish_plan",
+                AgentToolResultStatus.Rejected,
+                validationError,
+                "plan_evidence_required");
+            return null;
+        }
+
         if (task.Phase == AgentTaskPhase.Investigating)
         {
             task = _orchestrator.BeginPlanning(
@@ -299,6 +314,115 @@ public sealed class AgentPlanningLoop
                 decision.Plan,
                 AgentPlanRevisionSource.Agent,
                 "Agent updated the plan from the latest user instructions and evidence.");
+    }
+
+    private bool ValidateMachineCheckablePlan(
+        AgentTaskState task,
+        AgentPlanDraft plan,
+        out string error)
+    {
+        var editingSteps = plan.Steps
+            .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
+            .ToArray();
+        if (editingSteps.Length == 0)
+        {
+            // Plans created by older persisted tasks remain readable. New model plans
+            // include these fields because the response schema requires them.
+            error = string.Empty;
+            return true;
+        }
+
+        var observations = GetObservationContext();
+        foreach (var step in editingSteps)
+        {
+            if (!_registry.TryGet(step.ExpectedEditingTool!, out var tool) ||
+                tool is null ||
+                tool.Descriptor.Access != AgentToolAccess.Editing)
+            {
+                error = $"Plan step '{step.Title}' names an unavailable editing action '{step.ExpectedEditingTool}'.";
+                return false;
+            }
+
+            if (step.EvidenceObservationSequences.IsDefaultOrEmpty)
+            {
+                error = $"Plan step '{step.Title}' has no evidence observation references.";
+                return false;
+            }
+
+            var referenced = observations
+                .Where(item => step.EvidenceObservationSequences.Contains(item.Sequence))
+                .ToArray();
+            if (referenced.Length != step.EvidenceObservationSequences.Distinct().Count() ||
+                referenced.Any(item => item.Status != AgentToolResultStatus.Succeeded))
+            {
+                error = $"Plan step '{step.Title}' references missing or unsuccessful observations.";
+                return false;
+            }
+
+            if (RequiresVisualBoundaryEvidence(task.UserRequest) &&
+                !referenced.Any(IsVisualRangeEvidence))
+            {
+                error = $"Plan step '{step.Title}' needs a successful inspect_range observation with frames/all evidence; inspect_timeline or summary is not enough to identify opening/ending boundaries.";
+                return false;
+            }
+        }
+
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool RequiresVisualBoundaryEvidence(string request)
+        => new[] { "опенинг", "эндинг", "opening", "ending", "intro", "outro" }
+            .Any(value => request.Contains(value, StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsVisualRangeEvidence(AgentModelObservation observation)
+    {
+        if (!string.Equals(observation.ToolName, "inspect_range", StringComparison.OrdinalIgnoreCase) ||
+            observation.Data is not { } data ||
+            data.ValueKind != JsonValueKind.Object ||
+            !data.TryGetProperty("detail", out var detailElement))
+        {
+            return false;
+        }
+
+        var detail = detailElement.GetString();
+        if (!string.Equals(detail, "frames", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(detail, "all", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (data.TryGetProperty("analysis_deferred", out var deferredElement) &&
+            deferredElement.ValueKind == JsonValueKind.True)
+        {
+            return false;
+        }
+
+        return HasVisualObservations(data);
+    }
+
+    private static bool HasVisualObservations(JsonElement data)
+    {
+        if (data.TryGetProperty("vision", out var vision) &&
+            vision.ValueKind == JsonValueKind.Object &&
+            vision.TryGetProperty("available", out var available) &&
+            available.ValueKind == JsonValueKind.True &&
+            vision.TryGetProperty("observations", out var observations) &&
+            observations.ValueKind == JsonValueKind.Array &&
+            observations.GetArrayLength() > 0)
+        {
+            return true;
+        }
+
+        return data.TryGetProperty("analyses", out var analyses) &&
+               analyses.ValueKind == JsonValueKind.Array &&
+               analyses.EnumerateArray().Any(item =>
+                   item.ValueKind == JsonValueKind.Object &&
+                   item.TryGetProperty("status", out var status) &&
+                   string.Equals(status.GetString(), "succeeded", StringComparison.OrdinalIgnoreCase) &&
+                   item.TryGetProperty("observation", out var nested) &&
+                   nested.ValueKind == JsonValueKind.Object &&
+                   HasVisualObservations(nested));
     }
 
     private ImmutableArray<AgentToolDescriptor> GetPlanningToolDescriptors()

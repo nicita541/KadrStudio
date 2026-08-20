@@ -788,7 +788,13 @@ public sealed class AiAgentOrchestrator
                 Guid.NewGuid(),
                 index + 1,
                 draft.Title.Trim(),
-                draft.Description.Trim()));
+                draft.Description.Trim(),
+                string.IsNullOrWhiteSpace(draft.ExpectedEditingTool)
+                    ? null
+                    : draft.ExpectedEditingTool.Trim(),
+                draft.EvidenceObservationSequences.IsDefault
+                    ? ImmutableArray<int>.Empty
+                    : draft.EvidenceObservationSequences.Distinct().ToImmutableArray()));
         }
 
         return builder.MoveToImmutable();

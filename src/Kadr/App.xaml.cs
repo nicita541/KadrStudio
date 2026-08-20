@@ -47,8 +47,7 @@ public partial class App : System.Windows.Application
                 Path.Combine(basePath, "KadrStudio.exe"),
                 Path.Combine(basePath, "tools", "ffmpeg.exe"),
                 Path.Combine(basePath, "tools", "ffprobe.exe"),
-                Path.Combine(basePath, "mediahost", "Kadr.MediaHost.exe"),
-                Path.Combine(basePath, "ai", "ollama.exe")
+                Path.Combine(basePath, "mediahost", "Kadr.MediaHost.exe")
             };
             var missing = requiredFiles.Where(path => !File.Exists(path)).ToArray();
             if (missing.Length > 0)

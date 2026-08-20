@@ -17,7 +17,6 @@ public sealed class AiChatRenderTests
             var panel = Assert.IsAssignableFrom<FrameworkElement>(window.FindName("AiChatPanel"));
             Assert.NotNull(window.FindName("AiChatMessagesListBox"));
             Assert.NotNull(window.FindName("AiChatPromptTextBox"));
-            Assert.NotNull(window.FindName("AiChatScenarioComboBox"));
 
             foreach (var dpi in new[] { 96d, 120d, 144d })
             {

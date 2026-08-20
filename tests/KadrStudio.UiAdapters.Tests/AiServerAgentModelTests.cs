@@ -11,24 +11,24 @@ using KadrStudio.Services.Agent;
 
 namespace KadrStudio.UiAdapters.Tests;
 
-public sealed class OllamaAgentModelTests
+public sealed class AiServerAgentModelTests
 {
     [Fact]
     public async Task Remote_agent_model_uses_structured_schema_and_returns_tool_action()
     {
         var handler = new AgentOllamaHandler();
-        var options = new OllamaServerOptions(
+        var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
             "agent-secret",
             "agent-model");
 
-        using var service = new OllamaVideoAnalysisService(
+        using var service = new AiVideoAnalysisService(
             new FfmpegLocator(),
             new ProcessRunner(),
             options,
             handler);
 
-        var model = new OllamaAgentModel(service);
+        var model = new AiServerAgentModel(service);
         var task = CreateTask();
         var tool = new AgentToolDescriptor(
             "inspect_project",
@@ -53,11 +53,11 @@ public sealed class OllamaAgentModelTests
             handler.ChatRequestBody,
             StringComparison.Ordinal);
         Assert.Contains(
-            "\"format\"",
+            "\"schema\"",
             handler.ChatRequestBody,
             StringComparison.Ordinal);
         Assert.Contains(
-            "\"think\":false",
+            "\"systemPrompt\"",
             handler.ChatRequestBody,
             StringComparison.Ordinal);
         Assert.Equal("Bearer", handler.LastAuthorizationScheme);
@@ -68,18 +68,18 @@ public sealed class OllamaAgentModelTests
     public async Task Remote_agent_model_sends_prior_conversation_as_context()
     {
         var handler = new AgentOllamaHandler();
-        var options = new OllamaServerOptions(
+        var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
             "agent-secret",
             "agent-model");
 
-        using var service = new OllamaVideoAnalysisService(
+        using var service = new AiVideoAnalysisService(
             new FfmpegLocator(),
             new ProcessRunner(),
             options,
             handler);
 
-        var model = new OllamaAgentModel(service);
+        var model = new AiServerAgentModel(service);
         var context = ImmutableArray.Create(
             new AgentConversationContextMessage(
                 AgentConversationRole.User,
@@ -98,16 +98,8 @@ public sealed class OllamaAgentModelTests
         using var requestDocument = JsonDocument.Parse(
             handler.ChatRequestBody);
 
-        var messages = requestDocument.RootElement
-            .GetProperty("messages");
-        var userMessage = messages.EnumerateArray()
-            .Single(message =>
-                string.Equals(
-                    message.GetProperty("role").GetString(),
-                    "user",
-                    StringComparison.Ordinal));
-        var turnPayload = userMessage
-            .GetProperty("content")
+        var turnPayload = requestDocument.RootElement
+            .GetProperty("userPrompt")
             .GetString();
 
         Assert.NotNull(turnPayload);
@@ -134,18 +126,18 @@ public sealed class OllamaAgentModelTests
             {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"Собрать безопасный черновик.","plan_summary":"Изменения будут выполнены только после утверждения.","plan_constraints":["Не менять основной таймлайн."],"plan_steps":[{"title":"Исследовать","description":"Использовать только необходимые наблюдения."},{"title":"Смонтировать","description":"Работать в отдельном Agent Draft."},{"title":"Проверить","description":"Проверить результат после монтажа."}],"completion_summary":""}
             """);
 
-        var options = new OllamaServerOptions(
+        var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
             "agent-secret",
             "agent-model");
 
-        using var service = new OllamaVideoAnalysisService(
+        using var service = new AiVideoAnalysisService(
             new FfmpegLocator(),
             new ProcessRunner(),
             options,
             handler);
 
-        var model = new OllamaAgentModel(service);
+        var model = new AiServerAgentModel(service);
         var decision = await model.DecideAsync(
             new AgentModelTurnRequest(
                 CreateTask(),
@@ -177,18 +169,18 @@ public sealed class OllamaAgentModelTests
             """
             {"action":"begin_verification","progress":"Перехожу к проверке.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":""}
             """);
-        var options = new OllamaServerOptions(
+        var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
             "agent-secret",
             "agent-model");
 
-        using var service = new OllamaVideoAnalysisService(
+        using var service = new AiVideoAnalysisService(
             new FfmpegLocator(),
             new ProcessRunner(),
             options,
             handler);
 
-        var model = new OllamaAgentModel(service);
+        var model = new AiServerAgentModel(service);
         var decision = await model.DecideAsync(
             new AgentModelTurnRequest(
                 CreateTask(),
@@ -205,16 +197,8 @@ public sealed class OllamaAgentModelTests
 
         using var requestDocument = JsonDocument.Parse(
             handler.ChatRequestBody);
-        var userMessage = requestDocument.RootElement
-            .GetProperty("messages")
-            .EnumerateArray()
-            .Single(message =>
-                string.Equals(
-                    message.GetProperty("role").GetString(),
-                    "user",
-                    StringComparison.Ordinal));
         using var turnDocument = JsonDocument.Parse(
-            userMessage.GetProperty("content").GetString()!);
+            requestDocument.RootElement.GetProperty("userPrompt").GetString()!);
 
         Assert.Equal(
             "execution",
@@ -230,18 +214,18 @@ public sealed class OllamaAgentModelTests
             """
             {"action":"complete_task","progress":"Проверка завершена.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":"Agent Draft проверен; утверждённый план выполнен."}
             """);
-        var options = new OllamaServerOptions(
+        var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
             "agent-secret",
             "agent-model");
 
-        using var service = new OllamaVideoAnalysisService(
+        using var service = new AiVideoAnalysisService(
             new FfmpegLocator(),
             new ProcessRunner(),
             options,
             handler);
 
-        var model = new OllamaAgentModel(service);
+        var model = new AiServerAgentModel(service);
         var decision = await model.DecideAsync(
             new AgentModelTurnRequest(
                 CreateTask(),
@@ -258,36 +242,6 @@ public sealed class OllamaAgentModelTests
         Assert.Equal(
             "Agent Draft проверен; утверждённый план выполнен.",
             decision.CompletionSummary);
-    }
-
-    [Fact]
-    public async Task Local_agent_model_prepares_recommended_model_before_first_turn()
-    {
-        var handler = new LocalAgentOllamaHandler();
-
-        using var service = new OllamaVideoAnalysisService(
-            new FfmpegLocator(),
-            new ProcessRunner(),
-            new OllamaServerOptions(),
-            handler);
-
-        var model = new OllamaAgentModel(service);
-        var task = CreateTask();
-
-        var decision = await model.DecideAsync(
-            new AgentModelTurnRequest(
-                task,
-                ImmutableArray<AgentToolDescriptor>.Empty,
-                ImmutableArray<AgentModelObservation>.Empty,
-                ImmutableArray<AgentConversationContextMessage>.Empty,
-                1),
-            CancellationToken.None);
-
-        Assert.Equal(AgentModelActionKind.AskUser, decision.Action);
-        Assert.Equal(1, handler.PullCount);
-        Assert.Equal(
-            OllamaVideoAnalysisService.RecommendedLocalModel,
-            handler.LastChatModel);
     }
 
     private static AgentTaskState CreateTask()
@@ -339,8 +293,8 @@ public sealed class OllamaAgentModelTests
             var path = request.RequestUri?.AbsolutePath;
             var json = path switch
             {
-                "/api/version" => "{\"version\":\"test\"}",
-                "/api/chat" => await HandleChatAsync(
+                "/health/live" => "{\"status\":\"live\"}",
+                "/v1/inference/structured" => await HandleInferenceAsync(
                     request,
                     cancellationToken),
                 _ => "{}"
@@ -355,92 +309,22 @@ public sealed class OllamaAgentModelTests
             };
         }
 
-        private async Task<string> HandleChatAsync(
+        private async Task<string> HandleInferenceAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
             ChatRequestBody = await request.Content!
                 .ReadAsStringAsync(cancellationToken);
 
-            return WrapChatContent(_responseContent);
+            return WrapInferenceContent(_responseContent);
         }
     }
 
-    private sealed class LocalAgentOllamaHandler : HttpMessageHandler
-    {
-        private bool _installed;
-
-        public int PullCount { get; private set; }
-        public string? LastChatModel { get; private set; }
-
-        protected override async Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request,
-            CancellationToken cancellationToken)
-        {
-            var path = request.RequestUri?.AbsolutePath;
-
-            if (path == "/api/pull")
-            {
-                PullCount++;
-                _installed = true;
-            }
-
-            string json;
-            switch (path)
-            {
-                case "/api/version":
-                    json = "{\"version\":\"test\"}";
-                    break;
-
-                case "/api/tags":
-                    json = _installed
-                        ? $"{{\"models\":[{{\"name\":\"{OllamaVideoAnalysisService.RecommendedLocalModel}\",\"size\":1000}}]}}"
-                        : "{\"models\":[]}";
-                    break;
-
-                case "/api/pull":
-                    json = "{\"status\":\"success\"}";
-                    break;
-
-                case "/api/chat":
-                    var body = await request.Content!
-                        .ReadAsStringAsync(cancellationToken);
-                    using (var document = JsonDocument.Parse(body))
-                    {
-                        LastChatModel = document.RootElement
-                            .GetProperty("model")
-                            .GetString();
-                    }
-
-                    json = WrapChatContent(
-                        """
-                        {"action":"ask_user","progress":"Нужно уточнение.","tool_name":"","tool_arguments":{},"question":"Какой результат считать приоритетным?","question_context":"Данных проекта недостаточно для выбора.","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":""}
-                        """);
-                    break;
-
-                default:
-                    json = "{}";
-                    break;
-            }
-
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    json,
-                    Encoding.UTF8,
-                    "application/json")
-            };
-        }
-    }
-
-    private static string WrapChatContent(string content)
+    private static string WrapInferenceContent(string content)
         => JsonSerializer.Serialize(new
         {
-            message = new
-            {
-                content
-            },
-            done_reason = "stop",
-            eval_count = 64
+            content,
+            doneReason = "stop",
+            evalCount = 64
         });
 }

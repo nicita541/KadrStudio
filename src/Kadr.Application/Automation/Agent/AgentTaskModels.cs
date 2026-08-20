@@ -44,13 +44,17 @@ public sealed record AgentQuestion(
 
 public sealed record AgentPlanStepDraft(
     string Title,
-    string Description);
+    string Description,
+    string? ExpectedEditingTool = null,
+    ImmutableArray<int> EvidenceObservationSequences = default);
 
 public sealed record AgentPlanStep(
     Guid Id,
     int Order,
     string Title,
-    string Description);
+    string Description,
+    string? ExpectedEditingTool = null,
+    ImmutableArray<int> EvidenceObservationSequences = default);
 
 public sealed record AgentPlanDraft(
     string Objective,

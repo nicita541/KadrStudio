@@ -24,7 +24,7 @@ public sealed record EditorWorkspaceServices(
     ProjectHistoryService ProjectHistoryService,
     AutoSubtitleService AutoSubtitleService,
     VideoAnalysisService VideoAnalysisService,
-    OllamaVideoAnalysisService OllamaVideoAnalysisService,
+    AiVideoAnalysisService AiVideoAnalysisService,
     BackgroundJobScheduler AutomationScheduler,
     WorkspaceSettingsService SettingsService);
 
@@ -47,7 +47,7 @@ public static class EditorWorkspaceCompositionRoot
         var export = new ExportService(ffmpeg, processes, renderCoordinator);
         var subtitles = new AutoSubtitleService(ffmpeg, processes);
         var analysis = new VideoAnalysisService(ffmpeg, processes);
-        var ollama = new OllamaVideoAnalysisService(ffmpeg, processes);
+        var aiServer = new AiVideoAnalysisService(ffmpeg, processes);
         return new EditorWorkspaceServices(
             ffmpeg,
             processes,
@@ -62,7 +62,7 @@ public static class EditorWorkspaceCompositionRoot
             new ProjectHistoryService(),
             subtitles,
             analysis,
-            ollama,
+            aiServer,
             new BackgroundJobScheduler(),
             settingsService);
     }

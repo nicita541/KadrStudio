@@ -75,13 +75,6 @@ public sealed record RefreshMediaOnlineStateCommand(IReadOnlyDictionary<Guid, bo
     };
 }
 
-public sealed record AddTrackCommand(TimelineTrack Track) : IEditCommand
-{
-    public string Description => "Добавить дорожку";
-    public ProjectState Apply(ProjectState project)
-        => project with { Tracks = project.Tracks.Add(Track) };
-}
-
 public sealed record UpdateTrackCommand(TimelineTrack Track) : IEditCommand
 {
     public string Description => "Изменить дорожку";
@@ -526,30 +519,6 @@ public sealed record RippleDeleteRangeCommand(TimeRange Range) : IEditCommand
         if (point is null || point <= range.Start) return point;
         if (point >= range.End) return point - range.Duration;
         return range.Start;
-    }
-}
-
-public sealed record LinkMediaClipsCommand(IReadOnlySet<Guid> ClipIds) : IEditCommand
-{
-    public string Description => "Связать клипы";
-    public ProjectState Apply(ProjectState project)
-    {
-        var clips = project.MediaClips.Where(item => ClipIds.Contains(item.Id)).ToArray();
-        if (clips.Length < 2 || clips.Length != ClipIds.Count)
-            throw new EditRejectedException("Для связи требуется минимум два существующих клипа.");
-        var first = clips[0];
-        if (clips.Any(item => item.Start != first.Start || item.SourceIn != first.SourceIn || item.Duration != first.Duration))
-            throw new EditRejectedException("Связываемые клипы должны иметь одинаковые временные диапазоны.");
-        var kinds = clips.Select(item => project.FindTrack(item.TrackId)!.Kind).ToArray();
-        if (kinds.Distinct().Count() != kinds.Length)
-            throw new EditRejectedException("Нельзя связать два клипа одного типа.");
-        var group = Guid.NewGuid();
-        return project with
-        {
-            MediaClips = project.MediaClips.Select(item => ClipIds.Contains(item.Id)
-                ? item with { LinkGroupId = group }
-                : item).ToImmutableArray()
-        };
     }
 }
 

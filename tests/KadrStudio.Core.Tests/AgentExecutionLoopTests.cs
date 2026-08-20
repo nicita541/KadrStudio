@@ -84,6 +84,9 @@ public sealed class AgentExecutionLoopTests
             editLogTool,
             readTool);
         var model = new QueueAgentModel(
+            AgentModelDecision.UseTool(
+                "fake_edit",
+                AgentToolJson.EmptyObject()),
             AgentModelDecision.BeginVerification(),
             AgentModelDecision.UseTool(
                 "inspect_agent_edits",
@@ -117,7 +120,7 @@ public sealed class AgentExecutionLoopTests
         Assert.Equal(
             "Исправление повторно проверено.",
             completed.CompletionSummary);
-        Assert.Equal(1, editingTool.ExecutionCount);
+        Assert.Equal(2, editingTool.ExecutionCount);
         Assert.Equal(2, editLogTool.ExecutionCount);
         Assert.Equal(2, readTool.ExecutionCount);
         Assert.Contains(
@@ -129,6 +132,9 @@ public sealed class AgentExecutionLoopTests
     public async Task Execution_question_pauses_and_answer_resumes_same_draft()
     {
         var orchestrator = CreateExecutingTask();
+        var editingTool = new CountingTool(
+            "fake_edit",
+            AgentToolAccess.Editing);
         var editLogTool = new CountingTool(
             "inspect_agent_edits",
             AgentToolAccess.ReadOnly);
@@ -136,12 +142,16 @@ public sealed class AgentExecutionLoopTests
             "inspect_timeline",
             AgentToolAccess.ReadOnly);
         var registry = CreateRegistry(
+            editingTool,
             editLogTool,
             readTool);
         var model = new QueueAgentModel(
             AgentModelDecision.AskUser(
                 "Какой из двух вариантов использовать?",
                 "Инструменты не позволяют надёжно выбрать."),
+            AgentModelDecision.UseTool(
+                "fake_edit",
+                AgentToolJson.EmptyObject()),
             AgentModelDecision.BeginVerification(),
             AgentModelDecision.UseTool(
                 "inspect_agent_edits",
@@ -184,6 +194,9 @@ public sealed class AgentExecutionLoopTests
     public async Task Verification_requires_inspection_of_the_actual_agent_draft()
     {
         var orchestrator = CreateExecutingTask();
+        var editingTool = new CountingTool(
+            "fake_edit",
+            AgentToolAccess.Editing);
         var editLogTool = new CountingTool(
             "inspect_agent_edits",
             AgentToolAccess.ReadOnly);
@@ -195,11 +208,15 @@ public sealed class AgentExecutionLoopTests
             "inspect_timeline",
             AgentToolAccess.ReadOnly);
         var registry = CreateRegistry(
+            editingTool,
             editLogTool,
             projectTool,
             sourceTimelineTool,
             draftTimelineTool);
         var model = new QueueAgentModel(
+            AgentModelDecision.UseTool(
+                "fake_edit",
+                AgentToolJson.EmptyObject()),
             AgentModelDecision.BeginVerification(),
             AgentModelDecision.UseTool(
                 "inspect_agent_edits",
@@ -258,6 +275,28 @@ public sealed class AgentExecutionLoopTests
             "approved plan",
             failed.FailureMessage ?? string.Empty,
             StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Repeated_verification_without_a_successful_edit_fails_bounded()
+    {
+        var orchestrator = CreateExecutingTask();
+        var registry = CreateRegistry(
+            new CountingTool("inspect_timeline", AgentToolAccess.ReadOnly));
+        var model = new QueueAgentModel(
+            AgentModelDecision.BeginVerification("Проверяю якобы выполненное изменение."),
+            AgentModelDecision.BeginVerification("Изменение уже сделано."));
+        var loop = new AgentExecutionLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var failed = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("without making any approved edit", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, loop.Observations.Count(item => item.ErrorCode == "successful_edit_required"));
     }
 
     private static AiAgentOrchestrator CreateExecutingTask()

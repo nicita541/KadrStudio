@@ -90,24 +90,24 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         ProjectHistoryService = services.ProjectHistoryService;
         AutoSubtitleService = services.AutoSubtitleService;
         VideoAnalysisService = services.VideoAnalysisService;
-        OllamaVideoAnalysisService = services.OllamaVideoAnalysisService;
+        AiVideoAnalysisService = services.AiVideoAnalysisService;
         _automationScheduler = services.AutomationScheduler;
         AutomationOrchestrator = new AutomationOrchestrator(
-            _automationScheduler, VideoAnalysisService, OllamaVideoAnalysisService, AutoSubtitleService);
+            _automationScheduler, VideoAnalysisService, AiVideoAnalysisService, AutoSubtitleService);
         var animeFingerprints = new AnimeFingerprintService(
             services.FfmpegLocator, services.ProcessRunner, _artifactStore);
         AiMontageAnalysisService = new AiMontageAnalysisService(
-            AutomationOrchestrator, AutoSubtitleService, OllamaVideoAnalysisService, _artifactStore, animeFingerprints);
+            AutomationOrchestrator, AutoSubtitleService, AiVideoAnalysisService, _artifactStore, animeFingerprints);
         AiMontageCoordinator = new AiMontageCoordinator(
             AiMontageAnalysisService,
-            new OllamaMontagePlanningProvider(OllamaVideoAnalysisService));
+            new AiServerMontagePlanningProvider(AiVideoAnalysisService));
 
         AgentDebugLog = new FileAgentDebugLog();
         AiAgentOrchestrator = new AiAgentOrchestrator();
         var agentRangeInspector = new AgentMediaRangeInspector(
             AutomationOrchestrator,
             AutoSubtitleService,
-            OllamaVideoAnalysisService,
+            AiVideoAnalysisService,
             _artifactStore);
         AgentReadOnlyToolBackend = new KadrAgentReadOnlyToolBackend(
             () => _editorSession.State,
@@ -122,8 +122,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AgentToolExecutor = new AgentToolExecutor(
             AgentToolRegistry,
             debugLog: AgentDebugLog);
-        AgentModel = new OllamaAgentModel(
-            OllamaVideoAnalysisService,
+        AgentModel = new AiServerAgentModel(
+            AiVideoAnalysisService,
             AgentDebugLog);
         AgentPlanningLoop = new AgentPlanningLoop(
             AiAgentOrchestrator,
@@ -167,7 +167,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public ProjectHistoryService ProjectHistoryService { get; }
     public AutoSubtitleService AutoSubtitleService { get; }
     public VideoAnalysisService VideoAnalysisService { get; }
-    public OllamaVideoAnalysisService OllamaVideoAnalysisService { get; }
+    public AiVideoAnalysisService AiVideoAnalysisService { get; }
     public AutomationOrchestrator AutomationOrchestrator { get; }
     public AiMontageAnalysisService AiMontageAnalysisService { get; }
     public IAiMontageCoordinator AiMontageCoordinator { get; }
@@ -1496,7 +1496,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         await _renderCoordinator.DisposeAsync();
         await _artifactStore.DisposeAsync();
         _projectService.Dispose();
-        OllamaVideoAnalysisService.Dispose();
+        AiVideoAnalysisService.Dispose();
     }
 
     private void BuildMediaView()

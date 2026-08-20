@@ -7,6 +7,7 @@ public sealed record AgentExecutionLoopOptions(
     int MaxConversationMessages = 48,
     int MaxConversationCharacters = 20_000,
     int MaxConsecutiveIdenticalToolCalls = 2,
+    int MaxPrematureTerminalDecisions = 2,
     int MaxProgressCharacters = 600)
 {
     public static AgentExecutionLoopOptions Default { get; } = new();
@@ -25,6 +26,8 @@ public sealed record AgentExecutionLoopOptions(
             throw new ArgumentOutOfRangeException(nameof(MaxConversationCharacters));
         if (MaxConsecutiveIdenticalToolCalls <= 0)
             throw new ArgumentOutOfRangeException(nameof(MaxConsecutiveIdenticalToolCalls));
+        if (MaxPrematureTerminalDecisions <= 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxPrematureTerminalDecisions));
         if (MaxProgressCharacters <= 0)
             throw new ArgumentOutOfRangeException(nameof(MaxProgressCharacters));
     }

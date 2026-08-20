@@ -82,29 +82,6 @@ public sealed class StereoPcmMeter
         => amplitude <= 0 ? SilenceFloorDb : Math.Max(SilenceFloorDb, 20f * MathF.Log10(amplitude));
 }
 
-public readonly record struct PreviewArtifactKey(
-    Guid ProjectId,
-    string ContentSignature,
-    TimelineTime RangeStart,
-    TimelineTime RangeDuration,
-    int Width,
-    int Height,
-    FrameRate FrameRate,
-    bool IsProxy)
-{
-    public string StableHash
-    {
-        get
-        {
-            var value = string.Join('|',
-                ProjectId.ToString("N"), ContentSignature, RangeStart.Ticks, RangeDuration.Ticks,
-                Width, Height, FrameRate.Numerator, FrameRate.Denominator, IsProxy);
-            return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(value)));
-        }
-    }
-}
-
 public interface IPreviewEngine : IAsyncDisposable
 {
     PreviewState State { get; }

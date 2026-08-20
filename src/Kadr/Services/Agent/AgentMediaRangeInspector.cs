@@ -20,7 +20,7 @@ namespace KadrStudio.Services.Agent;
 public sealed class AgentMediaRangeInspector(
     AutomationOrchestrator orchestrator,
     AutoSubtitleService subtitles,
-    OllamaVideoAnalysisService ollama,
+    AiVideoAnalysisService aiServer,
     IArtifactStore artifacts) : IAgentMediaRangeInspector
 {
     private const int CacheFormatVersion = 1;
@@ -127,7 +127,7 @@ public sealed class AgentMediaRangeInspector(
         var query = BuildQuery(request);
 
         VideoAnalysisPipelineResult? pipeline = null;
-        OllamaRangeInspection? vision = null;
+        AiRangeInspection? vision = null;
         string? visionWarning = null;
         if (request.Detail != AgentRangeInspectionDetail.Transcript)
         {
@@ -149,7 +149,7 @@ public sealed class AgentMediaRangeInspector(
                         asset,
                         pipeline.Result,
                         query,
-                        ollama.PreferredModel,
+                        aiServer.PreferredModel,
                         progress: null,
                         cancellationToken: cancellationToken,
                         priority: JobPriority.UserInitiated).ConfigureAwait(false);
@@ -233,7 +233,7 @@ public sealed class AgentMediaRangeInspector(
                 ? null
                 : new
                 {
-                    model = ollama.PreferredModel,
+                    model = aiServer.PreferredModel,
                     available = vision is not null,
                     sampling = "sparse_contact_sheets",
                     continuous_video_observed = false,
@@ -276,7 +276,7 @@ public sealed class AgentMediaRangeInspector(
     {
         var stableFingerprint = MontagePlanValidator.StableFingerprint(source);
         var modelIdentity = request.Detail is AgentRangeInspectionDetail.Frames or AgentRangeInspectionDetail.All
-            ? $"{ollama.Endpoint}|{ollama.PreferredModel}"
+            ? $"{aiServer.Endpoint}|{aiServer.PreferredModel}"
             : "no-vision";
         var transcriptIdentity = request.Detail is AgentRangeInspectionDetail.Transcript or AgentRangeInspectionDetail.All
             ? TranscriptIdentity()

@@ -10,7 +10,7 @@ namespace KadrStudio.Services;
 public sealed class AutomationOrchestrator(
     IBackgroundJobScheduler scheduler,
     VideoAnalysisService analysis,
-    OllamaVideoAnalysisService ollama,
+    AiVideoAnalysisService aiServer,
     AutoSubtitleService subtitles)
 {
     public async Task<SubtitleTranscriptionResult> TranscribeAsync(
@@ -31,7 +31,7 @@ public sealed class AutomationOrchestrator(
 
     public async Task<VideoAnalysisPipelineResult> AnalyzeAsync(
         VideoAnalysisRequest request,
-        string? ollamaModel,
+        string? aiModel,
         IProgress<VideoAnalysisProgress>? progress = null,
         CancellationToken cancellationToken = default,
         JobPriority priority = JobPriority.UserInitiated)
@@ -39,7 +39,7 @@ public sealed class AutomationOrchestrator(
         var isolatedRequest = request with { Asset = CopyAsset(request.Asset) };
         var key = JobKey.Create(
             "video-analysis", isolatedRequest.Asset.Id, Fingerprint(isolatedRequest.Asset),
-            isolatedRequest.SourceStart, isolatedRequest.SourceEnd, isolatedRequest.Query, ollamaModel);
+            isolatedRequest.SourceStart, isolatedRequest.SourceEnd, isolatedRequest.Query, aiModel);
         var job = scheduler.Schedule(new JobRequest<VideoAnalysisPipelineResult>(
             key,
             JobLane.Analysis,
@@ -48,13 +48,13 @@ public sealed class AutomationOrchestrator(
             {
                 var result = await analysis.AnalyzeAsync(isolatedRequest, progress, token).ConfigureAwait(false);
                 string? warning = null;
-                if (!string.IsNullOrWhiteSpace(ollamaModel))
+                if (!string.IsNullOrWhiteSpace(aiModel))
                 {
                     try
                     {
-                        var enhancement = await ollama.EnhanceAsync(
+                        var enhancement = await aiServer.EnhanceAsync(
                             isolatedRequest.Asset, result, isolatedRequest.Query,
-                            ollamaModel, progress, token).ConfigureAwait(false);
+                            aiModel, progress, token).ConfigureAwait(false);
                         result = MergeEnhancement(result, enhancement);
                     }
                     catch (OperationCanceledException)
@@ -151,7 +151,7 @@ public sealed class AutomationOrchestrator(
             priority,
             async token =>
             {
-                var enhancement = await ollama.EnhanceAsync(
+                var enhancement = await aiServer.EnhanceAsync(
                     snapshot, baseline, query, model, progress, token).ConfigureAwait(false);
                 var merged = MergeEnhancement(baseline, enhancement);
                 var refined = await analysis.RefineSemanticBoundariesAsync(
@@ -162,7 +162,7 @@ public sealed class AutomationOrchestrator(
         return await AwaitAsync(job, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<OllamaRangeInspection> InspectRangeAsync(
+    public async Task<AiRangeInspection> InspectRangeAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
         string query,
@@ -184,12 +184,12 @@ public sealed class AutomationOrchestrator(
             query,
             model);
 
-        var job = scheduler.Schedule(new JobRequest<OllamaRangeInspection>(
+        var job = scheduler.Schedule(new JobRequest<AiRangeInspection>(
             key,
             JobLane.Analysis,
             priority,
-            token => new ValueTask<OllamaRangeInspection>(
-                ollama.InspectRangeAsync(
+            token => new ValueTask<AiRangeInspection>(
+                aiServer.InspectRangeAsync(
                     snapshot,
                     baseline,
                     query,
@@ -203,7 +203,7 @@ public sealed class AutomationOrchestrator(
 
     private static VideoAnalysisResult MergeEnhancement(
         VideoAnalysisResult baseline,
-        OllamaAnalysisEnhancement enhancement)
+        AiAnalysisEnhancement enhancement)
     {
         var refinedKinds = enhancement.Ranges.Select(range => range.Kind).ToHashSet();
         var ranges = baseline.Ranges

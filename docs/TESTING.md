@@ -3,7 +3,7 @@
 ## Обязательный быстрый gate
 
 ```powershell
-dotnet restore KadrStudio.sln --disable-parallel
+dotnet restore KadrStudio.sln --disable-parallel -m:1 -nr:false
 dotnet build KadrStudio.sln -c Release --no-restore -m:1 -nr:false -warnaserror
 dotnet test KadrStudio.sln -c Release --no-build --no-restore -m:1 -nr:false
 ```

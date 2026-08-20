@@ -37,11 +37,7 @@ public sealed class FileAgentDebugLog : IAgentDebugLog
         try
         {
             RootDirectory = string.IsNullOrWhiteSpace(rootDirectory)
-                ? Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "KadrStudio",
-                    "Logs",
-                    "Agent")
+                ? KadrLocalDataPaths.AgentLogsRoot
                 : Path.GetFullPath(rootDirectory);
 
             Directory.CreateDirectory(RootDirectory);

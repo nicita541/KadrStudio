@@ -2086,29 +2086,11 @@ public sealed class OllamaVideoAnalysisService : IDisposable
             return Path.GetFullPath(configured);
         }
 
-        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
-        {
-            var directory = new DirectoryInfo(start);
-            for (var level = 0; directory is not null && level < 8; level++, directory = directory.Parent)
-            {
-                var candidate = Path.Combine(directory.FullName, ".ollama", "models");
-                if (Directory.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
-        }
-
-        var standardRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
-        if (Directory.Exists(standardRoot))
-            return standardRoot;
-
-        var applicationRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "KadrStudio", "AI", "models");
-        Directory.CreateDirectory(applicationRoot);
-        return applicationRoot;
+        // Kadr's bundled Ollama is intentionally portable. Do not silently
+        // place multi-gigabyte models in %LOCALAPPDATA% or %USERPROFILE%.
+        // During development this resolves to the repository root; in a
+        // standalone portable build it resolves next to KadrStudio.exe.
+        return KadrLocalDataPaths.AiModelsRoot;
     }
 
     private static string FindOllamaExecutable()

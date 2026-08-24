@@ -25,6 +25,9 @@ public sealed class InspectObjectsTool(IAgentReadOnlyToolBackend backend) : IAge
         var sequenceId = AgentToolJson.OptionalGuid(arguments, "sequence_id")
                          ?? context.DefaultReadSequenceId;
         var data = await backend.InspectObjectsAsync(context, sequenceId, ids, cancellationToken);
-        return new AgentToolExecutionOutput($"Inspected {ids.Count} timeline object id(s).", data.Clone());
+        return new AgentToolExecutionOutput(
+            $"Inspected {ids.Count} timeline object id(s).",
+            data.Clone(),
+            AgentEvidenceCapabilities.Timeline);
     }
 }

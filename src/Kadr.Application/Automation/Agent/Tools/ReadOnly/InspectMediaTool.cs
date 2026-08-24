@@ -52,6 +52,7 @@ public sealed class InspectMediaTool : IAgentTool
 
         return new AgentToolExecutionOutput(
             $"Media inspection completed for '{mediaId}'.",
-            data.Clone());
+            data.Clone(),
+            AgentEvidenceCapabilities.Project);
     }
 }

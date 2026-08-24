@@ -31,6 +31,9 @@ public sealed class InspectSequenceOverviewTool(IAgentReadOnlyToolBackend backen
             sequenceId,
             bucketCount,
             cancellationToken);
-        return new AgentToolExecutionOutput("Sequence technical overview completed.", data.Clone());
+        return new AgentToolExecutionOutput(
+            "Sequence technical overview completed.",
+            data.Clone(),
+            AgentEvidenceCapabilities.Timeline);
     }
 }

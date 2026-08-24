@@ -42,6 +42,7 @@ public sealed class InspectTimelineIntegrityTool : IAgentTool
             cancellationToken);
         return new AgentToolExecutionOutput(
             $"Timeline integrity inspection completed for sequence '{sequenceId}'.",
-            data.Clone());
+            data.Clone(),
+            AgentEvidenceCapabilities.Timeline | AgentEvidenceCapabilities.Integrity);
     }
 }

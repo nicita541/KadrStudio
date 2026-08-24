@@ -12,5 +12,6 @@ public enum AgentTaskPhase
     Verifying,
     Completed,
     Failed,
-    Stopped
+    Stopped,
+    Interrupted
 }

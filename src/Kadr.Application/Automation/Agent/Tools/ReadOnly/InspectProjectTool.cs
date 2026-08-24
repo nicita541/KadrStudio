@@ -39,6 +39,7 @@ public sealed class InspectProjectTool : IAgentTool
 
         return new AgentToolExecutionOutput(
             "Project inspection completed.",
-            data.Clone());
+            data.Clone(),
+            AgentEvidenceCapabilities.Project | AgentEvidenceCapabilities.Timeline);
     }
 }

@@ -117,7 +117,7 @@ public partial class MainWindow : Window
         AiChatMessagesListBox.ItemsSource = _aiChatRows;
         RefreshAiChatRows();
         _viewModel.PropertyChanged += ViewModel_PropertyChanged;
-        _viewModel.AiAgentOrchestrator.TaskChanged += AgentTaskChanged;
+        _viewModel.AgentWorkflow.Changed += AgentTaskChanged;
         UpdateAgentTimelineLock();
         UpdateAgentTaskControls();
 
@@ -153,6 +153,7 @@ public partial class MainWindow : Window
                 await _viewModel.OpenProjectAsync(_initialProjectPath);
                 _recentProjectsService.Add(_initialProjectPath, _viewModel.Project.Name);
                 ResetPreviewState();
+                await TryResumeRecoveredAgentAsync();
             }
             catch (Exception exception)
             {
@@ -171,6 +172,7 @@ public partial class MainWindow : Window
                 {
                     await _viewModel.RecoverAutosaveAsync(selectedRecovery);
                     ResetPreviewState();
+                    await TryResumeRecoveredAgentAsync();
                 }
                 catch (Exception exception)
                 {
@@ -246,6 +248,7 @@ public partial class MainWindow : Window
             await _viewModel.OpenProjectAsync(dialog.FileName);
             _recentProjectsService.Add(dialog.FileName, _viewModel.Project.Name);
             ResetPreviewState();
+            await TryResumeRecoveredAgentAsync();
             var missing = _viewModel.Project.Media.Where(asset => asset.IsMissing).Select(asset => asset.Name).ToList();
             if (missing.Count > 0)
             {
@@ -506,6 +509,59 @@ public partial class MainWindow : Window
         }
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
+    }
+
+    private async Task TryResumeRecoveredAgentAsync()
+    {
+        var task = _viewModel.AgentWorkflow.Current;
+        if (task?.Phase is not (
+                AgentTaskPhase.Executing or
+                AgentTaskPhase.Verifying or
+                AgentTaskPhase.Interrupted))
+        {
+            return;
+        }
+
+        var progress = new KadrStudio.Core.Domain.AiChatMessage(
+            Guid.NewGuid(),
+            KadrStudio.Core.Domain.AiChatRole.Assistant,
+            KadrStudio.Core.Domain.AiChatMessageKind.Progress,
+            task.Phase == AgentTaskPhase.Interrupted
+                ? "Проверяю состояние прерванной задачи агента…"
+                : "Восстанавливаю Agent Draft с последнего подтверждённого checkpoint…",
+            DateTimeOffset.UtcNow,
+            KadrStudio.Core.Domain.AiChatOperationState.Running,
+            10,
+            AgentTaskId: task.Id);
+        SaveAiConversation(_aiChatCoordinator.Append(
+            _viewModel.GetAiConversation(),
+            progress));
+
+        _analysisCancellation?.Cancel();
+        _analysisCancellation?.Dispose();
+        _analysisCancellation = new CancellationTokenSource();
+        SetAiChatBusy(true);
+        _agentProgressMessageId = progress.Id;
+        try
+        {
+            var state = await _viewModel.AgentWorkflow.ContinueAsync(
+                _analysisCancellation.Token);
+            PresentAgentState(progress.Id, state);
+        }
+        catch (Exception exception)
+        {
+            CompleteChatProgress(
+                progress.Id,
+                WithAgentDebugLog(exception.Message),
+                KadrStudio.Core.Domain.AiChatMessageKind.Error,
+                KadrStudio.Core.Domain.AiChatOperationState.Failed);
+        }
+        finally
+        {
+            _agentProgressMessageId = null;
+            SetAiChatBusy(false);
+            UpdateAgentTimelineLock();
+        }
     }
 
     private void RazorTool_Click(object sender, RoutedEventArgs e)
@@ -1317,7 +1373,7 @@ public partial class MainWindow : Window
         await SendAiChatMessageAsync();
     }
 
-    private void AiAgentStopTask_Click(object sender, RoutedEventArgs e)
+    private async void AiAgentStopTask_Click(object sender, RoutedEventArgs e)
     {
         if (_isAiChatBusy)
         {
@@ -1325,14 +1381,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
         if (task is null || task.IsTerminal)
         {
             UpdateAgentTaskControls();
             return;
         }
 
-        var stopped = _viewModel.StopAgentTask(
+        var stopped = await _viewModel.AgentWorkflow.StopAsync(
             "Задача отменена пользователем.");
 
         var conversation = DisableAgentPlanCards(
@@ -1377,7 +1433,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var activeTask = _viewModel.CurrentAgentTask;
+        var activeTask = _viewModel.AgentWorkflow.Current;
 
         _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
             DateTimeOffset.UtcNow,
@@ -1476,49 +1532,34 @@ public partial class MainWindow : Window
 
             if (activeTask?.Phase == AgentTaskPhase.WaitingForUserInput)
             {
-                state = _viewModel.AnswerAgentQuestion(
+                state = await _viewModel.AgentWorkflow.AnswerAsync(
                     prompt,
-                    _selectedAgentQuestionId);
+                    _selectedAgentQuestionId,
+                    token);
                 _selectedAgentQuestionId = null;
-                if (state.Phase is AgentTaskPhase.Executing or AgentTaskPhase.Verifying)
-                {
-                    await RunAgentExecutionUntilPauseAsync(
-                        progressMessage.Id,
-                        token);
-                }
-                else
-                {
-                    await RunAgentPlanningUntilPauseAsync(
-                        progressMessage.Id,
-                        token);
-                }
+                PresentAgentState(progressMessage.Id, state);
             }
             else if (activeTask?.Phase is
                      AgentTaskPhase.WaitingForApproval or
                      AgentTaskPhase.Approved)
             {
-                _viewModel.BeginAgentPlanRevision();
-                await RunAgentPlanningUntilPauseAsync(
-                    progressMessage.Id,
-                    token);
+                state = await _viewModel.AgentWorkflow.RequestRevisionAsync(token);
+                PresentAgentState(progressMessage.Id, state);
             }
             else
             {
-                state = _viewModel.StartAgentTask(prompt);
+                state = await _viewModel.AgentWorkflow.StartAsync(prompt, token);
                 ReplaceMessageAgentTaskId(progressMessage.Id, state.Id);
                 ReplaceMessageAgentTaskId(userMessage.Id, state.Id);
-
-                await RunAgentPlanningUntilPauseAsync(
-                    progressMessage.Id,
-                    token);
+                PresentAgentState(progressMessage.Id, state);
             }
         }
         catch (OperationCanceledException)
         {
-            var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
             if (task is { IsTerminal: false })
             {
-                task = _viewModel.StopAgentTask(
+                task = await _viewModel.AgentWorkflow.StopAsync(
                     "Задача остановлена пользователем.");
             }
 
@@ -1539,7 +1580,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
-            var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
 
             _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
@@ -1552,7 +1593,7 @@ public partial class MainWindow : Window
 
             if (task is { IsTerminal: false })
             {
-                task = _viewModel.AiAgentOrchestrator.Fail(exception.Message);
+                task = await _viewModel.AgentWorkflow.FailAsync(exception.Message);
             }
 
             CompleteChatProgress(
@@ -1577,12 +1618,10 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunAgentPlanningUntilPauseAsync(
+    private void PresentAgentState(
         Guid progressMessageId,
-        CancellationToken token)
+        AgentTaskState state)
     {
-        var state = await _viewModel.AgentPlanningLoop.RunUntilPauseAsync(token);
-        _viewModel.PersistAgentTaskState(state);
 
         switch (state.Phase)
         {
@@ -1610,6 +1649,12 @@ public partial class MainWindow : Window
                     state.CompletionSummary ?? "Ответ подготовлен по данным проекта.",
                     KadrStudio.Core.Domain.AiChatMessageKind.Text,
                     KadrStudio.Core.Domain.AiChatOperationState.Completed);
+                if (state.DraftSequenceId is not null)
+                {
+                    AppendAgentDraftMessage(
+                        state,
+                        state.CompletionSummary ?? "Agent Draft выполнен и проверен.");
+                }
                 break;
 
             case AgentTaskPhase.Failed:
@@ -1619,6 +1664,10 @@ public partial class MainWindow : Window
                         state.FailureMessage ?? "Агент не смог подготовить план."),
                     KadrStudio.Core.Domain.AiChatMessageKind.Error,
                     KadrStudio.Core.Domain.AiChatOperationState.Failed);
+                if (state.DraftSequenceId is not null)
+                {
+                    AppendAgentDraftMessage(state, "Сохранён последний целостный Agent Draft после ошибки.");
+                }
                 break;
 
             case AgentTaskPhase.Stopped:
@@ -1627,65 +1676,21 @@ public partial class MainWindow : Window
                     "Задача остановлена.",
                     KadrStudio.Core.Domain.AiChatMessageKind.Text,
                     KadrStudio.Core.Domain.AiChatOperationState.Cancelled);
-                break;
-        }
-    }
-
-    private async Task RunAgentExecutionUntilPauseAsync(
-        Guid progressMessageId,
-        CancellationToken token)
-    {
-        var state = await _viewModel.AgentExecutionLoop.RunUntilPauseAsync(token);
-        _viewModel.PersistAgentTaskState(state);
-
-        switch (state.Phase)
-        {
-            case AgentTaskPhase.WaitingForUserInput:
-                CompleteChatProgress(
-                    progressMessageId,
-                    "Агент приостановил монтаж и ждёт вашего ответа.",
-                    KadrStudio.Core.Domain.AiChatMessageKind.Text,
-                    KadrStudio.Core.Domain.AiChatOperationState.Completed);
-                AppendAgentQuestion(state);
-                break;
-
-            case AgentTaskPhase.Completed:
-                CompleteChatProgress(
-                    progressMessageId,
-                    "Монтаж выполнен и проверен.",
-                    KadrStudio.Core.Domain.AiChatMessageKind.Text,
-                    KadrStudio.Core.Domain.AiChatOperationState.Completed);
-                AppendAgentDraftMessage(
-                    state,
-                    state.CompletionSummary ?? "Agent Draft выполнен и проверен.");
-                break;
-
-            case AgentTaskPhase.Failed:
-                CompleteChatProgress(
-                    progressMessageId,
-                    WithAgentDebugLog(
-                        state.FailureMessage ?? "Агент остановился из-за ошибки."),
-                    KadrStudio.Core.Domain.AiChatMessageKind.Error,
-                    KadrStudio.Core.Domain.AiChatOperationState.Failed);
                 if (state.DraftSequenceId is not null)
                 {
-                    AppendAgentDraftMessage(
-                        state,
-                        "Сохранён последний целостный Agent Draft после ошибки.");
+                    AppendAgentDraftMessage(state, "Сохранён последний целостный Agent Draft.");
                 }
                 break;
 
-            case AgentTaskPhase.Stopped:
+            case AgentTaskPhase.Interrupted:
                 CompleteChatProgress(
                     progressMessageId,
-                    "Агент остановлен. Черновик сохранён.",
-                    KadrStudio.Core.Domain.AiChatMessageKind.Text,
-                    KadrStudio.Core.Domain.AiChatOperationState.Cancelled);
+                    state.FailureMessage ?? "Задача агента была безопасно прервана; Agent Draft сохранён.",
+                    KadrStudio.Core.Domain.AiChatMessageKind.Error,
+                    KadrStudio.Core.Domain.AiChatOperationState.Interrupted);
                 if (state.DraftSequenceId is not null)
                 {
-                    AppendAgentDraftMessage(
-                        state,
-                        "Сохранён последний целостный Agent Draft.");
+                    AppendAgentDraftMessage(state, "Прерванный Agent Draft сохранён без повторного выполнения шагов.");
                 }
                 break;
         }
@@ -1939,7 +1944,7 @@ public partial class MainWindow : Window
             ProgressPercent = 100
         }));
 
-        var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
         _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(
             DateTimeOffset.UtcNow,
             "chat_ui",
@@ -1960,7 +1965,7 @@ public partial class MainWindow : Window
 
     private void UpdateAgentTaskControls()
     {
-        var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
         AiAgentStopTaskButton.Visibility =
             !_isAiChatBusy &&
             task is { IsTerminal: false }
@@ -2069,7 +2074,7 @@ public partial class MainWindow : Window
                 message.AgentPlanVersion is { } planVersion &&
                 message.PlanSnapshot?.CanCreateDraft == true)
             {
-                var currentTask = _viewModel.CurrentAgentTask;
+                var currentTask = _viewModel.AgentWorkflow.Current;
                 var canExecute =
                     currentTask?.Id == taskId &&
                     currentTask.Phase == AgentTaskPhase.WaitingForApproval &&
@@ -2087,7 +2092,7 @@ public partial class MainWindow : Window
                 }
             }
 
-            var currentAgentTask = _viewModel.CurrentAgentTask;
+            var currentAgentTask = _viewModel.AgentWorkflow.Current;
             var canRetryFailedPlanning =
                 displayMessage.Kind == KadrStudio.Core.Domain.AiChatMessageKind.Error &&
                 displayMessage.AgentTaskId is { } failedTaskId &&
@@ -2119,7 +2124,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
         if (task is null || task.Phase != AgentTaskPhase.Failed || task.DraftSequenceId is not null)
         {
             AppendAiChatError("Безопасный повтор доступен только для подготовки плана до создания Agent Draft.");
@@ -2148,8 +2153,9 @@ public partial class MainWindow : Window
 
         try
         {
-            _viewModel.RetryFailedAgentPlanning();
-            await RunAgentPlanningUntilPauseAsync(messageId, _analysisCancellation.Token);
+            var retried = await _viewModel.AgentWorkflow.RetryAsync(
+                _analysisCancellation.Token);
+            PresentAgentState(messageId, retried);
         }
         catch (OperationCanceledException)
         {
@@ -2161,10 +2167,10 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
-            var current = _viewModel.CurrentAgentTask;
+            var current = _viewModel.AgentWorkflow.Current;
             if (current is { IsTerminal: false })
             {
-                _viewModel.AiAgentOrchestrator.Fail(exception.Message);
+                await _viewModel.AgentWorkflow.FailAsync(exception.Message);
             }
             CompleteChatProgress(
                 messageId,
@@ -2353,7 +2359,7 @@ public partial class MainWindow : Window
     private async Task ExecuteAgentPlanAsync(
         KadrStudio.Core.Domain.AiChatMessage planMessage)
     {
-        var task = _viewModel.CurrentAgentTask
+        var task = _viewModel.AgentWorkflow.Current
             ?? throw new InvalidOperationException(
                 "Активная задача агента не найдена.");
 
@@ -2394,25 +2400,28 @@ public partial class MainWindow : Window
 
         try
         {
-            var draft = _viewModel.ApproveAgentPlanAndCreateDraft();
+            var state = await _viewModel.AgentWorkflow.ApproveAsync(token);
+            var draft = state.DraftSequenceId is { } draftId
+                ? _viewModel.CoreState.FindSequence(draftId)
+                : null;
             ResetPreviewState();
             TimelineEditor.InvalidateVisual();
 
-            UpdateChatProgress(
-                progressMessage.Id,
-                0.7,
-                $"Agent Draft «{draft.Name}» открыт. Агент выполняет план…");
-
-            await RunAgentExecutionUntilPauseAsync(
-                progressMessage.Id,
-                token);
+            if (draft is not null)
+            {
+                UpdateChatProgress(
+                    progressMessage.Id,
+                    0.9,
+                    $"Agent Draft «{draft.Name}» создан; проверяю результат…");
+            }
+            PresentAgentState(progressMessage.Id, state);
         }
         catch (OperationCanceledException)
         {
-            var current = _viewModel.CurrentAgentTask;
+            var current = _viewModel.AgentWorkflow.Current;
             if (current is { IsTerminal: false })
             {
-                current = _viewModel.StopAgentTask(
+                current = await _viewModel.AgentWorkflow.StopAsync(
                     "Выполнение остановлено пользователем.");
             }
 
@@ -2431,11 +2440,11 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
-            var current = _viewModel.CurrentAgentTask;
+            var current = _viewModel.AgentWorkflow.Current;
             if (current is { IsTerminal: false } &&
                 current.Phase != AgentTaskPhase.WaitingForApproval)
             {
-                current = _viewModel.AiAgentOrchestrator.Fail(exception.Message);
+                current = await _viewModel.AgentWorkflow.FailAsync(exception.Message);
             }
 
             CompleteChatProgress(
@@ -2523,7 +2532,7 @@ public partial class MainWindow : Window
 
     private void AppendAiChatError(string text)
     {
-        var task = _viewModel.CurrentAgentTask;
+        var task = _viewModel.AgentWorkflow.Current;
         var displayText = WithAgentDebugLog(text);
 
         _viewModel.AgentDebugLog.Write(new AgentDebugLogEntry(

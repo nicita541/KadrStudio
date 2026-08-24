@@ -165,7 +165,6 @@ public sealed class AutomationOrchestrator(
     public async Task<AiRangeInspection> InspectRangeAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
-        string query,
         string model,
         IProgress<VideoAnalysisProgress>? progress = null,
         CancellationToken cancellationToken = default,
@@ -181,7 +180,6 @@ public sealed class AutomationOrchestrator(
             Fingerprint(snapshot),
             baseline.SourceStart,
             baseline.SourceEnd,
-            query,
             model);
 
         var job = scheduler.Schedule(new JobRequest<AiRangeInspection>(
@@ -192,7 +190,6 @@ public sealed class AutomationOrchestrator(
                 aiServer.InspectRangeAsync(
                     snapshot,
                     baseline,
-                    query,
                     model,
                     progress,
                     token)),

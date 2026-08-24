@@ -49,6 +49,9 @@ public sealed class CompareMediaRangesTool(IAgentReadOnlyToolBackend backend) : 
             ? AgentToolJson.RequireFiniteDouble(arguments, "minimum_similarity", 0)
             : 0;
         var data = await backend.CompareMediaRangesAsync(context, samples, threshold, cancellationToken);
-        return new AgentToolExecutionOutput($"Compared {samples.Length} media ranges.", data.Clone());
+        return new AgentToolExecutionOutput(
+            $"Compared {samples.Length} media ranges.",
+            data.Clone(),
+            AgentEvidenceCapabilities.Comparison);
     }
 }

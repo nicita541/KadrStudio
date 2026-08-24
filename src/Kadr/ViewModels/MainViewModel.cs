@@ -9,6 +9,10 @@ using KadrStudio.Application.Editing;
 using KadrStudio.Application.Automation;
 using KadrStudio.Application.Automation.Agent;
 using KadrStudio.Application.Automation.Agent.Diagnostics;
+using KadrStudio.Application.Automation.Agent.Execution;
+using KadrStudio.Application.Automation.Agent.Persistence;
+using KadrStudio.Application.Automation.Agent.Recovery;
+using KadrStudio.Application.Automation.Agent.Workflow;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.Editing;
@@ -131,6 +135,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AgentEditingToolBackend = new KadrAgentEditingToolBackend(
             () => _editorSession.State,
             ExecuteAgentCoreCommand);
+        AgentCheckpointStore = new KadrAgentCheckpointStore(
+            () => _editorSession.State,
+            ExecuteAgentCoreCommand);
+        AgentRecoveryService = new AgentRecoveryService(AgentCheckpointStore);
         AgentEditingToolSet.RegisterDefaults(
             AgentToolRegistry,
             AgentEditingToolBackend);
@@ -151,10 +159,25 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             AiAgentOrchestrator,
             AgentToolRegistry,
             AgentToolExecutor,
-            AgentModel,
-            conversationProvider: BuildAgentConversationContext,
+            AgentModel as IAgentVerificationReporter,
             seedObservationProvider: () => AgentPlanningLoop.Observations,
+            checkpointStore: AgentCheckpointStore,
             debugLog: AgentDebugLog);
+        AgentWorkflow = new AgentWorkflowService(
+            AiAgentOrchestrator,
+            AgentPlanningLoop,
+            AgentExecutionLoop,
+            StartAgentTask,
+            (answer, questionId) => AnswerAgentQuestion(answer, questionId),
+            BeginAgentPlanRevision,
+            () =>
+            {
+                ApproveAgentPlanAndCreateDraft();
+                return CurrentAgentTask!;
+            },
+            RetryFailedAgentPlanning,
+            StopAgentTask,
+            PersistAgentTaskState);
         AiAgentOrchestrator.TaskChanged += (_, args) =>
         {
             AgentDebugLog.Write(new AgentDebugLogEntry(
@@ -187,6 +210,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public AiMontageAnalysisService AiMontageAnalysisService { get; }
     public IAiMontageCoordinator AiMontageCoordinator { get; }
     public IAgentDebugLog AgentDebugLog { get; }
+    public IAgentCheckpointStore AgentCheckpointStore { get; }
+    public AgentRecoveryService AgentRecoveryService { get; }
+    public IAgentWorkflowService AgentWorkflow { get; }
     public string? AgentDebugLogPath => AgentDebugLog.CurrentLogPath;
     public AiAgentOrchestrator AiAgentOrchestrator { get; }
     public KadrAgentReadOnlyToolBackend AgentReadOnlyToolBackend { get; }
@@ -847,52 +873,17 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public void PersistAgentTaskState(AgentTaskState task)
     {
         ArgumentNullException.ThrowIfNull(task);
-        var normalizedPlan = task.Plan is null
-            ? null
-            : task.Plan with
-            {
-                Constraints = task.Plan.Constraints.IsDefault ? [] : task.Plan.Constraints,
-                Steps = task.Plan.Steps.Select(step => step with
-                {
-                    EvidenceObservationSequences = step.EvidenceObservationSequences.IsDefault
-                        ? []
-                        : step.EvidenceObservationSequences,
-                    ProtectedInvariants = step.ProtectedInvariants.IsDefault
-                        ? []
-                        : step.ProtectedInvariants,
-                    VerificationChecks = step.VerificationChecks.IsDefault
-                        ? []
-                        : step.VerificationChecks
-                }).ToImmutableArray()
-            };
-        var normalized = task with
-        {
-            Brief = task.Brief is null
-                ? null
-                : AgentTaskBrief.Create(
-                    task.Brief.Kind,
-                    task.Brief.Goal,
-                    task.Brief.Scope,
-                    task.Brief.ProtectedElements.IsDefault ? [] : task.Brief.ProtectedElements,
-                    task.Brief.Constraints.IsDefault ? [] : task.Brief.Constraints,
-                    task.Brief.AcceptanceCriteria.IsDefault ? [] : task.Brief.AcceptanceCriteria,
-                    task.Brief.Assumptions.IsDefault ? [] : task.Brief.Assumptions,
-                    task.Brief.MissingInformation.IsDefault ? [] : task.Brief.MissingInformation),
-            Plan = normalizedPlan,
-            Questions = task.Questions.IsDefault
-                ? []
-                : task.Questions.Select(question => question with
-                {
-                    Options = question.AvailableOptions
-                }).ToImmutableArray(),
-            Journal = task.Journal.IsDefault ? [] : task.Journal,
-            EvidenceLedger = task.Evidence.Select(evidence => evidence with
-            {
-                Facts = evidence.Facts.IsDefault ? [] : evidence.Facts
-            }).ToImmutableArray()
-        };
-        var payload = JsonSerializer.Serialize(normalized);
-        var conversation = GetAiConversation();
+        SaveAiConversation(BuildConversationWithAgentTask(
+            GetAiConversation(),
+            task));
+    }
+
+    private static KadrStudio.Core.Domain.AiConversation BuildConversationWithAgentTask(
+        KadrStudio.Core.Domain.AiConversation conversation,
+        AgentTaskState task)
+    {
+        var payload = JsonSerializer.Serialize(
+            AgentTaskPersistenceEnvelope.Create(task));
         var existing = conversation.Messages.LastOrDefault(message =>
             message.Kind == KadrStudio.Core.Domain.AiChatMessageKind.AgentMemory &&
             message.AgentTaskId == task.Id);
@@ -905,7 +896,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 DateTimeOffset.UtcNow,
                 AgentTaskId: task.Id)
             : existing with { Text = payload };
-        SaveAiConversation(existing is null
+        return existing is null
             ? conversation with
             {
                 Messages = conversation.Messages.Add(memory),
@@ -915,7 +906,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             {
                 Messages = conversation.Messages.Replace(existing, memory),
                 UpdatedAt = DateTimeOffset.UtcNow
-            });
+            };
     }
 
     public AgentTaskState StartAgentTask(string userRequest)
@@ -1042,20 +1033,34 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             Revision = 0,
             Status = KadrStudio.Core.Domain.SequenceStatus.Draft,
             ParentSequenceId = source.Id,
-            MontagePlanId = null
+            MontagePlanId = null,
+            AgentCheckpoint = new KadrStudio.Core.Domain.AgentDraftCheckpoint(
+                approved.Id,
+                plan.Id,
+                plan.Version,
+                AgentPlanFingerprint.Create(plan),
+                source.Id,
+                source.Revision,
+                KadrStudio.Core.Domain.AgentDraftExecutionStatus.Executing,
+                [],
+                DateTimeOffset.UtcNow)
         };
 
-        AgentEditingToolBackend.Reset(approved.Id);
+        var executing = AiAgentOrchestrator.BeginExecution(draft.Id);
+        var conversation = BuildConversationWithAgentTask(
+            GetAiConversation(),
+            executing);
 
-        if (!ExecuteAgentCoreCommand(
-                "Agent Draft создан",
-                new CreateSequenceCommand(draft, Activate: true)))
+        if (!ExecuteAgentCoreTransaction(
+                "Agent Draft создан и checkpoint сохранён",
+                new CreateSequenceCommand(draft, Activate: true),
+                new ReplaceAiConversationCommand(conversation)))
         {
+            AiAgentOrchestrator.Fail(
+                "Не удалось атомарно создать Agent Draft и сохранить checkpoint.");
             throw new InvalidOperationException(
                 "Не удалось создать отдельный Agent Draft.");
         }
-
-        var executing = AiAgentOrchestrator.BeginExecution(draft.Id);
         StatusText = "Агент выполняет утверждённый план в отдельном черновике";
         OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
         OnPropertyChanged(nameof(CurrentAgentTask));
@@ -1071,12 +1076,19 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             ?? throw new AgentTaskTransitionException(
                 "Нет активной задачи агента.");
 
-        return task.IsTerminal
+        var stopped = task.IsTerminal
             ? task
             : AiAgentOrchestrator.Stop(
                 string.IsNullOrWhiteSpace(reason)
                     ? "Задача остановлена пользователем."
                     : reason);
+        if (stopped.DraftSequenceId is not null)
+        {
+            AgentCheckpointStore.SetStatus(
+                stopped,
+                KadrStudio.Core.Domain.AgentDraftExecutionStatus.Interrupted);
+        }
+        return stopped;
     }
 
     public AgentTaskState RetryFailedAgentPlanning()
@@ -1887,17 +1899,29 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
         try
         {
-            var task = JsonSerializer.Deserialize<AgentTaskState>(memory.Text);
+            AgentTaskState? task;
+            var formatVersion = 1;
+            try
+            {
+                var envelope = JsonSerializer.Deserialize<AgentTaskPersistenceEnvelope>(memory.Text);
+                task = envelope?.Task;
+                if (task is not null)
+                {
+                    formatVersion = envelope!.FormatVersion;
+                }
+            }
+            catch (JsonException)
+            {
+                task = null;
+            }
+            task ??= JsonSerializer.Deserialize<AgentTaskState>(memory.Text);
             if (task is null || task.ProjectId != _editorSession.State.Id)
             {
                 return;
             }
 
+            task = AgentRecoveryService.Reconcile(task, formatVersion);
             AiAgentOrchestrator.RestoreTask(task);
-            if (task.DraftSequenceId is not null)
-            {
-                AgentEditingToolBackend.Reset(task.Id);
-            }
         }
         catch (Exception exception) when (
             exception is JsonException or AgentTaskTransitionException or ArgumentException)
@@ -1908,6 +1932,27 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 "restore_failed",
                 Message: exception.Message,
                 Exception: exception.ToString()));
+        }
+    }
+
+    private bool ExecuteAgentCoreTransaction(
+        string description,
+        params IEditCommand[] commands)
+    {
+        _agentMutationDepth++;
+        try
+        {
+            var result = _editorSession.Execute(new EditTransaction(
+                description,
+                commands));
+            if (!result.Changed) return false;
+            RestoreFromCoreState(result.State, null, description);
+            StatusText = description;
+            return true;
+        }
+        finally
+        {
+            _agentMutationDepth--;
         }
     }
 

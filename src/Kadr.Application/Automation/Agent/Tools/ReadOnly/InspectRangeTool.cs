@@ -6,7 +6,7 @@ public sealed class InspectRangeTool : IAgentTool
 {
     private static readonly AgentToolDescriptor ToolDescriptor = new(
         "inspect_range",
-        "Inspect only a requested time range of media or a sequence. summary returns structure only and cannot answer semantic questions. Use frames/audio/transcript/all as evidence and narrow large ranges before semantic analysis.",
+        "Inspect only a requested time range of media or a sequence. Sensors return neutral frame, audio and transcript facts; the planner alone interprets them. summary returns structure only. Narrow large ranges before semantic analysis.",
         AgentToolAccess.ReadOnly,
         AgentToolJson.ParseObject(
             """
@@ -37,7 +37,7 @@ public sealed class InspectRangeTool : IAgentTool
                 "query": {
                   "type": "string",
                   "maxLength": 2000,
-                  "description": "Optional semantic question for this exact range. Keep it task-specific and concise."
+                  "description": "Optional planner note about why this exact range was requested. It is retained as provenance but is not shown to neutral sensors. Omit for summary."
                 }
               },
               "required": [
@@ -102,7 +102,6 @@ public sealed class InspectRangeTool : IAgentTool
             throw new AgentToolInputException(
                 "'summary' returns structure only and cannot answer a semantic query. Narrow the range and choose frames, audio, transcript or all.");
         }
-
         var request = new AgentRangeInspectionRequest(
             targetKind,
             targetId,
@@ -116,9 +115,12 @@ public sealed class InspectRangeTool : IAgentTool
             request,
             cancellationToken);
 
+        var prefix =
+            $"Range inspection completed for {targetKind.ToString().ToLowerInvariant()} '{targetId}' from {startSeconds:0.###}s to {endSeconds:0.###}s.";
         return new AgentToolExecutionOutput(
-            $"Range inspection completed for {targetKind.ToString().ToLowerInvariant()} '{targetId}' from {startSeconds:0.###}s to {endSeconds:0.###}s.",
-            data.Clone());
+            AgentRangeEvidenceSummary.Build(prefix, data),
+            data.Clone(),
+            AgentRangeEvidenceCapabilities.From(detail, data));
     }
 
     private static AgentRangeTargetKind ParseTargetKind(string value)

@@ -4,7 +4,7 @@ Ledger закрывается только вместе с зелёным releas
 
 ## Закрытые системные дефекты
 
-- [x] `ProjectState v3` — единственное live-состояние; старая `EditorProject` и JSON undo bridge удалены.
+- [x] Immutable `ProjectState` — единственное live-состояние; старая `EditorProject` и JSON undo bridge удалены.
 - [x] Fractional FPS, VFR metadata, track ID/order/name/mute/lock/visibility сохраняются без потерь.
 - [x] Все clip/text/marker/In-Out/track/transition изменения выполняются командами и поддерживают undo/redo.
 - [x] Preview/export используют один `RenderGraph`; V/A/Overlay подписи и поколения независимы.

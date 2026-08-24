@@ -7,7 +7,10 @@ public sealed record AgentPlanningLoopOptions(
     int MaxConversationMessages = 40,
     int MaxConversationCharacters = 16_000,
     int MaxConsecutiveIdenticalToolCalls = 2,
-    int MaxProgressCharacters = 600)
+    int MaxEquivalentBoundaryInspections = 2,
+    int MaxProgressCharacters = 600,
+    int MaxSuccessfulInvestigationsBeforePublication = 8,
+    int MaxDiscoveryCoverageAttemptsPerWindow = 2)
 {
     public static AgentPlanningLoopOptions Default { get; } = new();
 
@@ -43,9 +46,24 @@ public sealed record AgentPlanningLoopOptions(
                 nameof(MaxConsecutiveIdenticalToolCalls),
                 "Repeated tool-call limit must be positive.");
 
+        if (MaxEquivalentBoundaryInspections <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(MaxEquivalentBoundaryInspections),
+                "Equivalent boundary-inspection limit must be positive.");
+
         if (MaxProgressCharacters <= 0)
             throw new ArgumentOutOfRangeException(
                 nameof(MaxProgressCharacters),
                 "Progress text limit must be positive.");
+
+        if (MaxSuccessfulInvestigationsBeforePublication <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(MaxSuccessfulInvestigationsBeforePublication),
+                "Investigation budget must be positive.");
+
+        if (MaxDiscoveryCoverageAttemptsPerWindow <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(MaxDiscoveryCoverageAttemptsPerWindow),
+                "Discovery coverage retry limit must be positive.");
     }
 }

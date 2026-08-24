@@ -131,7 +131,7 @@ public sealed class AgentToolExecutor
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var context = AgentToolContext.FromTask(task);
+            var context = AgentToolContext.FromTask(task, call);
             var output = await tool.ExecuteAsync(
                 context,
                 call.Arguments,
@@ -166,7 +166,8 @@ public sealed class AgentToolExecutor
                 output.Data.Clone(),
                 null,
                 startedAt,
-                _utcNow());
+                _utcNow(),
+                output.EvidenceCapabilities);
 
             LogResult(task, result);
             return result;

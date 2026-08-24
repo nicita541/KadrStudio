@@ -23,7 +23,8 @@ public sealed record AgentTaskState(
     ImmutableArray<AgentEvidenceRecord> EvidenceLedger = default)
 {
     public bool IsTerminal =>
-        Phase is AgentTaskPhase.Completed or AgentTaskPhase.Failed or AgentTaskPhase.Stopped;
+        Phase is AgentTaskPhase.Completed or AgentTaskPhase.Failed or
+            AgentTaskPhase.Stopped or AgentTaskPhase.Interrupted;
 
     public bool HasOpenQuestion =>
         Questions.Any(question => !question.IsAnswered);
@@ -36,8 +37,7 @@ public sealed record AgentTaskState(
             ? ImmutableArray<AgentEvidenceRecord>.Empty
             : EvidenceLedger;
 
-    // The future UI can bind to this property:
-    // during agent execution/verification the draft is visible, but user editing is locked.
+    // During agent execution/verification the draft is visible, but user editing is locked.
     public bool IsDraftReadOnlyForUser =>
         DraftSequenceId is not null &&
         (

@@ -133,6 +133,59 @@ public sealed class AgentToolApiTests
     }
 
     [Fact]
+    public async Task Inspect_boundary_rejects_a_coarse_window()
+    {
+        var backend = new FakeBackend();
+        var registry = AgentReadOnlyToolSet.Create(backend);
+        var executor = new AgentToolExecutor(registry);
+        var task = CreateTask();
+        var arguments = AgentToolJson.ToElement(new
+        {
+            target_kind = "sequence",
+            target_id = task.SourceSequenceId,
+            at_seconds = 120,
+            window_seconds = 60,
+            detail = "all"
+        });
+
+        var result = await executor.ExecuteAsync(
+            task,
+            AgentToolCall.Create(task.Id, "inspect_boundary", arguments));
+
+        Assert.Equal(AgentToolResultStatus.Rejected, result.Status);
+        Assert.Equal("invalid_arguments", result.ErrorCode);
+        Assert.Contains("15 seconds", result.Summary, StringComparison.Ordinal);
+        Assert.Equal(0, backend.RangeCalls);
+    }
+
+    [Fact]
+    public async Task Inspect_boundary_preserves_the_requested_coordinate_when_window_is_clamped()
+    {
+        var backend = new FakeBackend();
+        var registry = AgentReadOnlyToolSet.Create(backend);
+        var executor = new AgentToolExecutor(registry);
+        var task = CreateTask();
+        var result = await executor.ExecuteAsync(
+            task,
+            AgentToolCall.Create(
+                task.Id,
+                "inspect_boundary",
+                AgentToolJson.ToElement(new
+                {
+                    target_kind = "sequence",
+                    target_id = task.SourceSequenceId,
+                    at_seconds = 0,
+                    window_seconds = 8,
+                    detail = "frames"
+                })));
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(0, result.Data!.Value.GetProperty("boundary_at_seconds").GetDouble());
+        Assert.Equal(0, result.Data.Value.GetProperty("startSeconds").GetDouble());
+        Assert.Equal(8, result.Data.Value.GetProperty("endSeconds").GetDouble());
+    }
+
+    [Fact]
     public async Task Unknown_tool_is_rejected_without_throwing()
     {
         var registry = AgentReadOnlyToolSet.Create(new FakeBackend());

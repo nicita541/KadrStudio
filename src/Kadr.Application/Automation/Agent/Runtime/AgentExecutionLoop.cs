@@ -1,37 +1,37 @@
 using System.Collections.Immutable;
 using System.Text.Json;
 using KadrStudio.Application.Automation.Agent.Diagnostics;
+using KadrStudio.Application.Automation.Agent.Execution;
 using KadrStudio.Application.Automation.Agent.Tools;
+using KadrStudio.Application.Automation.Agent.Verification;
+using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Application.Automation.Agent.Runtime;
 
 /// <summary>
 /// Executes an already approved plan on a separate Agent Draft and then verifies
-/// that draft. The model can use only registered safe tools; the tool executor
-/// enforces draft ownership for every editing call.
+/// that draft. Editing and verification tool calls are derived deterministically
+/// from the approved plan; the model can only phrase the final report.
 /// </summary>
 public sealed class AgentExecutionLoop
 {
     private readonly AiAgentOrchestrator _orchestrator;
     private readonly AgentToolRegistry _registry;
     private readonly AgentToolExecutor _toolExecutor;
-    private readonly IAgentModel _model;
+    private readonly IAgentVerificationReporter? _reporter;
     private readonly AgentExecutionLoopOptions _options;
-    private readonly Func<ImmutableArray<AgentConversationContextMessage>> _conversationProvider;
     private readonly Func<ImmutableArray<AgentModelObservation>> _seedObservationProvider;
+    private readonly IAgentCheckpointStore? _checkpointStore;
+    private readonly ApprovedPlanRunner _approvedPlanRunner;
+    private readonly AgentVerificationEngine _verificationEngine = new();
     private readonly IAgentDebugLog _debugLog;
     private readonly SemaphoreSlim _runGate = new(1, 1);
 
     private readonly List<AgentModelObservation> _observations = [];
     private Guid? _memoryTaskId;
     private int _nextObservationSequence = 1;
-    private string? _lastToolSignature;
-    private int _consecutiveIdenticalToolCalls;
-    private int _successfulVerificationReads;
     private int _successfulEditingActions;
-    private int _prematureTerminalDecisions;
     private bool _verificationEditLogObserved;
-    private bool _verificationIntegrityObserved;
     private readonly List<string> _successfulEditingToolNames = [];
     private readonly HashSet<Guid> _executedPlanStepIds = [];
 
@@ -39,21 +39,24 @@ public sealed class AgentExecutionLoop
         AiAgentOrchestrator orchestrator,
         AgentToolRegistry registry,
         AgentToolExecutor toolExecutor,
-        IAgentModel model,
+        IAgentVerificationReporter? reporter,
         AgentExecutionLoopOptions? options = null,
-        Func<ImmutableArray<AgentConversationContextMessage>>? conversationProvider = null,
         Func<ImmutableArray<AgentModelObservation>>? seedObservationProvider = null,
+        IAgentCheckpointStore? checkpointStore = null,
         IAgentDebugLog? debugLog = null)
     {
         _orchestrator = orchestrator ?? throw new ArgumentNullException(nameof(orchestrator));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _toolExecutor = toolExecutor ?? throw new ArgumentNullException(nameof(toolExecutor));
-        _model = model ?? throw new ArgumentNullException(nameof(model));
+        _reporter = reporter;
         _options = options ?? AgentExecutionLoopOptions.Default;
-        _conversationProvider =
-            conversationProvider ?? (() => ImmutableArray<AgentConversationContextMessage>.Empty);
         _seedObservationProvider =
             seedObservationProvider ?? (() => ImmutableArray<AgentModelObservation>.Empty);
+        _checkpointStore = checkpointStore;
+        _approvedPlanRunner = new ApprovedPlanRunner(
+            _orchestrator,
+            _registry,
+            _toolExecutor);
         _debugLog = debugLog ?? NullAgentDebugLog.Instance;
         _options.Validate();
     }
@@ -97,249 +100,75 @@ public sealed class AgentExecutionLoop
                     "Execution loop requires an executing or verifying Agent Draft.");
             }
 
-            if (task.Phase == AgentTaskPhase.Executing &&
-                HasDeterministicEditingPlan(task))
+            if (!HasDeterministicEditingPlan(task))
             {
-                var executionError = await ExecuteApprovedPlanAsync(
+                return FailTask(
+                    "Approved plan has no complete deterministic editing actions.");
+            }
+
+            RestoreCommittedSteps(task);
+            if (task.Phase == AgentTaskPhase.Executing)
+            {
+                var execution = await _approvedPlanRunner.RunAsync(
                     task,
+                    _executedPlanStepIds,
                     cancellationToken).ConfigureAwait(false);
-                if (executionError is not null)
+                foreach (var result in execution.Results)
                 {
-                    return FailTask(executionError);
+                    AddObservation(AgentModelObservation.FromResult(
+                        _nextObservationSequence++,
+                        result));
+                    if (result.IsSuccess)
+                    {
+                        _successfulEditingActions++;
+                        _successfulEditingToolNames.Add(result.ToolName);
+                    }
+                }
+                foreach (var stepId in execution.CompletedStepIds)
+                {
+                    _executedPlanStepIds.Add(stepId);
+                }
+                if (!execution.IsSuccess)
+                {
+                    return FailTask(execution.Error!);
                 }
 
-                _successfulVerificationReads = 0;
                 _verificationEditLogObserved = false;
-                _verificationIntegrityObserved = false;
-                _prematureTerminalDecisions = 0;
                 task = _orchestrator.BeginVerification(
                     "Утверждённые действия выполнены один раз; запускаю обязательную проверку.");
-
-                var verificationError = await RunAutomaticVerificationAsync(
-                    task,
-                    cancellationToken).ConfigureAwait(false);
-                if (verificationError is not null)
-                {
-                    return FailTask(verificationError);
-                }
-
-                var report = await BuildVerificationReportAsync(
-                    task,
-                    cancellationToken).ConfigureAwait(false);
-                if (!report.Accepted)
-                {
-                    var issues = report.Issues.IsDefaultOrEmpty
-                        ? report.Summary
-                        : string.Join(" ", report.Issues);
-                    return FailTask($"Проверка Agent Draft не принята: {issues}");
-                }
-
-                return _orchestrator.Complete(LimitText(report.Summary, 4_000));
+                _checkpointStore?.SetStatus(task, AgentDraftExecutionStatus.Verifying);
             }
 
-            for (var turn = 1; turn <= _options.MaxModelTurns; turn++)
+            var verificationError = await RunAutomaticVerificationAsync(
+                task,
+                cancellationToken).ConfigureAwait(false);
+            if (verificationError is not null)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                task = RequireCurrentTask();
-
-                if (task.IsTerminal ||
-                    task.Phase == AgentTaskPhase.WaitingForUserInput)
-                {
-                    return task;
-                }
-
-                if (task.Phase is not (
-                        AgentTaskPhase.Executing or
-                        AgentTaskPhase.Verifying))
-                {
-                    return task;
-                }
-
-                AgentModelDecision decision;
-                try
-                {
-                    var tools = GetExecutionToolDescriptors();
-                    var observations = GetObservationContext();
-                    var conversation = GetConversationContext();
-                    var mode = task.Phase == AgentTaskPhase.Verifying
-                        ? AgentModelTurnMode.Verification
-                        : AgentModelTurnMode.Execution;
-
-                    Log(
-                        task,
-                        "model_turn_requested",
-                        turn,
-                        $"Preparing {mode} model turn {turn}.",
-                        $"tools={tools.Length}; observations={observations.Length}; conversation_messages={conversation.Length}");
-
-                    var request = new AgentModelTurnRequest(
-                        task,
-                        tools,
-                        observations,
-                        conversation,
-                        turn,
-                        mode);
-
-                    decision = await _model.DecideAsync(
-                        request,
-                        cancellationToken);
-
-                    Log(
-                        task,
-                        "model_decision",
-                        turn,
-                        $"Model selected action '{decision.Action}'.",
-                        DescribeDecision(decision));
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception exception)
-                {
-                    LogException(
-                        task,
-                        "model_turn_failed",
-                        turn,
-                        exception,
-                        "Execution/verification model turn failed before a valid decision was produced.");
-
-                    return FailTask(
-                        $"Agent model failed while executing the approved plan: {exception.Message}");
-                }
-
-                if (!string.IsNullOrWhiteSpace(decision.Progress))
-                {
-                    _orchestrator.RecordProgress(
-                        LimitText(decision.Progress, _options.MaxProgressCharacters));
-                }
-
-                switch (decision.Action)
-                {
-                    case AgentModelActionKind.UseTool:
-                        await HandleToolDecisionAsync(
-                            decision,
-                            cancellationToken);
-                        break;
-
-                    case AgentModelActionKind.AskUser:
-                        return HandleQuestionDecision(decision);
-
-                    case AgentModelActionKind.BeginVerification:
-                        if (task.Phase != AgentTaskPhase.Executing)
-                        {
-                            AddSyntheticObservation(
-                                string.Empty,
-                                AgentToolResultStatus.Rejected,
-                                "Verification has already started.",
-                                "verification_already_started");
-                            break;
-                        }
-
-                        if (_successfulEditingActions <= 0)
-                        {
-                            if (RejectPrematureTerminalDecision(
-                                    "Verification cannot start before at least one approved editing action succeeds.",
-                                    "successful_edit_required"))
-                            {
-                                return FailTask(
-                                    "Agent repeatedly tried to verify a draft without making any approved edit. The task was stopped instead of claiming changes that did not happen.");
-                            }
-                            break;
-                        }
-
-                        var incompleteSteps = GetIncompleteEditingSteps(task);
-                        if (incompleteSteps.Length > 0)
-                        {
-                            AddSyntheticObservation(
-                                string.Empty,
-                                AgentToolResultStatus.Rejected,
-                                $"Verification cannot start because {incompleteSteps.Length} approved editing action(s) have not succeeded yet.",
-                                "approved_edits_incomplete");
-                            break;
-                        }
-
-                        _successfulVerificationReads = 0;
-                        _verificationEditLogObserved = false;
-                        _verificationIntegrityObserved = false;
-                        _prematureTerminalDecisions = 0;
-                        _orchestrator.BeginVerification(
-                            string.IsNullOrWhiteSpace(decision.Progress)
-                                ? "Agent started checking the finished draft."
-                                : LimitText(decision.Progress, _options.MaxProgressCharacters));
-                        break;
-
-                    case AgentModelActionKind.CompleteTask:
-                        if (task.Phase != AgentTaskPhase.Verifying)
-                        {
-                            AddSyntheticObservation(
-                                string.Empty,
-                                AgentToolResultStatus.Rejected,
-                                "The agent must enter verification before completing the task.",
-                                "verification_required");
-                            break;
-                        }
-
-                        if (!_verificationEditLogObserved)
-                        {
-                            if (RejectPrematureTerminalDecision(
-                                    "Completion requires a successful inspect_agent_edits observation matching the successful editing actions.",
-                                    "verification_edit_log_required",
-                                    "inspect_agent_edits"))
-                            {
-                                return FailTask(
-                                    "Agent repeatedly tried to complete the task without a matching edit log. No unverified completion was accepted.");
-                            }
-                            break;
-                        }
-
-                        if (_successfulVerificationReads <= 0)
-                        {
-                            if (RejectPrematureTerminalDecision(
-                                    "Completion requires at least one successful read-only inspection of the final draft in addition to the edit log.",
-                                    "verification_observation_required"))
-                            {
-                                return FailTask(
-                                    "Agent repeatedly tried to complete the task before inspecting the final Agent Draft.");
-                            }
-                            break;
-                        }
-
-                        if (HasTool("inspect_timeline_integrity") &&
-                            !_verificationIntegrityObserved)
-                        {
-                            if (RejectPrematureTerminalDecision(
-                                    "Completion requires inspect_timeline_integrity for the final Agent Draft.",
-                                    "verification_integrity_required",
-                                    "inspect_timeline_integrity"))
-                            {
-                                return FailTask(
-                                    "Agent repeatedly tried to complete the task without checking gaps, overlaps and linked-clip synchronization.");
-                            }
-                            break;
-                        }
-
-                        if (string.IsNullOrWhiteSpace(decision.CompletionSummary))
-                        {
-                            return FailTask(
-                                "Agent model completed the task without a completion summary.");
-                        }
-
-                        return _orchestrator.Complete(
-                            LimitText(decision.CompletionSummary, 4_000));
-
-                    case AgentModelActionKind.PublishPlan:
-                        return FailTask(
-                            "The agent tried to replace the approved plan during execution.");
-
-                    default:
-                        return FailTask(
-                            $"Agent model returned unsupported execution action '{decision.Action}'.");
-                }
+                return FailTask(verificationError);
             }
 
-            return FailTask(
-                $"Agent execution exceeded the {_options.MaxModelTurns} model-turn safety limit.");
+            var deterministic = _verificationEngine.Verify(
+                task,
+                task.DraftSequenceId is { } checkpointDraftId
+                    ? _checkpointStore?.Read(checkpointDraftId)
+                    : null,
+                GetObservationContext());
+            if (!deterministic.IsValid)
+            {
+                return FailTask(
+                    $"Проверка Agent Draft не пройдена: {string.Join(" ", deterministic.Issues)}");
+            }
+
+            var report = await BuildVerificationReportAsync(
+                task,
+                deterministic,
+                cancellationToken).ConfigureAwait(false);
+            var summary = string.IsNullOrWhiteSpace(report.Summary)
+                ? deterministic.Summary
+                : report.Summary;
+            var completed = _orchestrator.Complete(LimitText(summary, 4_000));
+            _checkpointStore?.SetStatus(completed, AgentDraftExecutionStatus.Completed);
+            return completed;
         }
         finally
         {
@@ -349,13 +178,6 @@ public sealed class AgentExecutionLoop
 
     private static bool HasDeterministicEditingPlan(AgentTaskState task)
     {
-        if (task.Brief is null)
-        {
-            // Legacy persisted plans and compatibility tests keep the old
-            // model-driven runner. Every newly interpreted task has a brief.
-            return false;
-        }
-
         var editingSteps = task.Plan?.Steps
             .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
             .ToArray() ?? [];
@@ -364,48 +186,34 @@ public sealed class AgentExecutionLoop
                    step.ExpectedEditingArguments is { ValueKind: JsonValueKind.Object });
     }
 
-    private async Task<string?> ExecuteApprovedPlanAsync(
-        AgentTaskState task,
-        CancellationToken cancellationToken)
+    private void RestoreCommittedSteps(AgentTaskState task)
     {
-        foreach (var step in task.Plan!.Steps
-                     .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool)))
+        if (_checkpointStore is null || task.DraftSequenceId is not { } draftId)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (_executedPlanStepIds.Contains(step.Id))
-            {
-                continue;
-            }
-
-            if (!_registry.TryGet(step.ExpectedEditingTool!, out var tool) ||
-                tool is null ||
-                tool.Descriptor.Access != AgentToolAccess.Editing)
-            {
-                return $"Approved editing tool '{step.ExpectedEditingTool}' is no longer available.";
-            }
-
-            var result = await _toolExecutor.ExecuteAsync(
-                RequireCurrentTask(),
-                AgentToolCall.Create(
-                    task.Id,
-                    step.ExpectedEditingTool!,
-                    step.ExpectedEditingArguments!.Value),
-                cancellationToken).ConfigureAwait(false);
-            AddObservation(AgentModelObservation.FromResult(
-                _nextObservationSequence++,
-                result));
-            if (!result.IsSuccess)
-            {
-                return $"Approved action '{step.Title}' failed: {result.Summary}";
-            }
-
-            _executedPlanStepIds.Add(step.Id);
-            _successfulEditingActions++;
-            _successfulEditingToolNames.Add(result.ToolName);
-            _orchestrator.RecordProgress($"Выполнено: {step.Title}");
+            return;
         }
 
-        return null;
+        var checkpoint = _checkpointStore.Read(draftId);
+        if (checkpoint is null || task.Plan is null ||
+            checkpoint.TaskId != task.Id ||
+            checkpoint.PlanId != task.Plan.Id ||
+            checkpoint.PlanVersion != task.Plan.Version ||
+            !string.Equals(
+                checkpoint.PlanFingerprint,
+                AgentPlanFingerprint.Create(task.Plan),
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        foreach (var receipt in checkpoint.Receipts.OrderBy(receipt => receipt.Order))
+        {
+            if (_executedPlanStepIds.Add(receipt.StepId))
+            {
+                _successfulEditingActions++;
+                _successfulEditingToolNames.Add(receipt.ToolName);
+            }
+        }
     }
 
     private async Task<string?> RunAutomaticVerificationAsync(
@@ -435,10 +243,10 @@ public sealed class AgentExecutionLoop
                 return $"Required verification tool '{check.ToolName}' is unavailable.";
             }
 
-            await HandleToolDecisionAsync(
-                AgentModelDecision.UseTool(check.ToolName, check.Arguments),
+            var observation = await ExecuteVerificationToolAsync(
+                check.ToolName,
+                check.Arguments,
                 cancellationToken).ConfigureAwait(false);
-            var observation = GetObservationContext().LastOrDefault();
             if (observation is null ||
                 !string.Equals(observation.ToolName, check.ToolName, StringComparison.OrdinalIgnoreCase) ||
                 observation.Status != AgentToolResultStatus.Succeeded)
@@ -457,6 +265,32 @@ public sealed class AgentExecutionLoop
             }
         }
 
+        if (task.Plan is { } plan)
+        {
+            foreach (var probe in AgentVerificationProbePlanner.Create(plan))
+            {
+                var detail = ProbeDetail(probe.RequiredCapabilities);
+                var observation = await ExecuteVerificationToolAsync(
+                    "inspect_boundary",
+                    AgentToolJson.ToElement(new
+                    {
+                        target_kind = "sequence",
+                        target_id = draftId,
+                        at_seconds = probe.DraftBoundarySeconds,
+                        window_seconds = probe.WindowSeconds,
+                        detail,
+                        query = probe.Query
+                    }),
+                    cancellationToken).ConfigureAwait(false);
+                if (observation is null ||
+                    !string.Equals(observation.ToolName, "inspect_boundary", StringComparison.OrdinalIgnoreCase) ||
+                    observation.Status != AgentToolResultStatus.Succeeded)
+                {
+                    return $"Multichannel verification failed for approved step {probe.StepOrder}: {observation?.Summary ?? "no result"}";
+                }
+            }
+        }
+
         if (!_verificationEditLogObserved)
         {
             return "Agent edit log does not exactly match the approved actions.";
@@ -467,20 +301,22 @@ public sealed class AgentExecutionLoop
 
     private async Task<AgentVerificationReport> BuildVerificationReportAsync(
         AgentTaskState task,
+        AgentDeterministicVerificationResult deterministic,
         CancellationToken cancellationToken)
     {
         var observations = GetObservationContext()
             .Where(observation =>
                 string.Equals(observation.ToolName, "inspect_agent_edits", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(observation.ToolName, "inspect_timeline_integrity", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(observation.ToolName, "compare_sequences", StringComparison.OrdinalIgnoreCase))
+                string.Equals(observation.ToolName, "compare_sequences", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(observation.ToolName, "inspect_boundary", StringComparison.OrdinalIgnoreCase))
             .ToImmutableArray();
-        if (_model is IAgentVerificationReporter reporter)
+        if (_reporter is not null)
         {
             try
             {
-                return await reporter.ReportVerificationAsync(
-                    new AgentVerificationReportRequest(task, observations, 1),
+                return await _reporter.ReportVerificationAsync(
+                    new AgentVerificationReportRequest(task, deterministic, observations, 1),
                     cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -490,9 +326,9 @@ public sealed class AgentExecutionLoop
             catch (Exception exception)
             {
                 return new AgentVerificationReport(
-                    false,
-                    "Не удалось сформировать структурированный итоговый отчёт.",
-                    ImmutableArray.Create(exception.Message));
+                    true,
+                    "Утверждённые действия выполнены; детерминированная проверка Agent Draft пройдена.",
+                    ImmutableArray.Create($"Model report unavailable: {exception.Message}"));
             }
         }
 
@@ -502,100 +338,79 @@ public sealed class AgentExecutionLoop
             ImmutableArray<string>.Empty);
     }
 
-    private async Task HandleToolDecisionAsync(
-        AgentModelDecision decision,
+    private static string ProbeDetail(AgentEvidenceCapabilities required)
+    {
+        if ((required & AgentEvidenceCapabilities.Frames) != 0 &&
+            (required & (AgentEvidenceCapabilities.Audio | AgentEvidenceCapabilities.Transcript)) == 0)
+        {
+            return "frames";
+        }
+        if ((required & AgentEvidenceCapabilities.Transcript) != 0 &&
+            (required & (AgentEvidenceCapabilities.Frames | AgentEvidenceCapabilities.Audio)) == 0)
+        {
+            return "transcript";
+        }
+        if ((required & AgentEvidenceCapabilities.Audio) != 0 &&
+            (required & (AgentEvidenceCapabilities.Frames | AgentEvidenceCapabilities.Transcript)) == 0)
+        {
+            return "audio";
+        }
+
+        return "all";
+    }
+
+    private async Task<AgentModelObservation?> ExecuteVerificationToolAsync(
+        string toolName,
+        JsonElement toolArguments,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(decision.ToolName))
+        if (string.IsNullOrWhiteSpace(toolName))
         {
             AddSyntheticObservation(
                 string.Empty,
                 AgentToolResultStatus.Rejected,
-                "Agent model requested a tool without a tool name.",
-                "invalid_model_tool_call");
-            return;
+                "Deterministic verification requested a tool without a name.",
+                "invalid_verification_tool_call");
+            return GetObservationContext().LastOrDefault();
         }
 
-        if (decision.ToolArguments.ValueKind != JsonValueKind.Object)
+        if (toolArguments.ValueKind != JsonValueKind.Object)
         {
             AddSyntheticObservation(
-                decision.ToolName,
+                toolName,
                 AgentToolResultStatus.Rejected,
-                "Agent model tool arguments must be a JSON object.",
-                "invalid_model_tool_call");
-            return;
-        }
-
-        var signature =
-            decision.ToolName.Trim().ToLowerInvariant() + "\n" +
-            decision.ToolArguments.GetRawText();
-
-        if (string.Equals(signature, _lastToolSignature, StringComparison.Ordinal))
-        {
-            _consecutiveIdenticalToolCalls++;
-        }
-        else
-        {
-            _lastToolSignature = signature;
-            _consecutiveIdenticalToolCalls = 1;
-        }
-
-        if (_consecutiveIdenticalToolCalls >
-            _options.MaxConsecutiveIdenticalToolCalls)
-        {
-            AddSyntheticObservation(
-                decision.ToolName,
-                AgentToolResultStatus.Rejected,
-                "This exact tool call was already repeated. Reuse the existing result or change the request.",
-                "repeated_tool_call");
-            return;
+                "Deterministic verification tool arguments must be a JSON object.",
+                "invalid_verification_tool_call");
+            return GetObservationContext().LastOrDefault();
         }
 
         var task = RequireCurrentTask();
-        AgentPlanStep? approvedStep = null;
-        if (_registry.TryGet(decision.ToolName, out var requestedTool) &&
-            requestedTool is not null &&
-            requestedTool.Descriptor.Access == AgentToolAccess.Editing)
+        if (!_registry.TryGet(toolName, out var requestedTool) ||
+            requestedTool is null ||
+            requestedTool.Descriptor.Access != AgentToolAccess.ReadOnly)
         {
-            approvedStep = FindApprovedStep(task, decision);
-            if (approvedStep is null)
-            {
-                AddSyntheticObservation(
-                    decision.ToolName,
-                    AgentToolResultStatus.Rejected,
-                    $"Editing action '{decision.ToolName}' with these arguments is not an unexecuted action in the approved plan. Revise the plan before changing the tool or its ranges, clip IDs, or parameters.",
-                    "editing_arguments_not_approved");
-                return;
-            }
+            AddSyntheticObservation(
+                toolName,
+                AgentToolResultStatus.Rejected,
+                "Deterministic verification can execute read-only tools only.",
+                "verification_read_only_required");
+            return GetObservationContext().LastOrDefault();
         }
 
         var call = AgentToolCall.Create(
             task.Id,
-            decision.ToolName,
-            decision.ToolArguments);
+            toolName,
+            toolArguments);
 
         var result = await _toolExecutor.ExecuteAsync(
             task,
             call,
             cancellationToken);
 
-        AddObservation(AgentModelObservation.FromResult(
+        var resultObservation = AgentModelObservation.FromResult(
             _nextObservationSequence++,
-            result));
-
-        if (result.IsSuccess &&
-            _registry.TryGet(result.ToolName, out var executedTool) &&
-            executedTool is not null &&
-            executedTool.Descriptor.Access == AgentToolAccess.Editing)
-        {
-            if (approvedStep is not null)
-            {
-                _executedPlanStepIds.Add(approvedStep.Id);
-            }
-            _successfulEditingActions++;
-            _successfulEditingToolNames.Add(result.ToolName);
-            _prematureTerminalDecisions = 0;
-        }
+            result);
+        AddObservation(resultObservation);
 
         if (task.Phase == AgentTaskPhase.Verifying &&
             result.IsSuccess &&
@@ -619,88 +434,11 @@ public sealed class AgentExecutionLoop
                             "verification_edit_log_mismatch");
                     }
                 }
-                else if (IsFinalDraftInspection(task, result))
-                {
-                    _successfulVerificationReads++;
-                    if (string.Equals(
-                            result.ToolName,
-                            "inspect_timeline_integrity",
-                            StringComparison.OrdinalIgnoreCase))
-                    {
-                        _verificationIntegrityObserved = true;
-                    }
-                }
-            }
-            else
-            {
-                // Any corrective edit invalidates all previous verification evidence.
-                // The final draft must be inspected again after the correction.
-                _successfulVerificationReads = 0;
-                _verificationEditLogObserved = false;
-                _verificationIntegrityObserved = false;
             }
         }
+
+        return resultObservation;
     }
-
-    private static bool IsFinalDraftInspection(
-        AgentTaskState task,
-        AgentToolResult result)
-    {
-        if (task.DraftSequenceId is not { } draftSequenceId ||
-            result.Data is not { } data ||
-            data.ValueKind != JsonValueKind.Object)
-        {
-            return false;
-        }
-
-        if (!string.Equals(
-                result.ToolName,
-                "inspect_timeline",
-                StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(
-                result.ToolName,
-                "inspect_range",
-                StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(
-                result.ToolName,
-                "inspect_timeline_integrity",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        return data.TryGetProperty("sequence_id", out var sequenceIdElement) &&
-               sequenceIdElement.ValueKind == JsonValueKind.String &&
-               sequenceIdElement.TryGetGuid(out var observedSequenceId) &&
-               observedSequenceId == draftSequenceId;
-    }
-
-    private AgentTaskState HandleQuestionDecision(
-        AgentModelDecision decision)
-    {
-        if (string.IsNullOrWhiteSpace(decision.Question))
-        {
-            return FailTask(
-                "Agent model requested user input but returned an empty question.");
-        }
-
-        return _orchestrator.AskQuestion(
-            LimitText(decision.Question, 2_000),
-            string.IsNullOrWhiteSpace(decision.QuestionContext)
-                ? null
-                : LimitText(decision.QuestionContext, 4_000));
-    }
-
-    private ImmutableArray<AgentToolDescriptor> GetExecutionToolDescriptors()
-        => RequireCurrentTask().Phase == AgentTaskPhase.Verifying
-            ? _registry.Descriptors
-                .Where(descriptor => descriptor.Access == AgentToolAccess.ReadOnly &&
-                                     !string.Equals(
-                                         descriptor.Name,
-                                         "inspect_agent_edits",
-                                         StringComparison.OrdinalIgnoreCase))
-                .ToImmutableArray()
-            : _registry.Descriptors;
 
     private ImmutableArray<AgentModelObservation> GetObservationContext()
     {
@@ -708,47 +446,6 @@ public sealed class AgentExecutionLoop
         {
             return _observations.ToImmutableArray();
         }
-    }
-
-    private ImmutableArray<AgentConversationContextMessage> GetConversationContext()
-    {
-        var source = _conversationProvider();
-        if (source.IsDefaultOrEmpty)
-        {
-            return ImmutableArray<AgentConversationContextMessage>.Empty;
-        }
-
-        var selected = new List<AgentConversationContextMessage>();
-        var characters = 0;
-
-        for (var index = source.Length - 1;
-             index >= 0 && selected.Count < _options.MaxConversationMessages;
-             index--)
-        {
-            var item = source[index];
-            if (string.IsNullOrWhiteSpace(item.Text))
-            {
-                continue;
-            }
-
-            var text = item.Text.Trim();
-            if (text.Length > _options.MaxConversationCharacters)
-            {
-                text = text[.._options.MaxConversationCharacters].TrimEnd() + "…";
-            }
-
-            if (selected.Count > 0 &&
-                characters + text.Length > _options.MaxConversationCharacters)
-            {
-                break;
-            }
-
-            selected.Add(item with { Text = text });
-            characters += text.Length;
-        }
-
-        selected.Reverse();
-        return selected.ToImmutableArray();
     }
 
     private void EnsureMemoryFor(Guid taskId)
@@ -775,55 +472,10 @@ public sealed class AgentExecutionLoop
         }
 
         _memoryTaskId = taskId;
-        _lastToolSignature = null;
-        _consecutiveIdenticalToolCalls = 0;
-        _successfulVerificationReads = 0;
         _successfulEditingActions = 0;
-        _prematureTerminalDecisions = 0;
         _verificationEditLogObserved = false;
-        _verificationIntegrityObserved = false;
         _successfulEditingToolNames.Clear();
         _executedPlanStepIds.Clear();
-    }
-
-    private AgentPlanStep? FindApprovedStep(
-        AgentTaskState task,
-        AgentModelDecision decision)
-        => task.Plan?.Steps
-            .Where(step => !_executedPlanStepIds.Contains(step.Id))
-            .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
-            .FirstOrDefault(step => step.ExpectedEditingArguments is { ValueKind: JsonValueKind.Object } expected
-                ? AgentActionApproval.Matches(
-                    step.ExpectedEditingTool!,
-                    expected,
-                    decision.ToolName,
-                    decision.ToolArguments)
-                : string.Equals(
-                    step.ExpectedEditingTool,
-                    decision.ToolName,
-                    StringComparison.OrdinalIgnoreCase));
-
-    private AgentPlanStep[] GetIncompleteEditingSteps(AgentTaskState task)
-        => task.Plan?.Steps
-            .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
-            .Where(step => !_executedPlanStepIds.Contains(step.Id))
-            .ToArray() ?? [];
-
-    private bool HasTool(string name)
-        => _registry.TryGet(name, out var tool) && tool is not null;
-
-    private bool RejectPrematureTerminalDecision(
-        string summary,
-        string errorCode,
-        string toolName = "")
-    {
-        _prematureTerminalDecisions++;
-        AddSyntheticObservation(
-            toolName,
-            AgentToolResultStatus.Rejected,
-            summary,
-            errorCode);
-        return _prematureTerminalDecisions >= _options.MaxPrematureTerminalDecisions;
     }
 
     private bool EditLogMatchesSuccessfulActions(AgentToolResult result)
@@ -835,9 +487,7 @@ public sealed class AgentExecutionLoop
             !data.TryGetProperty("edits", out var editsElement) ||
             editsElement.ValueKind != JsonValueKind.Array)
         {
-            // Lightweight test backends and old persisted sessions may not expose
-            // the structured log yet; they still cannot pass without a successful edit.
-            return _successfulEditingActions > 0;
+            return false;
         }
 
         var loggedTools = editsElement.EnumerateArray()
@@ -904,6 +554,7 @@ public sealed class AgentExecutionLoop
             "task_failed",
             message: message);
 
+        _checkpointStore?.SetStatus(task, AgentDraftExecutionStatus.Interrupted);
         return _orchestrator.Fail(LimitText(message, 4_000));
     }
 
@@ -923,52 +574,6 @@ public sealed class AgentExecutionLoop
             turn,
             message,
             details));
-    }
-
-    private void LogException(
-        AgentTaskState task,
-        string eventName,
-        int? turn,
-        Exception exception,
-        string? message = null)
-    {
-        _debugLog.Write(new AgentDebugLogEntry(
-            DateTimeOffset.UtcNow,
-            "execution_loop",
-            eventName,
-            task.Id,
-            task.Phase.ToString(),
-            turn,
-            message ?? exception.Message,
-            Exception: exception.ToString()));
-    }
-
-    private static string DescribeDecision(AgentModelDecision decision)
-    {
-        var toolArguments = decision.ToolArguments.ValueKind == JsonValueKind.Object
-            ? decision.ToolArguments.GetRawText()
-            : "{}";
-
-        return
-            $"action={decision.Action}; " +
-            $"progress={LimitTextForLog(decision.Progress, 2_000)}; " +
-            $"tool_name={decision.ToolName}; " +
-            $"tool_arguments={LimitTextForLog(toolArguments, 12_000)}; " +
-            $"question={LimitTextForLog(decision.Question, 4_000)}; " +
-            $"completion={LimitTextForLog(decision.CompletionSummary, 4_000)}";
-    }
-
-    private static string LimitTextForLog(string? value, int maximumCharacters)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var normalized = value.Trim();
-        return normalized.Length <= maximumCharacters
-            ? normalized
-            : normalized[..maximumCharacters] + "…";
     }
 
     private static string LimitText(string value, int maximumCharacters)

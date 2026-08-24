@@ -222,6 +222,4 @@ public interface IAgentEditingToolBackend
     ValueTask<JsonElement> InspectEditLogAsync(
         AgentToolContext context,
         CancellationToken cancellationToken);
-
-    void Reset(Guid taskId);
 }

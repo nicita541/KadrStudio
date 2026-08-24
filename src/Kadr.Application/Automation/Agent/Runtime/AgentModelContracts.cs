@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Text.Json;
 using KadrStudio.Application.Automation.Agent.Tools;
+using KadrStudio.Application.Automation.Agent.Verification;
 
 namespace KadrStudio.Application.Automation.Agent.Runtime;
 
@@ -15,21 +16,12 @@ public sealed record AgentConversationContextMessage(
     string Text,
     DateTimeOffset CreatedAt);
 
-public enum AgentModelTurnMode
-{
-    Planning,
-    Execution,
-    Verification
-}
-
 public enum AgentModelActionKind
 {
     UseTool,
     AskUser,
     PublishPlan,
-    CompleteReadOnly,
-    BeginVerification,
-    CompleteTask
+    CompleteReadOnly
 }
 
 public sealed record AgentModelObservation(
@@ -38,7 +30,8 @@ public sealed record AgentModelObservation(
     AgentToolResultStatus Status,
     string Summary,
     JsonElement? Data,
-    string? ErrorCode)
+    string? ErrorCode,
+    AgentEvidenceCapabilities EvidenceCapabilities = AgentEvidenceCapabilities.None)
 {
     public static AgentModelObservation FromResult(
         int sequence,
@@ -52,8 +45,15 @@ public sealed record AgentModelObservation(
             result.Status,
             result.Summary,
             result.Data is { } data ? data.Clone() : null,
-            result.ErrorCode);
+            result.ErrorCode,
+            result.EvidenceCapabilities);
     }
+}
+
+public enum AgentModelTurnDirective
+{
+    Investigate,
+    PublishPlanFromExistingEvidence
 }
 
 public sealed record AgentModelTurnRequest(
@@ -62,7 +62,7 @@ public sealed record AgentModelTurnRequest(
     ImmutableArray<AgentModelObservation> Observations,
     ImmutableArray<AgentConversationContextMessage> Conversation,
     int TurnIndex,
-    AgentModelTurnMode Mode = AgentModelTurnMode.Planning);
+    AgentModelTurnDirective Directive = AgentModelTurnDirective.Investigate);
 
 public sealed record AgentTaskUnderstanding(
     AgentTaskBrief Brief,
@@ -82,6 +82,7 @@ public sealed record AgentPlanReview(
 
 public sealed record AgentVerificationReportRequest(
     AgentTaskState Task,
+    AgentDeterministicVerificationResult DeterministicResult,
     ImmutableArray<AgentModelObservation> VerificationObservations,
     int TurnIndex);
 
@@ -141,18 +142,6 @@ public sealed record AgentModelDecision(
             plan ?? throw new ArgumentNullException(nameof(plan)),
             string.Empty);
 
-    public static AgentModelDecision BeginVerification(
-        string progress = "")
-        => new(
-            AgentModelActionKind.BeginVerification,
-            progress ?? string.Empty,
-            string.Empty,
-            AgentToolJson.EmptyObject(),
-            string.Empty,
-            string.Empty,
-            null,
-            string.Empty);
-
     public static AgentModelDecision CompleteReadOnly(
         string summary,
         string progress = "")
@@ -166,16 +155,4 @@ public sealed record AgentModelDecision(
             null,
             summary ?? string.Empty);
 
-    public static AgentModelDecision CompleteTask(
-        string summary,
-        string progress = "")
-        => new(
-            AgentModelActionKind.CompleteTask,
-            progress ?? string.Empty,
-            string.Empty,
-            AgentToolJson.EmptyObject(),
-            string.Empty,
-            string.Empty,
-            null,
-            summary ?? string.Empty);
 }

@@ -94,7 +94,7 @@ public sealed class StructuredInferencePipelineTests
     {
         var runtime = new FakeRuntime(
             Response("{\"wrong\":true}", "", "stop", 10),
-            Response("{\"answer\":\"ok\",\"extra\":1}", "", "stop", 11));
+            Response("{\"answer\":42,\"extra\":1}", "", "stop", 11));
         var result = await new StructuredInferencePipeline(runtime)
             .RunAsync(Request(think: false), Planner(), CancellationToken.None);
 
@@ -102,6 +102,71 @@ public sealed class StructuredInferencePipelineTests
         Assert.Equal("schema_validation_failed", result.ErrorCode);
         Assert.Equal(2, result.AttemptCount);
         Assert.DoesNotContain("thinking", result.Error ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task DisallowedRootPropertyIsRemovedWithoutAnotherModelAttempt()
+    {
+        var runtime = new FakeRuntime(
+            Response("{\"answer\":\"fixed\",\"required\":[\"answer\"]}", "", "stop", 12));
+
+        var result = await new StructuredInferencePipeline(runtime)
+            .RunAsync(Request(think: false), Planner(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("{\"answer\":\"fixed\"}", result.Content);
+        Assert.Equal(1, result.AttemptCount);
+        Assert.Single(runtime.Requests);
+    }
+
+    [Fact]
+    public async Task DisallowedNestedPropertiesAreRemovedRecursively()
+    {
+        var schema = JsonSerializer.SerializeToElement(new
+        {
+            type = "object",
+            properties = new
+            {
+                items = new
+                {
+                    type = "array",
+                    items = new
+                    {
+                        type = "object",
+                        properties = new { name = new { type = "string" } },
+                        required = new[] { "name" },
+                        additionalProperties = false
+                    }
+                }
+            },
+            required = new[] { "items" },
+            additionalProperties = false
+        });
+        var runtime = new FakeRuntime(
+            Response("{\"items\":[{\"name\":\"kept\",\"schema\":true}],\"extra\":1}", "", "stop", 12));
+        var request = Request(think: false) with { Schema = schema };
+
+        var result = await new StructuredInferencePipeline(runtime)
+            .RunAsync(request, Planner(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("{\"items\":[{\"name\":\"kept\"}]}", result.Content);
+        Assert.Single(runtime.Requests);
+    }
+
+    [Fact]
+    public async Task PropertyProjectionDoesNotInventMissingRequiredValues()
+    {
+        var runtime = new FakeRuntime(
+            Response("{\"required\":[\"answer\"]}", "", "stop", 10),
+            Response("{\"required\":[\"answer\"]}", "", "stop", 11));
+
+        var result = await new StructuredInferencePipeline(runtime)
+            .RunAsync(Request(think: false), Planner(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal("schema_validation_failed", result.ErrorCode);
+        Assert.Equal(2, result.AttemptCount);
     }
 
     [Fact]
@@ -144,6 +209,25 @@ public sealed class StructuredInferencePipelineTests
         Assert.True(result.IsSuccess);
         Assert.Equal("{\"answer\":\"fixed\"}", result.Content);
         Assert.Equal(2, result.AttemptCount);
+    }
+
+    [Theory]
+    [InlineData("{\"answer\":\"fixed\"}}")]
+    [InlineData("{\"answer\":\"fixed\"]")]
+    [InlineData("```json\n{\"answer\":\"fixed\"}\n```")]
+    public async Task FirstStructuredValueRepairsOnlyContainerDelimitersAndIgnoresTrailingWrappers(
+        string malformed)
+    {
+        var runtime = new FakeRuntime(
+            Response(malformed, "", "stop", 12));
+
+        var result = await new StructuredInferencePipeline(runtime)
+            .RunAsync(Request(think: false), Planner(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("{\"answer\":\"fixed\"}", result.Content);
+        Assert.Equal(1, result.AttemptCount);
+        Assert.Single(runtime.Requests);
     }
 
     [Fact]

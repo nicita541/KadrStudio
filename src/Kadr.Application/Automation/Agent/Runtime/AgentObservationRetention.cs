@@ -57,6 +57,14 @@ internal static class AgentObservationRetention
             score += 100_000;
         }
 
+        if (observation.ToolName is "inspect_project" or
+            "inspect_timeline" or
+            "inspect_timeline_integrity" or
+            "inspect_content_overview")
+        {
+            score += 50_000;
+        }
+
         if (observation.Status != AgentToolResultStatus.Succeeded)
         {
             score += 10_000;

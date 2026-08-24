@@ -12,6 +12,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
     private static readonly Regex SilenceEndRegex = new(@"silence_end:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex FreezeStartRegex = new(@"freeze_start:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex FreezeEndRegex = new(@"freeze_end:\s*(?<time>\d+(?:\.\d+)?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex LoudnessFrameRegex = new(
+        @"\bt:\s*(?<time>\d+(?:\.\d+)?)\s+TARGET:.*?\bM:\s*(?<momentary>-?\d+(?:\.\d+)?)\s+S:\s*(?<short>-?\d+(?:\.\d+)?)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex LumaAverageRegex = new(
         @"lavfi\.signalstats\.YAVG=(?<value>\d+(?:\.\d+)?)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -64,9 +67,9 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
             var audioResult = await processRunner.RunAsync(
                 locator.FfmpegPath,
                 [
-                    "-hide_banner", "-nostdin",
+                    "-hide_banner", "-loglevel", "verbose", "-nostdin",
                     "-ss", Format(rangeStart), "-t", Format(rangeDuration), "-i", request.Asset.Path,
-                    "-vn", "-af", "silencedetect=noise=-38dB:d=0.6", "-f", "null", "-"
+                    "-vn", "-af", "silencedetect=noise=-38dB:d=0.6,ebur128=framelog=verbose", "-f", "null", "-"
                 ],
                 line => audioLines.Add(line),
                 cancellationToken);
@@ -77,15 +80,25 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         var sceneCuts = ParseTimes(detectorLines, SceneTimeRegex, rangeStart, rangeDuration);
         var blackRanges = ParsePairedRanges(detectorLines, BlackRegex, rangeStart, rangeDuration);
         var silenceRanges = ParseSplitRanges(audioLines, SilenceStartRegex, SilenceEndRegex, rangeStart, rangeDuration);
+        var loudnessWindows = ParseLoudnessWindows(
+            audioLines,
+            rangeStart,
+            rangeEnd);
         var freezeRanges = ParseSplitRanges(detectorLines, FreezeStartRegex, FreezeEndRegex, rangeStart, rangeDuration);
         var detected = BuildMarkers(request.Query, rangeStart, rangeEnd, sceneCuts, blackRanges, silenceRanges, freezeRanges);
 
         var summary =
             $"Диапазон {FormatTime(rangeStart)}–{FormatTime(rangeEnd)}: " +
             $"границ сцен — {sceneCuts.Count}, затемнений — {blackRanges.Count}, " +
-            $"пауз — {silenceRanges.Count}, стоп-кадров — {freezeRanges.Count}.";
+            $"пауз — {silenceRanges.Count}, стоп-кадров — {freezeRanges.Count}, " +
+            $"окон громкости — {loudnessWindows.Count}.";
         progress?.Report(new VideoAnalysisProgress(84, "Шаг 4/5: технические измерения готовы"));
-        return new VideoAnalysisResult(summary, rangeStart, rangeEnd, detected);
+        return new VideoAnalysisResult(
+            summary,
+            rangeStart,
+            rangeEnd,
+            detected,
+            loudnessWindows);
     }
 
     public async Task<VideoAnalysisResult> RefineSemanticBoundariesAsync(
@@ -421,6 +434,61 @@ public sealed class VideoAnalysisService(FfmpegLocator locator, ProcessRunner pr
         return ranges;
     }
 
+    private static IReadOnlyList<AudioLoudnessWindow> ParseLoudnessWindows(
+        IEnumerable<string> lines,
+        double rangeStart,
+        double rangeEnd)
+    {
+        const double windowSeconds = 2d;
+        var measurements = lines
+            .Select(line => LoudnessFrameRegex.Match(line))
+            .Where(match => match.Success)
+            .Select(match =>
+            {
+                var time = ParseDouble(match.Groups["time"].Value);
+                var momentary = ParseDouble(match.Groups["momentary"].Value);
+                var shortTerm = ParseDouble(match.Groups["short"].Value);
+                return (Time: time, Momentary: momentary, ShortTerm: shortTerm);
+            })
+            .Where(item => item.Time >= 0 &&
+                           double.IsFinite(item.Momentary) &&
+                           double.IsFinite(item.ShortTerm))
+            .ToArray();
+        if (measurements.Length == 0)
+        {
+            return [];
+        }
+
+        var result = new List<AudioLoudnessWindow>();
+        double? previousMomentary = null;
+        foreach (var group in measurements
+                     .GroupBy(item => (int)Math.Floor(item.Time / windowSeconds))
+                     .OrderBy(group => group.Key))
+        {
+            var relativeStart = group.Key * windowSeconds;
+            var start = Math.Clamp(rangeStart + relativeStart, rangeStart, rangeEnd);
+            var end = Math.Clamp(start + windowSeconds, start, rangeEnd);
+            if (end <= start)
+            {
+                continue;
+            }
+
+            var momentary = group.Average(item => item.Momentary);
+            var shortTerm = group.Average(item => item.ShortTerm);
+            var delta = previousMomentary is { } previous
+                ? momentary - previous
+                : 0;
+            result.Add(new AudioLoudnessWindow(
+                start,
+                end,
+                momentary,
+                shortTerm,
+                delta));
+            previousMomentary = momentary;
+        }
+        return result;
+    }
+
     private static void AddRange(ICollection<TimeRange> ranges, double start, double end, double minimum, double maximum)
     {
         start = Math.Clamp(start, minimum, maximum);
@@ -484,7 +552,15 @@ public sealed record VideoAnalysisResult(
     string Summary,
     double SourceStart,
     double SourceEnd,
-    IReadOnlyList<DetectedVideoRange> Ranges);
+    IReadOnlyList<DetectedVideoRange> Ranges,
+    IReadOnlyList<AudioLoudnessWindow>? LoudnessWindows = null);
+
+public sealed record AudioLoudnessWindow(
+    double SourceStart,
+    double SourceEnd,
+    double MomentaryLufs,
+    double ShortTermLufs,
+    double DeltaFromPreviousLufs);
 
 public sealed record DetectedVideoRange(
     MarkerKind Kind,

@@ -125,6 +125,47 @@ public enum MontageEvidenceKind
     UserAnnotation
 }
 
+public enum AgentDraftExecutionStatus
+{
+    Executing,
+    Verifying,
+    Completed,
+    Interrupted
+}
+
+/// <summary>
+/// Durable proof that one approved agent-plan step changed an Agent Draft.
+/// The receipt is stored on the sequence in the same editor transaction as
+/// the edit, making a successfully committed step safe to skip after restart.
+/// </summary>
+public sealed record AgentStepReceipt(
+    Guid StepId,
+    int Order,
+    string ToolName,
+    string ArgumentsFingerprint,
+    long BeforeDraftRevision,
+    long AfterDraftRevision,
+    string Summary,
+    DateTimeOffset AppliedAt);
+
+/// <summary>
+/// Persistent execution identity and progress for an Agent Draft.
+/// </summary>
+public sealed record AgentDraftCheckpoint(
+    Guid TaskId,
+    Guid PlanId,
+    int PlanVersion,
+    string PlanFingerprint,
+    Guid SourceSequenceId,
+    long SourceSequenceRevision,
+    AgentDraftExecutionStatus Status,
+    ImmutableArray<AgentStepReceipt> Receipts,
+    DateTimeOffset UpdatedAt)
+{
+    public ImmutableArray<AgentStepReceipt> Receipts { get; init; } =
+        Receipts.IsDefault ? [] : Receipts;
+}
+
 public sealed record SequenceState(
     Guid Id,
     string Name,
@@ -140,7 +181,8 @@ public sealed record SequenceState(
     TimelineTime? InPoint = null,
     TimelineTime? OutPoint = null,
     Guid? ParentSequenceId = null,
-    Guid? MontagePlanId = null)
+    Guid? MontagePlanId = null,
+    AgentDraftCheckpoint? AgentCheckpoint = null)
 {
     public TimelineTime Duration
     {

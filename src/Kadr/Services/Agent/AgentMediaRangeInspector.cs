@@ -15,7 +15,8 @@ namespace KadrStudio.Services.Agent;
 
 /// <summary>
 /// Executes focused, read-only media inspection for the agent.
-/// Results are cached by source fingerprint + exact range + detail + query.
+/// Sensor results are cached by source fingerprint + exact range + detail.
+/// The planner query is provenance only and is never forwarded to vision.
 /// </summary>
 public sealed class AgentMediaRangeInspector(
     AutomationOrchestrator orchestrator,
@@ -23,11 +24,13 @@ public sealed class AgentMediaRangeInspector(
     AiVideoAnalysisService aiServer,
     IArtifactStore artifacts) : IAgentMediaRangeInspector
 {
-    private const int CacheFormatVersion = 1;
+    private const int CacheFormatVersion = 13;
     private const double MaximumTechnicalSeconds = 1_800;
     private const double MaximumVisionSeconds = 600;
     private const int MaximumQueryCharacters = 2_000;
     private const int MaximumRanges = 120;
+    private const int MaximumLoudnessWindows = 120;
+    private const int MaximumLoudnessChanges = 24;
     private const int MaximumTranscriptCues = 200;
 
     public async ValueTask<JsonElement> InspectAsync(
@@ -124,7 +127,6 @@ public sealed class AgentMediaRangeInspector(
         var useTranscript =
             request.Detail == AgentRangeInspectionDetail.Transcript ||
             (request.Detail == AgentRangeInspectionDetail.All && source.HasAudio);
-        var query = BuildQuery(request);
 
         VideoAnalysisPipelineResult? pipeline = null;
         AiRangeInspection? vision = null;
@@ -148,7 +150,6 @@ public sealed class AgentMediaRangeInspector(
                     vision = await orchestrator.InspectRangeAsync(
                         asset,
                         pipeline.Result,
-                        query,
                         aiServer.PreferredModel,
                         progress: null,
                         cancellationToken: cancellationToken,
@@ -187,6 +188,21 @@ public sealed class AgentMediaRangeInspector(
             }
         }
 
+        if (useVision && (vision is null || !vision.CoverageComplete))
+        {
+            throw new AgentToolRejectedException(
+                "vision_evidence_incomplete",
+                "Vision sensor did not return a complete neutral observation for every sampled frame. " +
+                (string.IsNullOrWhiteSpace(visionWarning) ? "Retry the exact range." : visionWarning));
+        }
+        if (useTranscript && transcription is null)
+        {
+            throw new AgentToolRejectedException(
+                "transcript_evidence_incomplete",
+                "Transcript sensor did not return a completed measurement. " +
+                (string.IsNullOrWhiteSpace(transcriptWarning) ? "Retry the exact range." : transcriptWarning));
+        }
+
         var allRanges = pipeline?.Result.Ranges ?? Array.Empty<DetectedVideoRange>();
         if (request.Detail == AgentRangeInspectionDetail.Audio)
         {
@@ -204,13 +220,21 @@ public sealed class AgentMediaRangeInspector(
         var transcriptCues = transcription?.Cues
             .Take(MaximumTranscriptCues)
             .ToArray();
+        var loudnessWindows = pipeline?.Result.LoudnessWindows?
+            .Take(MaximumLoudnessWindows)
+            .ToArray() ?? [];
+        var loudnessChanges = loudnessWindows
+            .Where(window => Math.Abs(window.DeltaFromPreviousLufs) >= 4d)
+            .OrderByDescending(window => Math.Abs(window.DeltaFromPreviousLufs))
+            .Take(MaximumLoudnessChanges)
+            .OrderBy(window => window.SourceStart)
+            .ToArray();
 
         return AgentToolJson.ToElement(new
         {
             source_id = source.Id,
             source_name = source.Name,
             detail = request.Detail.ToString().ToLowerInvariant(),
-            query = request.Query,
             range = new
             {
                 start_seconds = Round(start),
@@ -227,18 +251,24 @@ public sealed class AgentMediaRangeInspector(
                     summary = Compact(pipeline.Result.Summary, 2_000),
                     range_count = allRanges.Count,
                     ranges_truncated = allRanges.Count > ranges.Length,
-                    ranges = ranges.Select(ToRangeObservation).ToArray()
+                    ranges = ranges.Select(ToRangeObservation).ToArray(),
+                    loudness_window_seconds = 2d,
+                    loudness_windows_truncated =
+                        (pipeline.Result.LoudnessWindows?.Count ?? 0) > loudnessWindows.Length,
+                    loudness_windows = loudnessWindows.Select(ToLoudnessObservation).ToArray(),
+                    loudness_change_points = loudnessChanges.Select(ToLoudnessObservation).ToArray()
                 },
+            audio_measurement_available = source.HasAudio && pipeline is not null,
             vision = !useVision
                 ? null
                 : new
                 {
                     model = aiServer.PreferredModel,
                     available = vision is not null,
+                    coverage_complete = vision?.CoverageComplete ?? false,
                     sampling = "sparse_contact_sheets",
                     continuous_video_observed = false,
                     warning = visionWarning,
-                    summary = Compact(vision?.Summary, 2_000),
                     observations = vision is null
                         ? Array.Empty<object>()
                         : vision.Observations.Select(item => (object)new
@@ -246,7 +276,7 @@ public sealed class AgentMediaRangeInspector(
                             start_seconds = Round(item.Start),
                             end_seconds = Round(item.End),
                             title = Compact(item.Title, 500),
-                            description = Compact(item.Description, 1_200),
+                            description = Compact(item.Description, 4_000),
                             confidence = Math.Round(item.Confidence, 3),
                             tags = item.Tags.Take(12).Select(tag => Compact(tag, 120)).ToArray()
                         }).ToArray()
@@ -284,13 +314,12 @@ public sealed class AgentMediaRangeInspector(
         var fingerprint = string.Join(
             '|',
             stableFingerprint,
-            "agent-range-v1",
+            "agent-range-v13",
             request.Detail,
             TimelineTime.FromSeconds(request.StartSeconds).Ticks,
             TimelineTime.FromSeconds(request.EndSeconds).Ticks,
             modelIdentity,
-            transcriptIdentity,
-            request.Query);
+            transcriptIdentity);
 
         return new MediaCacheKey(
             source.Id,
@@ -325,6 +354,16 @@ public sealed class AgentMediaRangeInspector(
             end_boundary = ToBoundaryObservation(range.EndBoundary)
         };
 
+    private static object ToLoudnessObservation(AudioLoudnessWindow window)
+        => new
+        {
+            start_seconds = Round(window.SourceStart),
+            end_seconds = Round(window.SourceEnd),
+            momentary_lufs = Math.Round(window.MomentaryLufs, 2),
+            short_term_lufs = Math.Round(window.ShortTermLufs, 2),
+            delta_from_previous_lufs = Math.Round(window.DeltaFromPreviousLufs, 2)
+        };
+
     private static object? ToBoundaryObservation(BoundaryVerificationResult? boundary)
         => boundary is null
             ? null
@@ -344,29 +383,6 @@ public sealed class AgentMediaRangeInspector(
             ? "Технический анализ выбранного диапазона: паузы, тишина и границы."
             : "Технический анализ выбранного диапазона без изменения его границ.";
 
-    private static string BuildQuery(AgentRangeInspectionRequest request)
-    {
-        if (!string.IsNullOrWhiteSpace(request.Query))
-        {
-            return request.Query.Trim();
-        }
-
-        return request.Detail switch
-        {
-            AgentRangeInspectionDetail.Frames =>
-                "Опиши только то, что действительно видно в выбранном диапазоне. " +
-                "Отметь смысловые части, смены контекста и вероятные границы, не додумывая пропущенные кадры.",
-            AgentRangeInspectionDetail.Audio =>
-                "Проверь аудиоконтекст выбранного диапазона и технические паузы. " +
-                "Тишина сама по себе не означает, что её надо удалять.",
-            AgentRangeInspectionDetail.All =>
-                "Исследуй выбранный диапазон в контексте задачи. " +
-                "Опирайся на видимые кадры, технические границы и речь; не принимай монтажных решений вместо агента.",
-            _ =>
-                "Собери фактические технические наблюдения только по выбранному диапазону."
-        };
-    }
-
     private static void ValidateDetailAgainstMedia(
         MediaSource source,
         AgentRangeInspectionDetail detail)
@@ -385,7 +401,8 @@ public sealed class AgentMediaRangeInspector(
         }
 
         if (detail is AgentRangeInspectionDetail.Audio or
-            AgentRangeInspectionDetail.Transcript)
+            AgentRangeInspectionDetail.Transcript or
+            AgentRangeInspectionDetail.All)
         {
             if (!source.HasAudio)
             {

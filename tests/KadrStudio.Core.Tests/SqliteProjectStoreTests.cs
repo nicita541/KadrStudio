@@ -27,6 +27,57 @@ public sealed class SqliteProjectStoreTests
     }
 
     [Fact]
+    public async Task Schema_v6_roundtrips_agent_draft_checkpoint_and_receipts()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "agent-checkpoint.kadr");
+        var store = new SqliteProjectStore();
+        var project = CreateProject().EnsureSequenceContainer().SynchronizeActiveSequence();
+        var source = project.ActiveSequence!;
+        var now = DateTimeOffset.UtcNow;
+        var checkpoint = new AgentDraftCheckpoint(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            2,
+            "PLAN-FINGERPRINT",
+            source.Id,
+            source.Revision,
+            AgentDraftExecutionStatus.Executing,
+            [new AgentStepReceipt(
+                Guid.NewGuid(),
+                1,
+                "ripple_delete_range",
+                "ARGUMENTS-FINGERPRINT",
+                0,
+                1,
+                "Deleted opening",
+                now)],
+            now);
+        var draft = source with
+        {
+            Id = Guid.NewGuid(),
+            Name = "Agent Draft",
+            Revision = 1,
+            Status = SequenceStatus.Draft,
+            ParentSequenceId = source.Id,
+            MontagePlanId = null,
+            AgentCheckpoint = checkpoint
+        };
+        project = project with { Sequences = project.Sequences.Add(draft) };
+
+        await store.SaveAsync(path, project);
+        var loaded = await store.LoadAsync(path);
+
+        var loadedCheckpoint = loaded.FindSequence(draft.Id)!.AgentCheckpoint;
+        Assert.NotNull(loadedCheckpoint);
+        Assert.Equal(checkpoint.TaskId, loadedCheckpoint!.TaskId);
+        Assert.Equal(checkpoint.PlanId, loadedCheckpoint.PlanId);
+        Assert.Equal(checkpoint.PlanFingerprint, loadedCheckpoint.PlanFingerprint);
+        Assert.Equal(checkpoint.Status, loadedCheckpoint.Status);
+        Assert.Equal(Assert.Single(checkpoint.Receipts), Assert.Single(loadedCheckpoint.Receipts));
+    }
+
+    [Fact]
     public async Task Project_is_stored_in_normalized_tables_with_valid_foreign_keys()
     {
         using var directory = new TemporaryDirectory();
@@ -43,7 +94,7 @@ public sealed class SqliteProjectStoreTests
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM text_clips;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM markers;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM transitions;"));
-        Assert.Equal(5L, await ScalarInt64Async(connection,
+        Assert.Equal(6L, await ScalarInt64Async(connection,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM ai_conversation;"));
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
@@ -180,7 +231,7 @@ public sealed class SqliteProjectStoreTests
     }
 
     [Fact]
-    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v5()
+    public async Task Schema_v2_is_read_without_mutation_and_next_save_migrates_to_v6()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "v2.kadr");
@@ -214,10 +265,35 @@ public sealed class SqliteProjectStoreTests
         await store.SaveAsync(path, loaded);
         await using var migrated = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
         await migrated.OpenAsync();
-        Assert.Equal(5L, await ScalarInt64Async(migrated,
+        Assert.Equal(6L, await ScalarInt64Async(migrated,
             "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
         Assert.Equal(1L, await ScalarInt64Async(migrated,
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transitions';"));
+    }
+
+    [Fact]
+    public async Task Schema_v5_without_agent_checkpoints_loads_and_next_save_migrates_to_v6()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "v5.kadr");
+        var store = new SqliteProjectStore();
+        await store.SaveAsync(path, CreateProject());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE metadata SET value='5' WHERE key='schema_version';";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var loaded = await store.LoadAsync(path);
+
+        Assert.All(loaded.Sequences, sequence => Assert.Null(sequence.AgentCheckpoint));
+        await store.SaveAsync(path, loaded);
+        await using var migrated = new SqliteConnection($"Data Source={path};Mode=ReadOnly;Pooling=False");
+        await migrated.OpenAsync();
+        Assert.Equal(6L, await ScalarInt64Async(migrated,
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='schema_version';"));
     }
 
     [Fact]

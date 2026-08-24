@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using KadrStudio.Application.Automation.Agent;
+using KadrStudio.Application.Automation.Agent.Execution;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.Editing;
@@ -21,10 +23,9 @@ public sealed class KadrAgentEditingToolBackendTests
             fixture.SourceSequenceId,
             "Удалить подтверждённый диапазон 5–15 секунд, остальное не трогать.",
             sourceSequenceRevision: sourceBefore.Revision);
-        fixture.Backend.Reset(orchestrator.CurrentTask!.Id);
-
         var registry = new AgentToolRegistry();
         registry.Register(new EndToEndRangeEvidenceTool(fixture.SourceSequenceId));
+        registry.Register(new EndToEndBoundaryVerificationTool());
         AgentEditingToolSet.RegisterDefaults(registry, fixture.Backend);
         registry.Register(new EndToEndVerificationTool("inspect_timeline_integrity"));
         registry.Register(new EndToEndVerificationTool("compare_sequences"));
@@ -46,12 +47,14 @@ public sealed class KadrAgentEditingToolBackendTests
 
         orchestrator.ApprovePlan();
         orchestrator.BeginExecution(fixture.DraftSequenceId);
+        fixture.PrepareCheckpoint(orchestrator.CurrentTask!);
         var completed = await new AgentExecutionLoop(
             orchestrator,
             registry,
             executor,
-            model,
-            seedObservationProvider: () => planning.Observations)
+            reporter: null,
+            seedObservationProvider: () => planning.Observations,
+            checkpointStore: fixture.CheckpointStore)
             .RunUntilPauseAsync();
 
         Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
@@ -266,6 +269,77 @@ public sealed class KadrAgentEditingToolBackendTests
     }
 
     [Fact]
+    public async Task Repeating_the_same_approved_step_is_idempotent()
+    {
+        var fixture = CreateFixture();
+        var context = fixture.Context;
+
+        await fixture.Backend.RippleDeleteRangeAsync(
+            context,
+            5,
+            15,
+            "Approved agent plan",
+            CancellationToken.None);
+        var repeated = await fixture.Backend.RippleDeleteRangeAsync(
+            context,
+            5,
+            15,
+            "Approved agent plan",
+            CancellationToken.None);
+
+        Assert.True(repeated.GetProperty("already_committed").GetBoolean());
+        Assert.Equal(
+            TimelineTime.FromSeconds(50),
+            fixture.Session.State.FindSequence(fixture.DraftSequenceId)!.Duration);
+        Assert.Single(fixture.CheckpointStore.Read(fixture.DraftSequenceId)!.Receipts);
+    }
+
+    [Fact]
+    public async Task Reusing_a_step_id_with_different_arguments_is_rejected()
+    {
+        var fixture = CreateFixture();
+        var context = fixture.Context;
+        await fixture.Backend.RippleDeleteRangeAsync(
+            context,
+            5,
+            15,
+            "Approved agent plan",
+            CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<AgentToolRejectedException>(
+            async () => await fixture.Backend.RippleDeleteRangeAsync(
+                context with { ArgumentsFingerprint = "DIFFERENT" },
+                5,
+                15,
+                "Changed action",
+                CancellationToken.None));
+
+        Assert.Equal("step_receipt_conflict", error.ErrorCode);
+        Assert.Single(fixture.CheckpointStore.Read(fixture.DraftSequenceId)!.Receipts);
+    }
+
+    [Fact]
+    public void Failure_before_atomic_commit_keeps_edit_and_receipt_unapplied()
+    {
+        var fixture = CreateFixture();
+        var context = fixture.Context;
+        var before = fixture.Session.State.FindSequence(fixture.DraftSequenceId)!;
+
+        Assert.Throws<EditRejectedException>(() => fixture.Session.Execute(
+            new EditTransaction(
+                "Fail approved step",
+                new CommitAgentStepCommand(
+                    context,
+                    "failing_edit",
+                    "Fail before commit",
+                    new ThrowingEditCommand()))));
+
+        var after = fixture.Session.State.FindSequence(fixture.DraftSequenceId)!;
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Empty(after.AgentCheckpoint!.Receipts);
+    }
+
+    [Fact]
     public async Task Multi_range_ripple_delete_uses_one_coordinate_state_and_preserves_source()
     {
         var fixture = CreateFixture();
@@ -442,6 +516,20 @@ public sealed class KadrAgentEditingToolBackendTests
             .SynchronizeActiveSequence();
 
         var sourceSequence = project.ActiveSequence!;
+        var taskId = Guid.NewGuid();
+        var planId = Guid.NewGuid();
+        const int planVersion = 1;
+        const string planFingerprint = "TEST-PLAN-FINGERPRINT";
+        var checkpoint = new AgentDraftCheckpoint(
+            taskId,
+            planId,
+            planVersion,
+            planFingerprint,
+            sourceSequence.Id,
+            sourceSequence.Revision,
+            AgentDraftExecutionStatus.Executing,
+            [],
+            DateTimeOffset.UtcNow);
         var draft = sourceSequence with
         {
             Id = Guid.NewGuid(),
@@ -449,7 +537,8 @@ public sealed class KadrAgentEditingToolBackendTests
             Revision = 0,
             Status = SequenceStatus.Draft,
             ParentSequenceId = sourceSequence.Id,
-            MontagePlanId = null
+            MontagePlanId = null,
+            AgentCheckpoint = checkpoint
         };
 
         var session = new EditorSession(project);
@@ -460,7 +549,6 @@ public sealed class KadrAgentEditingToolBackendTests
                     draft,
                     Activate: true)));
 
-        var taskId = Guid.NewGuid();
         var backend = new KadrAgentEditingToolBackend(
             () => session.State,
             (description, command) =>
@@ -471,19 +559,20 @@ public sealed class KadrAgentEditingToolBackendTests
                         command));
                 return result.Changed;
             });
-        backend.Reset(taskId);
-
-        var context = new AgentToolContext(
-            taskId,
-            project.Id,
-            sourceSequence.Id,
-            draft.Id,
-            AgentTaskPhase.Executing);
+        var checkpointStore = new KadrAgentCheckpointStore(
+            () => session.State,
+            (description, command) => session.Execute(
+                new EditTransaction(description, command)).Changed);
 
         return new Fixture(
             session,
             backend,
-            context,
+            checkpointStore,
+            taskId,
+            planId,
+            planVersion,
+            planFingerprint,
+            project.Id,
             sourceSequence.Id,
             draft.Id);
     }
@@ -582,6 +671,14 @@ public sealed class KadrAgentEditingToolBackendTests
         }
     }
 
+    private sealed class ThrowingEditCommand : IEditCommand
+    {
+        public string Description => "Throw before commit";
+
+        public ProjectState Apply(ProjectState project)
+            => throw new InvalidOperationException("Simulated edit failure.");
+    }
+
     private sealed class EndToEndRangeEvidenceTool : IAgentTool
     {
         private readonly Guid _sequenceId;
@@ -625,7 +722,8 @@ public sealed class KadrAgentEditingToolBackendTests
                             new { timestamp_seconds = 15, fact = "right boundary" }
                         }
                     }
-                }));
+                },
+                AgentEvidenceCapabilities.Frames));
         }
     }
 
@@ -667,18 +765,138 @@ public sealed class KadrAgentEditingToolBackendTests
                     source_sequence_id = context.SourceSequenceId,
                     draft_sequence_id = context.DraftSequenceId,
                     source_revision = 0,
+                    draft_duration_seconds = 50d,
                     unapproved_change_count = 0
                 });
+            var capability = Descriptor.Name == "inspect_timeline_integrity"
+                ? AgentEvidenceCapabilities.Integrity
+                : AgentEvidenceCapabilities.SequenceDiff;
             return ValueTask.FromResult(AgentToolExecutionOutput.From(
                 "Verification succeeded.",
-                data));
+                data,
+                capability));
         }
     }
 
-    private sealed record Fixture(
-        EditorSession Session,
-        KadrAgentEditingToolBackend Backend,
-        AgentToolContext Context,
-        Guid SourceSequenceId,
-        Guid DraftSequenceId);
+    private sealed class EndToEndBoundaryVerificationTool : IAgentTool
+    {
+        public AgentToolDescriptor Descriptor { get; } = new(
+            "inspect_boundary",
+            "Return factual post-edit boundary evidence.",
+            AgentToolAccess.ReadOnly,
+            AgentToolJson.ParseObject(
+                """
+                {"type":"object","additionalProperties":true}
+                """));
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            System.Text.Json.JsonElement arguments,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var at = arguments.GetProperty("at_seconds").GetDouble();
+            var window = arguments.GetProperty("window_seconds").GetDouble();
+            return ValueTask.FromResult(AgentToolExecutionOutput.From(
+                "Post-edit frame facts measured on both sides of the join.",
+                new
+                {
+                    channel = "frames",
+                    sequence_id = context.DraftSequenceId,
+                    start_seconds = Math.Max(0, at - window),
+                    end_seconds = at + window,
+                    query = arguments.GetProperty("query").GetString()
+                },
+                AgentEvidenceCapabilities.Frames));
+        }
+    }
+
+    private sealed class Fixture
+    {
+        private int _nextStepOrder;
+        private readonly Guid _taskId;
+        private readonly Guid _planId;
+        private readonly int _planVersion;
+        private readonly string _planFingerprint;
+        private readonly Guid _projectId;
+
+        public Fixture(
+            EditorSession session,
+            KadrAgentEditingToolBackend backend,
+            KadrAgentCheckpointStore checkpointStore,
+            Guid taskId,
+            Guid planId,
+            int planVersion,
+            string planFingerprint,
+            Guid projectId,
+            Guid sourceSequenceId,
+            Guid draftSequenceId)
+        {
+            Session = session;
+            Backend = backend;
+            CheckpointStore = checkpointStore;
+            _taskId = taskId;
+            _planId = planId;
+            _planVersion = planVersion;
+            _planFingerprint = planFingerprint;
+            _projectId = projectId;
+            SourceSequenceId = sourceSequenceId;
+            DraftSequenceId = draftSequenceId;
+        }
+
+        public EditorSession Session { get; }
+        public KadrAgentEditingToolBackend Backend { get; }
+        public KadrAgentCheckpointStore CheckpointStore { get; }
+        public Guid SourceSequenceId { get; }
+        public Guid DraftSequenceId { get; }
+
+        public AgentToolContext Context
+        {
+            get
+            {
+                var order = Interlocked.Increment(ref _nextStepOrder);
+                return new AgentToolContext(
+                    _taskId,
+                    _projectId,
+                    SourceSequenceId,
+                    DraftSequenceId,
+                    AgentTaskPhase.Executing,
+                    _planId,
+                    _planVersion,
+                    Guid.NewGuid(),
+                    order,
+                    _planFingerprint,
+                    $"TEST-ARGUMENTS-{order}");
+            }
+        }
+
+        public void PrepareCheckpoint(AgentTaskState task)
+        {
+            var plan = Assert.IsType<AgentPlan>(task.Plan);
+            var checkpoint = new AgentDraftCheckpoint(
+                task.Id,
+                plan.Id,
+                plan.Version,
+                AgentPlanFingerprint.Create(plan),
+                task.SourceSequenceId,
+                task.SourceSequenceRevision ?? 0,
+                AgentDraftExecutionStatus.Executing,
+                [],
+                DateTimeOffset.UtcNow);
+            Session.ReplaceState(
+                Session.State with
+                {
+                    Sequences = Session.State.Sequences
+                        .Select(sequence => sequence.Id == DraftSequenceId
+                            ? sequence with
+                            {
+                                MontagePlanId = null,
+                                AgentCheckpoint = checkpoint
+                            }
+                            : sequence)
+                        .ToImmutableArray()
+                },
+                "Prepare Agent Draft checkpoint");
+        }
+    }
 }

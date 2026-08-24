@@ -39,7 +39,10 @@ public sealed class SearchTimelineTool(IAgentReadOnlyToolBackend backend) : IAge
             OptionalInt(arguments, "cursor", 0),
             OptionalInt(arguments, "page_size", 50));
         var data = await backend.SearchTimelineAsync(context, request, cancellationToken);
-        return new AgentToolExecutionOutput("Timeline search page loaded.", data.Clone());
+        return new AgentToolExecutionOutput(
+            "Timeline search page loaded.",
+            data.Clone(),
+            AgentEvidenceCapabilities.Timeline);
     }
 
     private static double? OptionalDouble(JsonElement element, string name)

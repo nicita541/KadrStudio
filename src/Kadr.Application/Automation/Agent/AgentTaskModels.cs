@@ -42,6 +42,13 @@ public enum AgentTaskKind
     Mixed
 }
 
+public enum AgentInvestigationStrategy
+{
+    DirectTarget,
+    TimelineOnly,
+    ContentDiscovery
+}
+
 public enum AgentEvidenceChannel
 {
     Project,
@@ -56,6 +63,22 @@ public enum AgentEvidenceChannel
     EditLog
 }
 
+[Flags]
+public enum AgentEvidenceCapabilities
+{
+    None = 0,
+    Project = 1 << 0,
+    EditorContext = 1 << 1,
+    Timeline = 1 << 2,
+    Frames = 1 << 3,
+    Audio = 1 << 4,
+    Transcript = 1 << 5,
+    Integrity = 1 << 6,
+    Comparison = 1 << 7,
+    SequenceDiff = 1 << 8,
+    EditLog = 1 << 9
+}
+
 public sealed record AgentTaskBrief(
     AgentTaskKind Kind,
     string Goal,
@@ -64,7 +87,8 @@ public sealed record AgentTaskBrief(
     ImmutableArray<string> Constraints,
     ImmutableArray<string> AcceptanceCriteria,
     ImmutableArray<string> Assumptions,
-    ImmutableArray<string> MissingInformation)
+    ImmutableArray<string> MissingInformation,
+    AgentInvestigationStrategy InvestigationStrategy = AgentInvestigationStrategy.DirectTarget)
 {
     public static AgentTaskBrief Create(
         AgentTaskKind kind,
@@ -74,7 +98,8 @@ public sealed record AgentTaskBrief(
         IEnumerable<string>? constraints = null,
         IEnumerable<string>? acceptanceCriteria = null,
         IEnumerable<string>? assumptions = null,
-        IEnumerable<string>? missingInformation = null)
+        IEnumerable<string>? missingInformation = null,
+        AgentInvestigationStrategy investigationStrategy = AgentInvestigationStrategy.DirectTarget)
         => new(
             kind,
             goal.Trim(),
@@ -83,7 +108,8 @@ public sealed record AgentTaskBrief(
             Normalize(constraints),
             Normalize(acceptanceCriteria),
             Normalize(assumptions),
-            Normalize(missingInformation));
+            Normalize(missingInformation),
+            investigationStrategy);
 
     private static ImmutableArray<string> Normalize(IEnumerable<string>? values)
         => values?
@@ -112,7 +138,9 @@ public sealed record AgentEvidenceRecord(
     string Summary,
     ImmutableArray<string> Facts,
     string? ArtifactReference,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    AgentEvidenceCapabilities Capabilities = AgentEvidenceCapabilities.None,
+    double? BoundarySeconds = null);
 
 public sealed record AgentJournalEntry(
     Guid Id,

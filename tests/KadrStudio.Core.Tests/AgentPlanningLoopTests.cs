@@ -143,6 +143,260 @@ public sealed class AgentPlanningLoopTests
     }
 
     [Fact]
+    public async Task Equivalent_boundary_calls_with_different_windows_are_bounded()
+    {
+        var orchestrator = CreateStartedTask();
+        var registry = new AgentToolRegistry();
+        var tool = new CountingBoundaryTool();
+        registry.Register(tool);
+        var targetId = orchestrator.CurrentTask!.SourceSequenceId;
+        var decisions = new[] { 10, 8, 2 }
+            .Select(window => AgentModelDecision.UseTool(
+                "inspect_boundary",
+                AgentToolJson.ToElement(new
+                {
+                    target_kind = "sequence",
+                    target_id = targetId,
+                    at_seconds = 3.667,
+                    window_seconds = window,
+                    detail = "all",
+                    query = $"Equivalent wording {window}."
+                })))
+            .Append(AgentModelDecision.PublishPlan(CreatePlan()))
+            .ToArray();
+        var model = new ScriptedAgentModel(decisions);
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var state = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForApproval, state.Phase);
+        Assert.Equal(2, tool.CallCount);
+        Assert.Contains(
+            loop.Observations,
+            item => item.ErrorCode == "repeated_boundary_inspection");
+    }
+
+    [Fact]
+    public async Task Retry_with_typed_evidence_requests_plan_without_more_read_tools()
+    {
+        var orchestrator = CreateStartedTask();
+        orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Выполнить подтверждённое изменение.",
+            "Активная последовательность."));
+        var registry = new AgentToolRegistry();
+        var readTool = new CountingReadTool();
+        registry.Register(readTool);
+        registry.Register(new FakeEditingTool());
+        var model = new ScriptedAgentModel(
+            AgentModelDecision.UseTool("inspect_counter", AgentToolJson.EmptyObject()));
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model);
+
+        var failed = await loop.RunUntilPauseAsync();
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        orchestrator.RetryFailedPlanning();
+        model.Enqueue(AgentModelDecision.PublishPlan(
+            AgentPlanDraft.Create(
+                "Выполнить изменение в Agent Draft.",
+                "План опирается на типизированное наблюдение.",
+                ["Не менять source."],
+                [new AgentPlanStepDraft(
+                    "Применить изменение",
+                    "Выполнить утверждённый editing tool.",
+                    "fake_edit",
+                    [1],
+                    AgentToolJson.EmptyObject(),
+                    AgentEvidenceRequirement.Timeline)])));
+
+        Assert.True(loop.PrepareRetryFromExistingEvidence());
+        var planned = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForApproval, planned.Phase);
+        Assert.Equal(1, readTool.CallCount);
+        var retryRequest = model.Requests[^1];
+        Assert.Equal(
+            AgentModelTurnDirective.PublishPlanFromExistingEvidence,
+            retryRequest.Directive);
+        Assert.All(
+            retryRequest.AvailableTools,
+            descriptor => Assert.Equal(AgentToolAccess.Editing, descriptor.Access));
+    }
+
+    [Fact]
+    public async Task New_planning_loop_restores_persisted_evidence_and_continues_sequence_numbers()
+    {
+        var orchestrator = CreateStartedTask();
+        orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Выполнить подтверждённое изменение.",
+            "Активная последовательность."));
+        var registry = new AgentToolRegistry();
+        var readTool = new CountingReadTool();
+        registry.Register(readTool);
+        registry.Register(new FakeEditingTool());
+
+        var firstModel = new ScriptedAgentModel(
+            AgentModelDecision.UseTool("inspect_counter", AgentToolJson.EmptyObject()));
+        var firstLoop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            firstModel);
+        var failed = await firstLoop.RunUntilPauseAsync();
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Equal(1, Assert.Single(failed.Evidence).Sequence);
+
+        orchestrator.RetryFailedPlanning();
+        var secondModel = new ScriptedAgentModel(
+            AgentModelDecision.UseTool("inspect_counter", AgentToolJson.EmptyObject()),
+            AgentModelDecision.PublishPlan(
+                AgentPlanDraft.Create(
+                    "Выполнить изменение в Agent Draft.",
+                    "План опирается на восстановленное наблюдение.",
+                    ["Не менять source."],
+                    [new AgentPlanStepDraft(
+                        "Применить изменение",
+                        "Выполнить утверждённый editing tool.",
+                        "fake_edit",
+                        [1],
+                        AgentToolJson.EmptyObject(),
+                        AgentEvidenceRequirement.Timeline)])));
+        var restoredLoop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            secondModel);
+
+        Assert.True(restoredLoop.PrepareRetryFromExistingEvidence());
+        var planned = await restoredLoop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForApproval, planned.Phase);
+        var retryRequest = secondModel.Requests[0];
+        var restored = Assert.Single(retryRequest.Observations);
+        Assert.Equal(1, restored.Sequence);
+        Assert.Equal("inspect_counter", restored.ToolName);
+        Assert.Equal(AgentEvidenceCapabilities.Timeline, restored.EvidenceCapabilities);
+        Assert.Equal(
+            AgentModelTurnDirective.PublishPlanFromExistingEvidence,
+            retryRequest.Directive);
+        Assert.Equal(2, planned.Evidence.Max(item => item.Sequence));
+    }
+
+    [Fact]
+    public async Task Content_discovery_retry_does_not_force_plan_from_coarse_evidence_only()
+    {
+        var orchestrator = CreateStartedTask();
+        orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Найти и удалить смысловой блок.",
+            "Вся последовательность."));
+        var task = orchestrator.CurrentTask!;
+        orchestrator.ReplaceEvidenceLedger([
+            new AgentEvidenceRecord(
+                Guid.NewGuid(),
+                1,
+                AgentEvidenceChannel.Frames,
+                "inspect_content_overview",
+                task.SourceSequenceId,
+                task.SourceSequenceRevision,
+                0,
+                300,
+                "Coarse overview",
+                ["Sampled frames"],
+                null,
+                DateTimeOffset.UtcNow,
+                AgentEvidenceCapabilities.Frames)
+        ]);
+        var registry = new AgentToolRegistry();
+        registry.Register(new CountingReadTool());
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            new ScriptedAgentModel(AgentModelDecision.AskUser("Нужны точные границы.")));
+
+        Assert.False(loop.PrepareRetryFromExistingEvidence());
+    }
+
+    [Fact]
+    public async Task Content_discovery_probes_the_densest_unexplored_ocr_region_before_model_turn()
+    {
+        var orchestrator = CreateStartedTask();
+        orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Найти и удалить смысловой блок.",
+            "Вся последовательность.",
+            investigationStrategy: AgentInvestigationStrategy.ContentDiscovery));
+        var task = orchestrator.BeginInvestigation();
+        orchestrator.ReplaceEvidenceLedger([
+            new AgentEvidenceRecord(
+                Guid.NewGuid(),
+                1,
+                AgentEvidenceChannel.Frames,
+                "inspect_content_overview",
+                task.SourceSequenceId,
+                task.SourceSequenceRevision,
+                0,
+                1427,
+                "Tile 1 @ 2.000s: landscape [text: place] | " +
+                "Tile 2 @ 42.000s: room [text: name] | " +
+                "Tile 3 @ 121.407s: face [text: credit A] | " +
+                "Tile 4 @ 131.407s: sky [text: credit B] | " +
+                "Tile 5 @ 141.407s: motion [text: credit C] | " +
+                "Tile 6 @ 151.407s: profile [text: credit D] | " +
+                "Tile 7 @ 161.407s: running [text: credit E] | " +
+                "Tile 8 @ 171.407s: street [text: credit F] | " +
+                "Tile 9 @ 181.407s: crowd [text: credit G] | " +
+                "Tile 10 @ 191.407s: room [text: credit H] | " +
+                "Tile 11 @ 201.407s: close-up [text: credit I] | " +
+                "Tile 12 @ 211.407s: landscape [text: credit J] | " +
+                "Tile 13 @ 220.513s: white card [text: episode title]",
+                ["Observed frame facts"],
+                null,
+                DateTimeOffset.UtcNow,
+                AgentEvidenceCapabilities.Frames | AgentEvidenceCapabilities.Audio)
+        ]);
+        var registry = new AgentToolRegistry();
+        var rangeTool = new CoverageRangeTool(blackFrameStart: 146.407);
+        var boundaryTool = new BoundaryCaptureTool();
+        registry.Register(rangeTool);
+        registry.Register(boundaryTool);
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            new ContentDiscoveryModel());
+
+        var result = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, result.Phase);
+        Assert.Equal(3, rangeTool.Requests.Count);
+        Assert.Equal(91.407, rangeTool.Requests[0].Start, 3);
+        Assert.Equal(185.960, rangeTool.Requests[0].End, 3);
+        Assert.Equal(185.960, rangeTool.Requests[1].Start, 3);
+        Assert.Equal(280.513, rangeTool.Requests[1].End, 3);
+        Assert.Equal(0, rangeTool.Requests[2].Start, 3);
+        Assert.Equal(102, rangeTool.Requests[2].End, 3);
+        Assert.All(rangeTool.Requests, request => Assert.Equal("all", request.Detail));
+        Assert.Contains(boundaryTool.AtSeconds, value => Math.Abs(value - 146.407) < 0.001);
+        Assert.Contains(boundaryTool.AtSeconds, value => Math.Abs(value - 225.513) < 0.001);
+        Assert.Contains(result.Evidence, evidence =>
+            evidence.ToolName == "inspect_range" &&
+            Math.Abs(evidence.StartSeconds!.Value - 91.407) < 0.001);
+        Assert.Contains(result.Evidence, evidence =>
+            evidence.ToolName == "inspect_boundary" &&
+            Math.Abs((evidence.StartSeconds!.Value + evidence.EndSeconds!.Value) / 2d - 146.407) < 0.001);
+    }
+
+    [Fact]
     public async Task Planning_turn_limit_fails_task_instead_of_looping_forever()
     {
         var orchestrator = CreateStartedTask();
@@ -467,8 +721,133 @@ public sealed class AgentPlanningLoopTests
         Assert.Equal(AgentTaskPhase.WaitingForUserInput, result.Phase);
         Assert.Null(result.Plan);
         Assert.Contains(loop.Observations, item =>
-            item.ErrorCode == "plan_evidence_required" &&
+            item.ErrorCode == "plan_invalid" &&
             item.Summary.Contains("ripple_delete_ranges", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Content_discovery_retries_a_transient_frame_sensor_failure()
+    {
+        var orchestrator = CreateStartedTask();
+        var registry = new AgentToolRegistry();
+        registry.Register(new ProjectDurationTool(240));
+        var rangeTool = new CoverageRangeTool(failFirstCall: true);
+        registry.Register(rangeTool);
+        var model = new ContentDiscoveryModel();
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model,
+            new AgentPlanningLoopOptions(MaxDiscoveryCoverageAttemptsPerWindow: 2));
+
+        var state = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, state.Phase);
+        Assert.Equal(3, rangeTool.CallCount);
+        var overview = Assert.Single(loop.Observations, observation =>
+            observation.ToolName == "inspect_content_overview");
+        Assert.Equal(AgentToolResultStatus.Succeeded, overview.Status);
+        Assert.Equal(AgentEvidenceCapabilities.Frames, overview.EvidenceCapabilities);
+        var samples = overview.Data!.Value.GetProperty("samples").EnumerateArray().ToArray();
+        Assert.Equal(2, samples.Length);
+        Assert.Equal(2, samples[0].GetProperty("attempt_count").GetInt32());
+        Assert.Equal(1, samples[1].GetProperty("attempt_count").GetInt32());
+    }
+
+    [Fact]
+    public async Task Incomplete_content_discovery_retains_successful_windows_with_exact_ranges()
+    {
+        var orchestrator = CreateStartedTask();
+        var registry = new AgentToolRegistry();
+        registry.Register(new ProjectDurationTool(240));
+        var rangeTool = new CoverageRangeTool(permanentlyFailFromSeconds: 120);
+        registry.Register(rangeTool);
+        var model = new ContentDiscoveryModel();
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            model,
+            new AgentPlanningLoopOptions(MaxDiscoveryCoverageAttemptsPerWindow: 2));
+
+        var state = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, state.Phase);
+        Assert.Equal(3, rangeTool.CallCount);
+        var partial = Assert.Single(loop.Observations, observation =>
+            observation.ToolName == "inspect_content_sample");
+        Assert.Equal(AgentEvidenceCapabilities.Frames, partial.EvidenceCapabilities);
+        Assert.Equal(0, partial.Data!.Value.GetProperty("start_seconds").GetDouble());
+        Assert.Equal(120, partial.Data.Value.GetProperty("end_seconds").GetDouble());
+        var overview = Assert.Single(loop.Observations, observation =>
+            observation.ToolName == "inspect_content_overview");
+        Assert.Equal(AgentToolResultStatus.Failed, overview.Status);
+        Assert.Equal(AgentEvidenceCapabilities.None, overview.EvidenceCapabilities);
+    }
+
+    [Fact]
+    public async Task Recovery_reuses_persisted_content_samples_and_measures_only_missing_windows()
+    {
+        var orchestrator = CreateStartedTask();
+        var task = orchestrator.SetTaskBrief(AgentTaskBrief.Create(
+            AgentTaskKind.Edit,
+            "Найти смысловые блоки.",
+            "Вся последовательность.",
+            investigationStrategy: AgentInvestigationStrategy.ContentDiscovery));
+        orchestrator.ReplaceEvidenceLedger(
+        [
+            new AgentEvidenceRecord(
+                Guid.NewGuid(),
+                1,
+                AgentEvidenceChannel.Frames,
+                "inspect_content_sample",
+                task.SourceSequenceId,
+                task.SourceSequenceRevision,
+                0,
+                120,
+                "Persisted neutral facts for 0-120s.",
+                ["frames measured"],
+                null,
+                DateTimeOffset.UtcNow,
+                AgentEvidenceCapabilities.Frames),
+            new AgentEvidenceRecord(
+                Guid.NewGuid(),
+                2,
+                AgentEvidenceChannel.Project,
+                "inspect_project",
+                task.SourceSequenceId,
+                task.SourceSequenceRevision,
+                null,
+                null,
+                "Persisted project summary without runtime JSON payload.",
+                ["project inspected"],
+                null,
+                DateTimeOffset.UtcNow,
+                AgentEvidenceCapabilities.Project | AgentEvidenceCapabilities.Timeline)
+        ]);
+        var registry = new AgentToolRegistry();
+        registry.Register(new ProjectDurationTool(240));
+        var rangeTool = new CoverageRangeTool();
+        registry.Register(rangeTool);
+        var loop = new AgentPlanningLoop(
+            orchestrator,
+            registry,
+            new AgentToolExecutor(registry),
+            new ContentDiscoveryModel());
+
+        var state = await loop.RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.WaitingForUserInput, state.Phase);
+        var request = Assert.Single(rangeTool.Requests);
+        Assert.Equal(120, request.Start, 3);
+        Assert.Equal(240, request.End, 3);
+        var overview = Assert.Single(loop.Observations, observation =>
+            observation.ToolName == "inspect_content_overview");
+        Assert.Equal(AgentToolResultStatus.Succeeded, overview.Status);
+        var samples = overview.Data!.Value.GetProperty("samples").EnumerateArray().ToArray();
+        Assert.Equal(0, samples[0].GetProperty("attempt_count").GetInt32());
+        Assert.Equal(1, samples[1].GetProperty("attempt_count").GetInt32());
     }
 
     private static AiAgentOrchestrator CreateStartedTask()
@@ -513,6 +892,9 @@ public sealed class AgentPlanningLoopTests
         }
 
         public List<AgentModelTurnRequest> Requests { get; } = [];
+
+        public void Enqueue(AgentModelDecision decision)
+            => _decisions.Enqueue(decision);
 
         public ValueTask<AgentModelDecision> DecideAsync(
             AgentModelTurnRequest request,
@@ -563,7 +945,8 @@ public sealed class AgentPlanningLoopTests
                     {
                         call_count = CallCount,
                         task_id = context.TaskId
-                    }));
+                    },
+                    AgentEvidenceCapabilities.Timeline));
         }
     }
 
@@ -582,4 +965,197 @@ public sealed class AgentPlanningLoopTests
             => throw new InvalidOperationException(
                 "Planning loop must never execute this tool.");
     }
+
+    private sealed class CountingBoundaryTool : IAgentTool
+    {
+        public int CallCount { get; private set; }
+
+        public AgentToolDescriptor Descriptor { get; } = new(
+            "inspect_boundary",
+            "Read-only boundary counter used by planning policy tests.",
+            AgentToolAccess.ReadOnly,
+            AgentToolJson.ParseObject(
+                """
+                {
+                  "type":"object",
+                  "properties":{
+                    "target_kind":{"type":"string"},
+                    "target_id":{"type":"string","format":"uuid"},
+                    "at_seconds":{"type":"number"},
+                    "window_seconds":{"type":"number"},
+                    "detail":{"type":"string"},
+                    "query":{"type":"string"}
+                  },
+                  "required":["target_id","at_seconds"],
+                  "additionalProperties":false
+                }
+                """));
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            JsonElement arguments,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CallCount++;
+            return ValueTask.FromResult(AgentToolExecutionOutput.From(
+                "Boundary observed.",
+                new { sequence_id = context.SourceSequenceId },
+                AgentEvidenceCapabilities.Frames));
+        }
+    }
+
+    private sealed class ContentDiscoveryModel : IAgentModel, IAgentTaskInterpreter
+    {
+        public ValueTask<AgentTaskUnderstanding> UnderstandAsync(
+            AgentModelTurnRequest request,
+            CancellationToken cancellationToken)
+            => ValueTask.FromResult(new AgentTaskUnderstanding(
+                AgentTaskBrief.Create(
+                    AgentTaskKind.Edit,
+                    "Найти и удалить смысловой блок.",
+                    "Исходная последовательность.",
+                    investigationStrategy: AgentInvestigationStrategy.ContentDiscovery),
+                []));
+
+        public ValueTask<AgentModelDecision> DecideAsync(
+            AgentModelTurnRequest request,
+            CancellationToken cancellationToken)
+            => ValueTask.FromResult(AgentModelDecision.AskUser(
+                "Тест завершил обзор материала."));
+    }
+
+    private sealed class ProjectDurationTool(double durationSeconds) : IAgentTool
+    {
+        public AgentToolDescriptor Descriptor { get; } = new(
+            "inspect_project",
+            "Returns source duration for discovery coverage tests.",
+            AgentToolAccess.ReadOnly,
+            AgentToolJson.EmptyObject());
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            JsonElement arguments,
+            CancellationToken cancellationToken)
+            => ValueTask.FromResult(AgentToolExecutionOutput.From(
+                "Project inspected.",
+                new
+                {
+                    channel = "timeline",
+                    sequence_id = context.SourceSequenceId,
+                    duration_seconds = durationSeconds
+                },
+                AgentEvidenceCapabilities.Project | AgentEvidenceCapabilities.Timeline));
+    }
+
+    private sealed class CoverageRangeTool(
+        bool failFirstCall = false,
+        double? permanentlyFailFromSeconds = null,
+        double? blackFrameStart = null) : IAgentTool
+    {
+        public int CallCount { get; private set; }
+        public List<(double Start, double End, string? Detail)> Requests { get; } = [];
+
+        public AgentToolDescriptor Descriptor { get; } = new(
+            "inspect_range",
+            "Frame sensor used by deterministic discovery coverage tests.",
+            AgentToolAccess.ReadOnly,
+            AgentToolJson.ParseObject(
+                """
+                {"type":"object","additionalProperties":true}
+                """));
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            JsonElement arguments,
+            CancellationToken cancellationToken)
+        {
+            CallCount++;
+            var start = arguments.GetProperty("start_seconds").GetDouble();
+            var end = arguments.GetProperty("end_seconds").GetDouble();
+            var detail = arguments.TryGetProperty("detail", out var detailValue)
+                ? detailValue.GetString()
+                : null;
+            Requests.Add((start, end, detail));
+            if ((failFirstCall && CallCount == 1) ||
+                permanentlyFailFromSeconds is { } threshold && start >= threshold)
+            {
+                throw new InvalidOperationException("Transient frame sensor failure.");
+            }
+
+            return ValueTask.FromResult(AgentToolExecutionOutput.From(
+                $"Visible facts observed in {start:0.###}-{end:0.###}s.",
+                new
+                {
+                    channel = "frames",
+                    sequence_id = context.SourceSequenceId,
+                    start_seconds = start,
+                    end_seconds = end,
+                    analyses = blackFrameStart is null
+                        ? []
+                        : new object[]
+                        {
+                            new
+                            {
+                                timeline_start_seconds = start,
+                                timeline_end_seconds = end,
+                                source_start_seconds = start,
+                                source_end_seconds = end,
+                                observation = new
+                                {
+                                    analysis = new
+                                    {
+                                        ranges = new[]
+                                        {
+                                            new
+                                            {
+                                                kind = "blackframe",
+                                                start_seconds = blackFrameStart.Value,
+                                                end_seconds = blackFrameStart.Value + 1.5
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                },
+                AgentEvidenceCapabilities.Frames));
+        }
+    }
+
+    private sealed class BoundaryCaptureTool : IAgentTool
+    {
+        public List<double> AtSeconds { get; } = [];
+
+        public AgentToolDescriptor Descriptor { get; } = new(
+            "inspect_boundary",
+            "Captures deterministic boundary probes.",
+            AgentToolAccess.ReadOnly,
+            AgentToolJson.ParseObject(
+                """
+                {"type":"object","additionalProperties":true}
+                """));
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            JsonElement arguments,
+            CancellationToken cancellationToken)
+        {
+            var at = arguments.GetProperty("at_seconds").GetDouble();
+            AtSeconds.Add(at);
+            return ValueTask.FromResult(AgentToolExecutionOutput.From(
+                $"Boundary around {at:0.###}s observed.",
+                new
+                {
+                    channel = "all",
+                    sequence_id = context.SourceSequenceId,
+                    start_seconds = Math.Max(0, at - 15),
+                    end_seconds = at + 15
+                },
+                AgentEvidenceCapabilities.Frames |
+                AgentEvidenceCapabilities.Audio |
+                AgentEvidenceCapabilities.Transcript));
+        }
+    }
+
 }

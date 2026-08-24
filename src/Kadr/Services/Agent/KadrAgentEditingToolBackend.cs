@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Text.Json;
+using KadrStudio.Application.Automation.Agent.Execution;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.Editing;
 using KadrStudio.Application.Editing;
@@ -15,26 +16,6 @@ public sealed class KadrAgentEditingToolBackend(
     Func<ProjectState> stateProvider,
     Func<string, IEditCommand, bool> commandApplier) : IAgentEditingToolBackend
 {
-    private readonly object _gate = new();
-    private readonly List<AgentAppliedEdit> _editLog = [];
-    private Guid? _taskId;
-    private int _nextEditSequence = 1;
-
-    public void Reset(Guid taskId)
-    {
-        if (taskId == Guid.Empty)
-        {
-            throw new ArgumentException("Task id cannot be empty.", nameof(taskId));
-        }
-
-        lock (_gate)
-        {
-            _taskId = taskId;
-            _editLog.Clear();
-            _nextEditSequence = 1;
-        }
-    }
-
     public ValueTask<JsonElement> RippleDeleteRangeAsync(
         AgentToolContext context,
         double startSeconds,
@@ -43,6 +24,18 @@ public sealed class KadrAgentEditingToolBackend(
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (IsStepAlreadyCommitted(context, "ripple_delete_range"))
+        {
+            var committedDraft = RequireDraft(context);
+            return ValueTask.FromResult(AgentToolJson.ToElement(new
+            {
+                sequence_id = committedDraft.Id,
+                before_duration_seconds = Round(committedDraft.Duration.TotalSeconds),
+                after_duration_seconds = Round(committedDraft.Duration.TotalSeconds),
+                removed_duration_seconds = 0,
+                already_committed = true
+            }));
+        }
         var before = RequireDraft(context);
         var range = new TimeRange(
             TimelineTime.FromSeconds(startSeconds),
@@ -84,6 +77,18 @@ public sealed class KadrAgentEditingToolBackend(
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (IsStepAlreadyCommitted(context, "ripple_delete_ranges"))
+        {
+            var committedDraft = RequireDraft(context);
+            return ValueTask.FromResult(AgentToolJson.ToElement(new
+            {
+                sequence_id = committedDraft.Id,
+                before_duration_seconds = Round(committedDraft.Duration.TotalSeconds),
+                after_duration_seconds = Round(committedDraft.Duration.TotalSeconds),
+                removed_duration_seconds = 0,
+                already_committed = true
+            }));
+        }
         if (ranges is null || ranges.Count == 0)
         {
             throw new AgentToolRejectedException(
@@ -139,7 +144,11 @@ public sealed class KadrAgentEditingToolBackend(
         RequireDraft(context);
         if (!commandApplier(
                 description,
-                new EditBatchCommand(description, commands)))
+                new CommitAgentStepCommand(
+                    context,
+                    "ripple_delete_ranges",
+                    description,
+                    new EditBatchCommand(description, commands))))
         {
             throw new AgentToolRejectedException(
                 "no_change",
@@ -147,15 +156,6 @@ public sealed class KadrAgentEditingToolBackend(
         }
 
         var after = RequireDraft(context);
-        lock (_gate)
-        {
-            _editLog.Add(new AgentAppliedEdit(
-                _nextEditSequence++,
-                "ripple_delete_ranges",
-                reason.Trim(),
-                description,
-                DateTimeOffset.UtcNow));
-        }
 
         return ValueTask.FromResult(AgentToolJson.ToElement(new
         {
@@ -1053,11 +1053,19 @@ public sealed class KadrAgentEditingToolBackend(
         cancellationToken.ThrowIfCancellationRequested();
         var draft = RequireDraft(context);
 
-        AgentAppliedEdit[] edits;
-        lock (_gate)
-        {
-            edits = _editLog.ToArray();
-        }
+        var checkpoint = draft.AgentCheckpoint
+            ?? throw new AgentToolRejectedException(
+                "checkpoint_required",
+                "Agent Draft has no persistent execution checkpoint.");
+        var edits = checkpoint.Receipts
+            .OrderBy(receipt => receipt.Order)
+            .Select((receipt, index) => new AgentAppliedEdit(
+                index + 1,
+                receipt.ToolName,
+                "Approved agent plan",
+                receipt.Summary,
+                receipt.AppliedAt))
+            .ToArray();
 
         return ValueTask.FromResult(AgentToolJson.ToElement(new
         {
@@ -1073,16 +1081,6 @@ public sealed class KadrAgentEditingToolBackend(
 
     private SequenceState RequireDraft(AgentToolContext context)
     {
-        lock (_gate)
-        {
-            if (_taskId != context.TaskId)
-            {
-                throw new AgentToolRejectedException(
-                    "editing_backend_task_mismatch",
-                    "Editing backend is not initialized for this agent task.");
-            }
-        }
-
         if (context.DraftSequenceId is not { } draftId ||
             draftId == context.SourceSequenceId)
         {
@@ -1118,6 +1116,19 @@ public sealed class KadrAgentEditingToolBackend(
                 "invalid_agent_draft",
                 "The active sequence is not the protected draft for this task.");
         }
+        if (draft.AgentCheckpoint is not { } checkpoint)
+        {
+            throw new AgentToolRejectedException(
+                "checkpoint_required",
+                "Agent Draft has no persistent execution checkpoint.");
+        }
+        if (checkpoint.TaskId != context.TaskId ||
+            checkpoint.SourceSequenceId != context.SourceSequenceId)
+        {
+            throw new AgentToolRejectedException(
+                "editing_backend_task_mismatch",
+                "Agent Draft checkpoint belongs to another task or source sequence.");
+        }
 
         return draft;
     }
@@ -1130,8 +1141,18 @@ public sealed class KadrAgentEditingToolBackend(
         IEditCommand command)
     {
         RequireDraft(context);
+        if (IsStepAlreadyCommitted(context, toolName))
+        {
+            return;
+        }
 
-        if (!commandApplier(description, command))
+        if (!commandApplier(
+                description,
+                new CommitAgentStepCommand(
+                    context,
+                    toolName,
+                    description,
+                    command)))
         {
             throw new AgentToolRejectedException(
                 "no_change",
@@ -1139,15 +1160,6 @@ public sealed class KadrAgentEditingToolBackend(
         }
 
         var draft = RequireDraft(context);
-        lock (_gate)
-        {
-            _editLog.Add(new AgentAppliedEdit(
-                _nextEditSequence++,
-                toolName,
-                reason.Trim(),
-                description,
-                DateTimeOffset.UtcNow));
-        }
 
         if (draft.Id != context.DraftSequenceId)
         {
@@ -1155,6 +1167,35 @@ public sealed class KadrAgentEditingToolBackend(
                 "draft_changed",
                 "Agent Draft identity changed during the edit.");
         }
+    }
+
+    private bool IsStepAlreadyCommitted(
+        AgentToolContext context,
+        string toolName)
+    {
+        if (context.PlanStepId is not { } stepId)
+        {
+            return false;
+        }
+
+        var receipt = RequireDraft(context).AgentCheckpoint?.Receipts
+            .FirstOrDefault(item => item.StepId == stepId);
+        if (receipt is null)
+        {
+            return false;
+        }
+        if (!string.Equals(receipt.ToolName, toolName, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                receipt.ArgumentsFingerprint,
+                context.ArgumentsFingerprint,
+                StringComparison.Ordinal))
+        {
+            throw new AgentToolRejectedException(
+                "step_receipt_conflict",
+                "A different action is already committed for this approved plan step.");
+        }
+
+        return true;
     }
 
     private static TransitionKind ParseTransitionKind(string value)

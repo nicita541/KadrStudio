@@ -51,6 +51,7 @@ public sealed class InspectTimelineTool : IAgentTool
 
         return new AgentToolExecutionOutput(
             $"Timeline inspection completed for sequence '{sequenceId}'.",
-            data.Clone());
+            data.Clone(),
+            AgentEvidenceCapabilities.Timeline);
     }
 }

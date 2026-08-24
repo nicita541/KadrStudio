@@ -1,8 +1,10 @@
 using System.Collections.Immutable;
 using System.Text.Json;
 using KadrStudio.Application.Automation.Agent;
+using KadrStudio.Application.Automation.Agent.Execution;
 using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
+using KadrStudio.Core.Domain;
 
 namespace KadrStudio.Core.Tests;
 
@@ -11,9 +13,129 @@ public sealed class AgentExecutionLoopTests
     [Fact]
     public async Task Interpreted_plan_is_executed_once_by_runner_then_verified_automatically()
     {
+        var fixture = CreateExecutingFixture();
+
+        var completed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
+        Assert.Equal(1, fixture.Edit.ExecutionCount);
+        Assert.All(fixture.VerificationTools, tool => Assert.Equal(1, tool.ExecutionCount));
+        Assert.Equal(0, fixture.Model.DecisionCalls);
+        Assert.Single(fixture.Store.Checkpoint!.Receipts);
+        Assert.Equal(AgentDraftExecutionStatus.Completed, fixture.Store.Checkpoint.Status);
+    }
+
+    [Fact]
+    public async Task Model_cannot_turn_a_valid_deterministic_result_into_failure()
+    {
+        var fixture = CreateExecutingFixture(
+            new ReporterModel(false, "Модель сомневается, но политика уже проверила результат."));
+
+        var completed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
+        Assert.Equal("Модель сомневается, но политика уже проверила результат.", completed.CompletionSummary);
+        Assert.Equal(1, fixture.Model.ReportCalls);
+        Assert.Equal(0, fixture.Model.DecisionCalls);
+    }
+
+    [Fact]
+    public async Task Restart_skips_a_step_that_already_has_a_matching_receipt()
+    {
+        var fixture = CreateExecutingFixture();
+        var step = Assert.Single(fixture.Orchestrator.CurrentTask!.Plan!.Steps
+            .Where(item => item.ExpectedEditingTool is not null));
+        fixture.Store.SeedReceipt(step);
+
+        var completed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
+        Assert.Equal(0, fixture.Edit.ExecutionCount);
+        Assert.Single(fixture.Store.Checkpoint!.Receipts);
+        Assert.All(fixture.VerificationTools, tool => Assert.Equal(1, tool.ExecutionCount));
+    }
+
+    [Fact]
+    public async Task Negative_deterministic_verification_cannot_be_overridden_by_model()
+    {
+        var fixture = CreateExecutingFixture(invalidIntegrity: true);
+
+        var failed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("overlapping", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, fixture.Model.ReportCalls);
+        Assert.Equal(0, fixture.Model.DecisionCalls);
+    }
+
+    [Fact]
+    public async Task Execution_requires_a_persistent_checkpoint()
+    {
+        var fixture = CreateExecutingFixture(withCheckpoint: false);
+
+        var failed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("checkpoint", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, fixture.Edit.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task Execution_does_not_accept_plan_replacement_or_missing_approved_tool()
+    {
+        var fixture = CreateExecutingFixture(registerEditingTool: false);
+
+        var failed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("approved editing tool", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, fixture.Model.DecisionCalls);
+    }
+
+    [Fact]
+    public async Task Receipt_arguments_must_exactly_match_the_approved_step()
+    {
+        var fixture = CreateExecutingFixture();
+        var step = Assert.Single(fixture.Orchestrator.CurrentTask!.Plan!.Steps
+            .Where(item => item.ExpectedEditingTool is not null));
+        fixture.Store.SeedReceipt(step, "WRONG-ARGUMENTS-FINGERPRINT");
+
+        var failed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("does not match the plan", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, fixture.Edit.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task Production_verification_requires_all_deterministic_tools()
+    {
+        var fixture = CreateExecutingFixture(registerComparisonTool: false);
+
+        var failed = await fixture.CreateLoop().RunUntilPauseAsync();
+
+        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
+        Assert.Contains("compare_sequences", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(1, fixture.Edit.ExecutionCount);
+        Assert.Equal(0, fixture.Model.ReportCalls);
+    }
+
+    private static Fixture CreateExecutingFixture(
+        ReporterModel? model = null,
+        bool invalidIntegrity = false,
+        bool withCheckpoint = true,
+        bool registerEditingTool = true,
+        bool registerComparisonTool = true)
+    {
+        const long sourceRevision = 7;
+        var sourceSequenceId = Guid.NewGuid();
+        var draftSequenceId = Guid.NewGuid();
         var orchestrator = new AiAgentOrchestrator();
-        var sourceId = Guid.NewGuid();
-        orchestrator.StartTask(Guid.NewGuid(), sourceId, "Выполни утверждённую задачу.");
+        orchestrator.StartTask(
+            Guid.NewGuid(),
+            sourceSequenceId,
+            "Выполни задачу по утверждённому плану.",
+            sourceSequenceRevision: sourceRevision);
         orchestrator.SetTaskBrief(AgentTaskBrief.Create(
             AgentTaskKind.Edit,
             "Выполнить одно изменение",
@@ -21,456 +143,158 @@ public sealed class AgentExecutionLoopTests
         orchestrator.BeginPlanning();
         orchestrator.PublishPlan(CreatePlanDraft());
         orchestrator.ApprovePlan();
-        orchestrator.BeginExecution(Guid.NewGuid());
+        orchestrator.BeginExecution(draftSequenceId);
 
-        var edit = new CountingTool("fake_edit", AgentToolAccess.Editing);
-        var editLog = new CountingTool("inspect_agent_edits", AgentToolAccess.ReadOnly);
-        var integrity = new CountingTool("inspect_timeline_integrity", AgentToolAccess.ReadOnly);
-        var compare = new CountingTool("compare_sequences", AgentToolAccess.ReadOnly);
-        var registry = CreateRegistry(edit, editLog, integrity, compare);
-        var model = new QueueAgentModel(
-            AgentModelDecision.CompleteTask("Утверждённое действие выполнено и проверено."));
-
-        var completed = await new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model).RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
-        Assert.Equal(1, edit.ExecutionCount);
-        Assert.Equal(1, editLog.ExecutionCount);
-        Assert.Equal(1, integrity.ExecutionCount);
-        Assert.Equal(1, compare.ExecutionCount);
-    }
-
-    [Fact]
-    public async Task Approved_plan_executes_on_draft_then_requires_verification()
-    {
-        var orchestrator = CreateExecutingTask();
-        var editingTool = new CountingTool(
-            "fake_edit",
-            AgentToolAccess.Editing);
-        var editLogTool = new CountingTool(
-            "inspect_agent_edits",
-            AgentToolAccess.ReadOnly);
-        var readTool = new CountingTool(
-            "inspect_timeline",
-            AgentToolAccess.ReadOnly);
-        var registry = CreateRegistry(
-            editingTool,
-            editLogTool,
-            readTool);
-        var model = new QueueAgentModel(
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.EmptyObject(),
-                "Выполняю изменение."),
-            AgentModelDecision.BeginVerification(
-                "Проверяю результат."),
-            AgentModelDecision.UseTool(
-                "inspect_agent_edits",
-                AgentToolJson.EmptyObject(),
-                "Сверяю журнал изменений."),
-            AgentModelDecision.UseTool(
-                "inspect_timeline",
-                AgentToolJson.EmptyObject(),
-                "Сверяю черновик."),
-            AgentModelDecision.CompleteTask(
-                "Черновик выполнен и проверен."));
-
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var completed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
-        Assert.Equal(
-            "Черновик выполнен и проверен.",
-            completed.CompletionSummary);
-        Assert.Equal(1, editingTool.ExecutionCount);
-        Assert.Equal(1, editLogTool.ExecutionCount);
-        Assert.Equal(1, readTool.ExecutionCount);
-        Assert.Contains(
-            loop.Observations,
-            item => item.ToolName == "fake_edit" && item.Status == AgentToolResultStatus.Succeeded);
-        Assert.Contains(
-            loop.Observations,
-            item => item.ToolName == "inspect_timeline" && item.Status == AgentToolResultStatus.Succeeded);
-    }
-
-    [Fact]
-    public async Task Approved_edit_cannot_execute_twice_during_verification()
-    {
-        var orchestrator = CreateExecutingTask();
-        var editingTool = new CountingTool(
-            "fake_edit",
-            AgentToolAccess.Editing);
-        var editLogTool = new CountingTool(
-            "inspect_agent_edits",
-            AgentToolAccess.ReadOnly);
-        var readTool = new CountingTool(
-            "inspect_timeline",
-            AgentToolAccess.ReadOnly);
-        var registry = CreateRegistry(
-            editingTool,
-            editLogTool,
-            readTool);
-        var model = new QueueAgentModel(
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.BeginVerification(),
-            AgentModelDecision.UseTool(
-                "inspect_agent_edits",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "inspect_timeline",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask(
-                "Нельзя завершать до повторной проверки."),
-            AgentModelDecision.UseTool(
-                "inspect_agent_edits",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "inspect_timeline",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask(
-                "Исправление повторно проверено."));
-
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var completed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
-        Assert.Equal(
-            "Нельзя завершать до повторной проверки.",
-            completed.CompletionSummary);
-        Assert.Equal(1, editingTool.ExecutionCount);
-        Assert.Equal(1, editLogTool.ExecutionCount);
-        Assert.Equal(1, readTool.ExecutionCount);
-        Assert.Contains(
-            loop.Observations,
-            item => item.ErrorCode == "editing_arguments_not_approved");
-    }
-
-    [Fact]
-    public async Task Execution_question_pauses_and_answer_resumes_same_draft()
-    {
-        var orchestrator = CreateExecutingTask();
-        var editingTool = new CountingTool(
-            "fake_edit",
-            AgentToolAccess.Editing);
-        var editLogTool = new CountingTool(
-            "inspect_agent_edits",
-            AgentToolAccess.ReadOnly);
-        var readTool = new CountingTool(
-            "inspect_timeline",
-            AgentToolAccess.ReadOnly);
-        var registry = CreateRegistry(
-            editingTool,
-            editLogTool,
-            readTool);
-        var model = new QueueAgentModel(
-            AgentModelDecision.AskUser(
-                "Какой из двух вариантов использовать?",
-                "Инструменты не позволяют надёжно выбрать."),
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.BeginVerification(),
-            AgentModelDecision.UseTool(
-                "inspect_agent_edits",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "inspect_timeline",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask(
-                "Ответ пользователя учтён; результат проверен."));
-
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var waiting = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(
-            AgentTaskPhase.WaitingForUserInput,
-            waiting.Phase);
-        Assert.Equal(
-            AgentTaskPhase.Executing,
-            waiting.ResumePhase);
-        Assert.True(waiting.IsDraftReadOnlyForUser);
-
-        var question = Assert.Single(waiting.Questions);
-        orchestrator.AnswerQuestion(
-            question.Id,
-            "Используй второй вариант.");
-
-        var completed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
-        Assert.Equal(waiting.DraftSequenceId, completed.DraftSequenceId);
-        Assert.False(completed.IsDraftReadOnlyForUser);
-    }
-
-    [Fact]
-    public async Task Verification_requires_inspection_of_the_actual_agent_draft()
-    {
-        var orchestrator = CreateExecutingTask();
-        var editingTool = new CountingTool(
-            "fake_edit",
-            AgentToolAccess.Editing);
-        var editLogTool = new CountingTool(
-            "inspect_agent_edits",
-            AgentToolAccess.ReadOnly);
-        var projectTool = new CountingTool(
-            "inspect_project",
-            AgentToolAccess.ReadOnly);
-        var sourceTimelineTool = new SourceTimelineTool();
-        var draftTimelineTool = new CountingTool(
-            "inspect_timeline",
-            AgentToolAccess.ReadOnly);
-        var registry = CreateRegistry(
-            editingTool,
-            editLogTool,
-            projectTool,
-            sourceTimelineTool,
-            draftTimelineTool);
-        var model = new QueueAgentModel(
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.BeginVerification(),
-            AgentModelDecision.UseTool(
-                "inspect_agent_edits",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "inspect_project",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool(
-                "inspect_source_timeline",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask(
-                "Нельзя завершить без проверки Agent Draft."),
-            AgentModelDecision.UseTool(
-                "inspect_timeline",
-                AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask(
-                "Agent Draft проверен."));
-
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var completed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Completed, completed.Phase);
-        Assert.Equal("Agent Draft проверен.", completed.CompletionSummary);
-        Assert.Contains(
-            loop.Observations,
-            item => item.ErrorCode == "verification_observation_required");
-    }
-
-    [Fact]
-    public async Task Execution_does_not_accept_plan_replacement()
-    {
-        var orchestrator = CreateExecutingTask();
-        var registry = CreateRegistry(
-            new CountingTool(
-                "inspect_result",
-                AgentToolAccess.ReadOnly));
-        var model = new QueueAgentModel(
-            AgentModelDecision.PublishPlan(
-                CreatePlanDraft()));
-
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var failed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
-        Assert.Contains(
-            "approved plan",
-            failed.FailureMessage ?? string.Empty,
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public async Task Repeated_verification_without_a_successful_edit_fails_bounded()
-    {
-        var orchestrator = CreateExecutingTask();
-        var registry = CreateRegistry(
-            new CountingTool("inspect_timeline", AgentToolAccess.ReadOnly));
-        var model = new QueueAgentModel(
-            AgentModelDecision.BeginVerification("Проверяю якобы выполненное изменение."),
-            AgentModelDecision.BeginVerification("Изменение уже сделано."));
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var failed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
-        Assert.Contains("without making any approved edit", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(2, loop.Observations.Count(item => item.ErrorCode == "successful_edit_required"));
-    }
-
-    [Fact]
-    public async Task Editing_arguments_must_exactly_match_the_approved_step()
-    {
-        var orchestrator = CreateExecutingTask();
-        var editingTool = new CountingTool("fake_edit", AgentToolAccess.Editing);
-        var registry = CreateRegistry(editingTool);
-        var model = new QueueAgentModel(
-            AgentModelDecision.UseTool(
-                "fake_edit",
-                AgentToolJson.ParseObject("{\"clip_id\":\"00000000-0000-0000-0000-000000000001\"}")),
-            AgentModelDecision.AskUser(
-                "Нужно пересмотреть план.",
-                "Аргументы действия изменились."));
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var waiting = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.WaitingForUserInput, waiting.Phase);
-        Assert.Equal(0, editingTool.ExecutionCount);
-        Assert.Contains(
-            loop.Observations,
-            observation => observation.ErrorCode == "editing_arguments_not_approved");
-    }
-
-    [Fact]
-    public async Task Production_verification_requires_timeline_integrity_tool()
-    {
-        var orchestrator = CreateExecutingTask();
-        var registry = CreateRegistry(
-            new CountingTool("fake_edit", AgentToolAccess.Editing),
-            new CountingTool("inspect_agent_edits", AgentToolAccess.ReadOnly),
-            new CountingTool("inspect_timeline", AgentToolAccess.ReadOnly),
-            new CountingTool("inspect_timeline_integrity", AgentToolAccess.ReadOnly));
-        var model = new QueueAgentModel(
-            AgentModelDecision.UseTool("fake_edit", AgentToolJson.EmptyObject()),
-            AgentModelDecision.BeginVerification(),
-            AgentModelDecision.UseTool("inspect_agent_edits", AgentToolJson.EmptyObject()),
-            AgentModelDecision.UseTool("inspect_timeline", AgentToolJson.EmptyObject()),
-            AgentModelDecision.CompleteTask("Проверка якобы завершена."),
-            AgentModelDecision.CompleteTask("Проверка якобы завершена."));
-        var loop = new AgentExecutionLoop(
-            orchestrator,
-            registry,
-            new AgentToolExecutor(registry),
-            model);
-
-        var failed = await loop.RunUntilPauseAsync();
-
-        Assert.Equal(AgentTaskPhase.Failed, failed.Phase);
-        Assert.Contains("gaps", failed.FailureMessage, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(
-            2,
-            loop.Observations.Count(observation =>
-                observation.ErrorCode == "verification_integrity_required"));
-    }
-
-    private static AiAgentOrchestrator CreateExecutingTask()
-    {
-        var orchestrator = new AiAgentOrchestrator();
-        var sourceSequenceId = Guid.NewGuid();
-
-        orchestrator.StartTask(
-            Guid.NewGuid(),
+        var task = orchestrator.CurrentTask!;
+        var plan = task.Plan!;
+        var checkpoint = withCheckpoint
+            ? new AgentDraftCheckpoint(
+                task.Id,
+                plan.Id,
+                plan.Version,
+                AgentPlanFingerprint.Create(plan),
+                sourceSequenceId,
+                sourceRevision,
+                AgentDraftExecutionStatus.Executing,
+                [],
+                DateTimeOffset.UtcNow)
+            : null;
+        var store = new TestCheckpointStore(
+            draftSequenceId,
             sourceSequenceId,
-            "Выполни задачу по утверждённому плану.");
-        orchestrator.BeginPlanning();
-        orchestrator.PublishPlan(CreatePlanDraft());
-        orchestrator.ApprovePlan();
-        orchestrator.BeginExecution(Guid.NewGuid());
+            sourceRevision,
+            checkpoint);
+        var edit = new CheckpointEditingTool(store);
+        var editLog = new VerificationTool("inspect_agent_edits", store);
+        var integrity = new VerificationTool(
+            "inspect_timeline_integrity",
+            store,
+            invalidIntegrity);
+        var compare = new VerificationTool("compare_sequences", store);
+        var registry = new AgentToolRegistry();
+        if (registerEditingTool)
+        {
+            registry.Register(edit);
+        }
+        registry.Register(editLog);
+        registry.Register(integrity);
+        if (registerComparisonTool)
+        {
+            registry.Register(compare);
+        }
 
-        return orchestrator;
+        return new Fixture(
+            orchestrator,
+            registry,
+            store,
+            edit,
+            [editLog, integrity, compare],
+            model ?? new ReporterModel(true, "Agent Draft детерминированно проверен."));
     }
 
     private static AgentPlanDraft CreatePlanDraft()
         => AgentPlanDraft.Create(
             "Собрать безопасный Agent Draft.",
             "Изменить только то, что явно входит в задачу.",
-            new[]
-            {
-                "Не менять исходную последовательность."
-            },
-            new[]
-            {
+            ["Не менять исходную последовательность."],
+            [
                 new AgentPlanStepDraft(
                     "Выполнить изменение",
-                    "Использовать безопасные editing tools.",
+                    "Использовать безопасный editing tool.",
                     "fake_edit",
                     ExpectedEditingArguments: AgentToolJson.EmptyObject()),
                 new AgentPlanStepDraft(
                     "Проверить",
                     "Сверить фактический результат read-only tools.")
-            });
+            ]);
 
-    private static AgentToolRegistry CreateRegistry(
-        params IAgentTool[] tools)
+    private sealed record Fixture(
+        AiAgentOrchestrator Orchestrator,
+        AgentToolRegistry Registry,
+        TestCheckpointStore Store,
+        CheckpointEditingTool Edit,
+        ImmutableArray<VerificationTool> VerificationTools,
+        ReporterModel Model)
     {
-        var registry = new AgentToolRegistry();
-        foreach (var tool in tools)
-        {
-            registry.Register(tool);
-        }
-
-        return registry;
+        public AgentExecutionLoop CreateLoop()
+            => new(
+                Orchestrator,
+                Registry,
+                new AgentToolExecutor(Registry),
+                Model,
+                checkpointStore: Store);
     }
 
-    private sealed class QueueAgentModel(
-        params AgentModelDecision[] decisions) : IAgentModel
+    private sealed class ReporterModel(
+        bool accepted,
+        string summary) : IAgentModel, IAgentVerificationReporter
     {
-        private readonly Queue<AgentModelDecision> _decisions =
-            new(decisions);
+        public int DecisionCalls { get; private set; }
+        public int ReportCalls { get; private set; }
 
         public ValueTask<AgentModelDecision> DecideAsync(
             AgentModelTurnRequest request,
             CancellationToken cancellationToken)
         {
+            DecisionCalls++;
+            throw new InvalidOperationException(
+                "Execution must not ask the model to select editing tools or verification outcomes.");
+        }
+
+        public ValueTask<AgentVerificationReport> ReportVerificationAsync(
+            AgentVerificationReportRequest request,
+            CancellationToken cancellationToken)
+        {
             cancellationToken.ThrowIfCancellationRequested();
-
-            if (_decisions.Count == 0)
-            {
-                throw new InvalidOperationException(
-                    "Fake model has no remaining decision.");
-            }
-
-            return ValueTask.FromResult(_decisions.Dequeue());
+            ReportCalls++;
+            return ValueTask.FromResult(new AgentVerificationReport(
+                accepted,
+                summary,
+                accepted ? [] : ["Model-only objection"]));
         }
     }
 
-    private sealed class SourceTimelineTool : IAgentTool
+    private sealed class CheckpointEditingTool(
+        TestCheckpointStore store) : IAgentTool
     {
+        public int ExecutionCount { get; private set; }
+
         public AgentToolDescriptor Descriptor { get; } = new(
-            "inspect_source_timeline",
-            "Returns a non-draft sequence observation for verification tests.",
+            "fake_edit",
+            "Commits one approved test edit.",
+            AgentToolAccess.Editing,
+            AgentToolJson.EmptyObject());
+
+        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
+            AgentToolContext context,
+            JsonElement arguments,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!store.Commit(context, Descriptor.Name))
+            {
+                throw new AgentToolRejectedException(
+                    "Agent Draft has no persistent execution checkpoint.",
+                    "checkpoint_required");
+            }
+
+            ExecutionCount++;
+            return ValueTask.FromResult(AgentToolExecutionOutput.From(
+                "Committed approved edit.",
+                new { sequence_id = context.DraftSequenceId }));
+        }
+    }
+
+    private sealed class VerificationTool(
+        string name,
+        TestCheckpointStore store,
+        bool invalidIntegrity = false) : IAgentTool
+    {
+        public int ExecutionCount { get; private set; }
+
+        public AgentToolDescriptor Descriptor { get; } = new(
+            name,
+            "Returns deterministic test facts.",
             AgentToolAccess.ReadOnly,
             AgentToolJson.EmptyObject());
 
@@ -480,42 +304,131 @@ public sealed class AgentExecutionLoopTests
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return ValueTask.FromResult(
-                AgentToolExecutionOutput.From(
-                    "Inspected source timeline.",
-                    new { sequence_id = context.SourceSequenceId }));
+            ExecutionCount++;
+            return ValueTask.FromResult(name switch
+            {
+                "inspect_agent_edits" => AgentToolExecutionOutput.From(
+                    "Read persistent receipts.",
+                    new
+                    {
+                        edit_count = store.Checkpoint?.Receipts.Length ?? 0,
+                        edits = store.Checkpoint?.Receipts
+                            .Select(receipt => new { toolName = receipt.ToolName })
+                            .ToArray() ?? []
+                    },
+                    AgentEvidenceCapabilities.EditLog),
+                "inspect_timeline_integrity" => AgentToolExecutionOutput.From(
+                    "Inspected Agent Draft integrity.",
+                    new
+                    {
+                        sequence_id = context.DraftSequenceId,
+                        overlap_count = invalidIntegrity ? 1 : 0,
+                        link_issue_count = 0
+                    },
+                    AgentEvidenceCapabilities.Integrity),
+                "compare_sequences" => AgentToolExecutionOutput.From(
+                    "Compared source and Agent Draft.",
+                    new
+                    {
+                        source_sequence_id = context.SourceSequenceId,
+                        draft_sequence_id = context.DraftSequenceId,
+                        source_revision = store.SourceRevision,
+                        draft_duration_seconds = 60d
+                    },
+                    AgentEvidenceCapabilities.SequenceDiff),
+                _ => throw new InvalidOperationException(name)
+            });
         }
     }
 
-    private sealed class CountingTool(
-        string name,
-        AgentToolAccess access) : IAgentTool
+    private sealed class TestCheckpointStore(
+        Guid draftSequenceId,
+        Guid sourceSequenceId,
+        long sourceRevision,
+        AgentDraftCheckpoint? checkpoint) : IAgentCheckpointStore
     {
-        public int ExecutionCount { get; private set; }
+        public long SourceRevision { get; } = sourceRevision;
+        public AgentDraftCheckpoint? Checkpoint { get; private set; } = checkpoint;
 
-        public AgentToolDescriptor Descriptor { get; } = new(
-            name,
-            "Test tool.",
-            access,
-            AgentToolJson.EmptyObject());
+        public AgentDraftCheckpoint? Read(Guid requestedDraftSequenceId)
+            => requestedDraftSequenceId == draftSequenceId ? Checkpoint : null;
 
-        public ValueTask<AgentToolExecutionOutput> ExecuteAsync(
-            AgentToolContext context,
-            JsonElement arguments,
-            CancellationToken cancellationToken)
+        public long? ReadSequenceRevision(Guid sequenceId)
+            => sequenceId == sourceSequenceId ? SourceRevision : null;
+
+        public bool IsAgentDraft(Guid requestedDraftSequenceId, Guid requestedSourceSequenceId)
+            => requestedDraftSequenceId == draftSequenceId &&
+               requestedSourceSequenceId == sourceSequenceId;
+
+        public bool SetStatus(AgentTaskState task, AgentDraftExecutionStatus status)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            ExecutionCount++;
+            if (task.DraftSequenceId != draftSequenceId || Checkpoint is null)
+            {
+                return false;
+            }
 
-            return ValueTask.FromResult(
-                AgentToolExecutionOutput.From(
-                    $"Executed {name}.",
-                    new
-                    {
-                        task_id = context.TaskId,
-                        draft_sequence_id = context.DraftSequenceId,
-                        sequence_id = context.DraftSequenceId
-                    }));
+            Checkpoint = Checkpoint with
+            {
+                Status = status,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+            return true;
+        }
+
+        public bool Commit(AgentToolContext context, string toolName)
+        {
+            if (Checkpoint is null ||
+                context.PlanStepId is not { } stepId ||
+                context.PlanStepOrder is not { } order ||
+                string.IsNullOrWhiteSpace(context.ArgumentsFingerprint))
+            {
+                return false;
+            }
+            if (Checkpoint.Receipts.Any(receipt => receipt.StepId == stepId))
+            {
+                return true;
+            }
+
+            var before = Checkpoint.Receipts.IsEmpty
+                ? 0
+                : Checkpoint.Receipts.Max(receipt => receipt.AfterDraftRevision);
+            var receipt = new AgentStepReceipt(
+                stepId,
+                order,
+                toolName,
+                context.ArgumentsFingerprint,
+                before,
+                before + 1,
+                "Committed approved edit.",
+                DateTimeOffset.UtcNow);
+            Checkpoint = Checkpoint with
+            {
+                Receipts = Checkpoint.Receipts.Add(receipt),
+                UpdatedAt = receipt.AppliedAt
+            };
+            return true;
+        }
+
+        public void SeedReceipt(
+            AgentPlanStep step,
+            string? argumentsFingerprint = null)
+        {
+            var arguments = Assert.IsType<JsonElement>(step.ExpectedEditingArguments);
+            var receipt = new AgentStepReceipt(
+                step.Id,
+                step.Order,
+                step.ExpectedEditingTool!,
+                argumentsFingerprint ?? AgentPlanFingerprint.CreateArguments(
+                    step.ExpectedEditingTool!,
+                    arguments),
+                0,
+                1,
+                "Previously committed edit.",
+                DateTimeOffset.UtcNow);
+            Checkpoint = Assert.IsType<AgentDraftCheckpoint>(Checkpoint) with
+            {
+                Receipts = [receipt]
+            };
         }
     }
 }

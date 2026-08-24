@@ -27,8 +27,13 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
         double duration,
         CancellationToken cancellationToken = default)
     {
-        var embedded = await TryExtractEmbeddedSubtitlesAsync(asset, sourceStart, duration, preferSigns: false, cancellationToken);
-        if (embedded.Count > 0)
+        var embedded = await TryExtractEmbeddedSubtitlesAsync(
+            asset,
+            sourceStart,
+            duration,
+            preferSigns: false,
+            cancellationToken).ConfigureAwait(false);
+        if (embedded is not null)
         {
             return new SubtitleTranscriptionResult(embedded, "встроенная русская дорожка субтитров");
         }
@@ -49,9 +54,29 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
         double duration,
         bool preferSigns,
         CancellationToken cancellationToken = default)
-        => TryExtractEmbeddedSubtitlesAsync(asset, sourceStart, duration, preferSigns, cancellationToken);
+        => ExtractEmbeddedTextCoreAsync(asset, sourceStart, duration, preferSigns, cancellationToken);
 
-    private async Task<IReadOnlyList<SubtitleCue>> TryExtractEmbeddedSubtitlesAsync(
+    private async Task<IReadOnlyList<SubtitleCue>> ExtractEmbeddedTextCoreAsync(
+        MediaAsset asset,
+        double sourceStart,
+        double duration,
+        bool preferSigns,
+        CancellationToken cancellationToken)
+        => await TryExtractEmbeddedSubtitlesAsync(
+               asset,
+               sourceStart,
+               duration,
+               preferSigns,
+               cancellationToken).ConfigureAwait(false)
+           ?? Array.Empty<SubtitleCue>();
+
+    /// <summary>
+    /// Returns null when an embedded subtitle sensor could not be used. An empty
+    /// collection means the selected embedded stream was read successfully and
+    /// contained no cues in the exact requested range. That negative measurement
+    /// is valid transcript evidence and must not be replaced by a Whisper error.
+    /// </summary>
+    private async Task<IReadOnlyList<SubtitleCue>?> TryExtractEmbeddedSubtitlesAsync(
         MediaAsset asset,
         double sourceStart,
         double duration,
@@ -64,7 +89,7 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
             cancellationToken: cancellationToken);
         if (probe.ExitCode != 0)
         {
-            return Array.Empty<SubtitleCue>();
+            return null;
         }
 
         int? selectedIndex = null;
@@ -100,11 +125,11 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
         }
         catch (JsonException)
         {
-            return Array.Empty<SubtitleCue>();
+            return null;
         }
         if (selectedIndex is null || selectedScore < 10)
         {
-            return Array.Empty<SubtitleCue>();
+            return null;
         }
 
         var temporaryDirectory = CreateTemporaryDirectory();
@@ -116,7 +141,7 @@ public sealed partial class AutoSubtitleService(FfmpegLocator locator, ProcessRu
                 cancellationToken: cancellationToken);
             if (extract.ExitCode != 0 || !File.Exists(srtPath))
             {
-                return Array.Empty<SubtitleCue>();
+                return null;
             }
             var end = sourceStart + duration;
             return ParseSrt(await File.ReadAllTextAsync(srtPath, cancellationToken))

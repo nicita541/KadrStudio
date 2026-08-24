@@ -19,8 +19,9 @@ public abstract class AgentEditingToolBase(
 
     protected static AgentToolExecutionOutput Output(
         string summary,
-        JsonElement data)
-        => new(summary, data.Clone());
+        JsonElement data,
+        AgentEvidenceCapabilities evidenceCapabilities = AgentEvidenceCapabilities.None)
+        => new(summary, data.Clone(), evidenceCapabilities);
 }
 
 public sealed class RippleDeleteRangeAgentTool(
@@ -577,6 +578,7 @@ public sealed class InspectAgentEditsTool(
 
         return Output(
             "Agent edit log inspected.",
-            data);
+            data,
+            AgentEvidenceCapabilities.EditLog);
     }
 }

@@ -14,7 +14,13 @@ public sealed record AgentToolCall(
     Guid TaskId,
     string ToolName,
     JsonElement Arguments,
-    DateTimeOffset RequestedAt)
+    DateTimeOffset RequestedAt,
+    Guid? PlanId = null,
+    int? PlanVersion = null,
+    Guid? PlanStepId = null,
+    int? PlanStepOrder = null,
+    string? PlanFingerprint = null,
+    string? ArgumentsFingerprint = null)
 {
     public static AgentToolCall Create(
         Guid taskId,
@@ -39,6 +45,38 @@ public sealed record AgentToolCall(
             DateTimeOffset.UtcNow);
     }
 
+    public static AgentToolCall CreateApprovedStep(
+        AgentTaskState task,
+        AgentPlanStep step)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        ArgumentNullException.ThrowIfNull(step);
+        var plan = task.Plan
+            ?? throw new AgentTaskTransitionException(
+                "Approved editing step requires a plan.");
+        if (step.ExpectedEditingArguments is not { ValueKind: JsonValueKind.Object } arguments ||
+            string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
+        {
+            throw new AgentTaskTransitionException(
+                "Approved editing step requires a tool and exact arguments.");
+        }
+
+        return new AgentToolCall(
+            Guid.NewGuid(),
+            task.Id,
+            step.ExpectedEditingTool.Trim(),
+            arguments.Clone(),
+            DateTimeOffset.UtcNow,
+            plan.Id,
+            plan.Version,
+            step.Id,
+            step.Order,
+            AgentPlanFingerprint.Create(plan),
+            AgentPlanFingerprint.CreateArguments(
+                step.ExpectedEditingTool,
+                arguments));
+    }
+
     public static AgentToolCall Create(
         Guid taskId,
         string toolName)
@@ -47,12 +85,14 @@ public sealed record AgentToolCall(
 
 public sealed record AgentToolExecutionOutput(
     string Summary,
-    JsonElement Data)
+    JsonElement Data,
+    AgentEvidenceCapabilities EvidenceCapabilities = AgentEvidenceCapabilities.None)
 {
     public static AgentToolExecutionOutput From<T>(
         string summary,
-        T data)
-        => new(summary, AgentToolJson.ToElement(data));
+        T data,
+        AgentEvidenceCapabilities evidenceCapabilities = AgentEvidenceCapabilities.None)
+        => new(summary, AgentToolJson.ToElement(data), evidenceCapabilities);
 }
 
 public sealed record AgentToolResult(
@@ -63,7 +103,8 @@ public sealed record AgentToolResult(
     JsonElement? Data,
     string? ErrorCode,
     DateTimeOffset StartedAt,
-    DateTimeOffset CompletedAt)
+    DateTimeOffset CompletedAt,
+    AgentEvidenceCapabilities EvidenceCapabilities = AgentEvidenceCapabilities.None)
 {
     public bool IsSuccess => Status == AgentToolResultStatus.Succeeded;
 
@@ -75,12 +116,28 @@ public sealed record AgentToolContext(
     Guid ProjectId,
     Guid SourceSequenceId,
     Guid? DraftSequenceId,
-    AgentTaskPhase Phase)
+    AgentTaskPhase Phase,
+    Guid? PlanId = null,
+    int? PlanVersion = null,
+    Guid? PlanStepId = null,
+    int? PlanStepOrder = null,
+    string? PlanFingerprint = null,
+    string? ArgumentsFingerprint = null)
 {
     public Guid DefaultReadSequenceId =>
         DraftSequenceId ?? SourceSequenceId;
 
-    public static AgentToolContext FromTask(AgentTaskState state)
+    public bool IsApprovedEditingStep =>
+        PlanId.HasValue &&
+        PlanVersion.HasValue &&
+        PlanStepId.HasValue &&
+        PlanStepOrder.HasValue &&
+        !string.IsNullOrWhiteSpace(PlanFingerprint) &&
+        !string.IsNullOrWhiteSpace(ArgumentsFingerprint);
+
+    public static AgentToolContext FromTask(
+        AgentTaskState state,
+        AgentToolCall? call = null)
     {
         ArgumentNullException.ThrowIfNull(state);
 
@@ -89,7 +146,13 @@ public sealed record AgentToolContext(
             state.ProjectId,
             state.SourceSequenceId,
             state.DraftSequenceId,
-            state.Phase);
+            state.Phase,
+            call?.PlanId,
+            call?.PlanVersion,
+            call?.PlanStepId,
+            call?.PlanStepOrder,
+            call?.PlanFingerprint,
+            call?.ArgumentsFingerprint);
     }
 }
 

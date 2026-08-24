@@ -10,7 +10,7 @@ namespace KadrStudio.Infrastructure.Storage;
 
 public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IProjectStore
 {
-    private const int CurrentSchemaVersion = 5;
+    private const int CurrentSchemaVersion = 6;
     private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
@@ -1009,7 +1009,7 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
                 conversation_id TEXT NOT NULL REFERENCES ai_conversation(id) ON DELETE CASCADE,
                 message_order INTEGER NOT NULL CHECK(message_order >= 0),
                 role INTEGER NOT NULL CHECK(role BETWEEN 0 AND 1),
-                kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 5),
+                kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 6),
                 operation_state INTEGER NOT NULL CHECK(operation_state BETWEEN 0 AND 4),
                 created_at TEXT NOT NULL,
                 message_json TEXT NOT NULL CHECK(length(message_json) > 2),

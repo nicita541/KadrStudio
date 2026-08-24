@@ -20,6 +20,9 @@ public sealed class InspectEditorContextTool(IAgentReadOnlyToolBackend backend) 
     {
         AgentToolJson.EnsureOnlyProperties(arguments);
         var data = await backend.InspectEditorContextAsync(context, cancellationToken);
-        return new AgentToolExecutionOutput("Editor context inspected.", data.Clone());
+        return new AgentToolExecutionOutput(
+            "Editor context inspected.",
+            data.Clone(),
+            AgentEvidenceCapabilities.EditorContext);
     }
 }

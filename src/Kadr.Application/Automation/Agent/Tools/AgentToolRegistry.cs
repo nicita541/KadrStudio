@@ -40,6 +40,23 @@ public sealed partial class AgentToolRegistry
         return _tools.TryGetValue(name.Trim(), out tool);
     }
 
+    public bool TryValidateArguments(
+        string toolName,
+        System.Text.Json.JsonElement arguments,
+        out string error)
+    {
+        if (!TryGet(toolName, out var tool) || tool is null)
+        {
+            error = $"Agent tool '{toolName}' is not registered.";
+            return false;
+        }
+
+        return AgentJsonSchemaValidator.TryValidate(
+            arguments,
+            tool.Descriptor.InputSchema,
+            out error);
+    }
+
     private static void ValidateDescriptor(AgentToolDescriptor descriptor)
     {
         ArgumentNullException.ThrowIfNull(descriptor);

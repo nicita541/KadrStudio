@@ -75,7 +75,7 @@ public sealed class StructuredInferencePipeline
         var firstResponse = await _runtime.ChatAsync(model, firstRequest, cancellationToken)
             .ConfigureAwait(false);
         var first = ReadAttempt(firstResponse);
-        if (StructuredOutputValidator.TryValidate(
+        if (TryNormalizeStructuredOutput(
                 first.Content,
                 payload.Schema,
                 out var normalized,
@@ -98,28 +98,11 @@ public sealed class StructuredInferencePipeline
             .ConfigureAwait(false);
         var repair = ReadAttempt(repairResponse);
 
-        if (StructuredOutputValidator.TryValidate(
+        if (TryNormalizeStructuredOutput(
                 repair.Content,
                 payload.Schema,
                 out normalized,
                 out var repairErrors))
-        {
-            return StructuredInferenceResult.Success(
-                normalized,
-                repair.DoneReason,
-                repair.EvalCount,
-                payload.Think ? first.EvalCount : 0,
-                2);
-        }
-
-        if (StructuredOutputValidator.TryCloseOpenContainers(
-                repair.Content,
-                out var structurallyCompleted) &&
-            StructuredOutputValidator.TryValidate(
-                structurallyCompleted,
-                payload.Schema,
-                out normalized,
-                out _))
         {
             return StructuredInferenceResult.Success(
                 normalized,
@@ -139,6 +122,43 @@ public sealed class StructuredInferencePipeline
             repair.DoneReason ?? first.DoneReason,
             repair.EvalCount,
             2);
+    }
+
+    private static bool TryNormalizeStructuredOutput(
+        string content,
+        JsonElement schema,
+        out string normalized,
+        out IReadOnlyList<string> errors)
+    {
+        if (StructuredOutputValidator.TryValidate(content, schema, out normalized, out errors))
+        {
+            return true;
+        }
+
+        if (StructuredOutputValidator.TryRemoveDisallowedProperties(
+                content,
+                schema,
+                out var projected) &&
+            StructuredOutputValidator.TryValidate(projected, schema, out normalized, out errors))
+        {
+            return true;
+        }
+
+        if (!StructuredOutputValidator.TryCloseOpenContainers(content, out var completed))
+        {
+            return false;
+        }
+
+        if (StructuredOutputValidator.TryValidate(completed, schema, out normalized, out errors))
+        {
+            return true;
+        }
+
+        return StructuredOutputValidator.TryRemoveDisallowedProperties(
+                   completed,
+                   schema,
+                   out projected) &&
+               StructuredOutputValidator.TryValidate(projected, schema, out normalized, out errors);
     }
 
     private static JsonObject BuildModelRequest(

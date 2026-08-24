@@ -136,6 +136,7 @@ internal static class ProjectDocumentSerializer
         public long? OutPointTicks { get; init; }
         public Guid? ParentSequenceId { get; init; }
         public Guid? MontagePlanId { get; init; }
+        public AgentDraftCheckpoint? AgentCheckpoint { get; init; }
 
         public static SequenceDocument FromState(SequenceState sequence) => new()
         {
@@ -157,7 +158,8 @@ internal static class ProjectDocumentSerializer
             InPointTicks = sequence.InPoint?.Ticks,
             OutPointTicks = sequence.OutPoint?.Ticks,
             ParentSequenceId = sequence.ParentSequenceId,
-            MontagePlanId = sequence.MontagePlanId
+            MontagePlanId = sequence.MontagePlanId,
+            AgentCheckpoint = sequence.AgentCheckpoint
         };
 
         public SequenceState ToState() => new(
@@ -176,6 +178,7 @@ internal static class ProjectDocumentSerializer
             InPointTicks is { } inTicks ? new TimelineTime(inTicks) : null,
             OutPointTicks is { } outTicks ? new TimelineTime(outTicks) : null,
             ParentSequenceId,
-            MontagePlanId);
+            MontagePlanId,
+            AgentCheckpoint);
     }
 }

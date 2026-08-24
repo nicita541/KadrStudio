@@ -961,6 +961,7 @@ public sealed class KadrAgentReadOnlyToolBackend(
             start_seconds = Round(actual.Start),
             end_seconds = Round(actual.End),
             detail = request.Detail.ToString().ToLowerInvariant(),
+            query = Compact(request.Query, MaximumQueryCharacters),
             truncated = ReadBoolean(observation, "truncated"),
             artifact_reference = ReadString(observation, "artifact_reference"),
             recommended_next_inspection = ReadString(observation, "recommended_next_inspection") ??
@@ -1095,32 +1096,21 @@ public sealed class KadrAgentReadOnlyToolBackend(
                 }
                 catch (AgentToolRejectedException exception)
                 {
-                    analyses.Add(new
-                    {
-                        source_id = source.Id,
-                        source_name = Compact(source.Name, 300),
-                        timeline_start_seconds = slice.TimelineStartSeconds,
-                        timeline_end_seconds = slice.TimelineEndSeconds,
-                        source_start_seconds = slice.SourceStartSeconds,
-                        source_end_seconds = slice.SourceEndSeconds,
-                        status = "rejected",
-                        error_code = exception.ErrorCode,
-                        message = exception.Message
-                    });
+                    // A sequence result represents evidence for the complete
+                    // requested timeline range. Returning a successful wrapper
+                    // with a rejected child used to make the planner treat missing
+                    // transcript/vision data as verified evidence.
+                    throw new AgentToolRejectedException(
+                        exception.ErrorCode,
+                        $"Analysis of timeline range {slice.TimelineStartSeconds:0.###}-" +
+                        $"{slice.TimelineEndSeconds:0.###}s was rejected: {exception.Message}");
                 }
                 catch (Exception exception)
                 {
-                    analyses.Add(new
-                    {
-                        source_id = source.Id,
-                        source_name = Compact(source.Name, 300),
-                        timeline_start_seconds = slice.TimelineStartSeconds,
-                        timeline_end_seconds = slice.TimelineEndSeconds,
-                        source_start_seconds = slice.SourceStartSeconds,
-                        source_end_seconds = slice.SourceEndSeconds,
-                        status = "failed",
-                        message = exception.Message
-                    });
+                    throw new AgentToolRejectedException(
+                        "range_analysis_failed",
+                        $"Analysis of timeline range {slice.TimelineStartSeconds:0.###}-" +
+                        $"{slice.TimelineEndSeconds:0.###}s failed: {exception.Message}");
                 }
             }
         }

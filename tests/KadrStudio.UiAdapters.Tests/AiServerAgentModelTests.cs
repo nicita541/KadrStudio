@@ -8,6 +8,7 @@ using KadrStudio.Application.Automation.Agent.Runtime;
 using KadrStudio.Application.Automation.Agent.Tools;
 using KadrStudio.Application.Automation.Agent.Tools.Editing;
 using KadrStudio.Application.Automation.Agent.Tools.ReadOnly;
+using KadrStudio.Application.Automation.Agent.Verification;
 using KadrStudio.Core.Domain;
 using KadrStudio.Services;
 using KadrStudio.Services.Agent;
@@ -21,7 +22,7 @@ public sealed class AiServerAgentModelTests
     {
         var handler = new AgentOllamaHandler(
             """
-            {"task_kind":"edit","goal":"Удалить указанные части","scope":"Активная последовательность","protected_elements":["Остальной монтаж"],"constraints":["Не менять source"],"acceptance_criteria":["Изменён только Agent Draft"],"assumptions":[],"missing_information":["Точные границы нужно исследовать"],"needs_user_clarification":false,"clarification_reason":""}
+            {"task_kind":"edit","investigation_strategy":"content_discovery","goal":"Удалить указанные части","scope":"Активная последовательность","protected_elements":["Остальной монтаж"],"constraints":["Не менять source"],"acceptance_criteria":["Изменён только Agent Draft"],"assumptions":[],"missing_information":["Точные границы нужно исследовать"],"needs_user_clarification":false,"clarification_reason":""}
             """);
         var options = new AiServerClientOptions(new Uri("https://ai.example.test/"), "agent-secret", "vision-model");
         using var service = new AiVideoAnalysisService(new FfmpegLocator(), new ProcessRunner(), options, handler);
@@ -216,7 +217,7 @@ public sealed class AiServerAgentModelTests
     {
         var handler = new AgentOllamaHandler(
             """
-            {"task_kind":"edit","goal":"Удалить выбранный фрагмент","scope":"Активная последовательность","protected_elements":["Остальной монтаж"],"constraints":["Не менять source"],"acceptance_criteria":["Изменён только утверждённый диапазон"],"assumptions":[],"missing_information":["Способ закрытия зазора"],"needs_user_clarification":true,"clarification_reason":"Способ удаления меняет тайминг."}
+            {"task_kind":"edit","investigation_strategy":"direct_target","goal":"Удалить выбранный фрагмент","scope":"Активная последовательность","protected_elements":["Остальной монтаж"],"constraints":["Не менять source"],"acceptance_criteria":["Изменён только утверждённый диапазон"],"assumptions":[],"missing_information":["Способ закрытия зазора"],"needs_user_clarification":true,"clarification_reason":"Способ удаления меняет тайминг."}
             """);
         var options = new AiServerClientOptions(new Uri("https://ai.example.test/"), "agent-secret", "vision-model");
         using var service = new AiVideoAnalysisService(new FfmpegLocator(), new ProcessRunner(), options, handler);
@@ -243,7 +244,7 @@ public sealed class AiServerAgentModelTests
     public async Task Remote_agent_critic_rejects_unverifiable_plan_without_rewriting_it()
     {
         var handler = new AgentOllamaHandler(
-            """{"accepted":false,"summary":"План нельзя безопасно выполнить.","issues":["Нет доказательства диапазона."]}""");
+            """{"accepted":false,"summary":"План нельзя безопасно выполнить.","issues":["Нет доказательства диапазона."],"step_assessments":[{"step_order":1,"evidence_supports_action":true,"protected_content_detected":false,"exact_arguments_supported":true,"counterevidence_checked":true,"adjacent_context_checked":true,"unresolved_contradictions":[],"summary":"Формальный assessment заполнен."}]}""");
         var options = new AiServerClientOptions(new Uri("https://ai.example.test/"), "agent-secret", "vision-model");
         using var service = new AiVideoAnalysisService(new FfmpegLocator(), new ProcessRunner(), options, handler);
         var model = new AiServerAgentModel(service);
@@ -263,6 +264,60 @@ public sealed class AiServerAgentModelTests
 
         Assert.False(review.Accepted);
         Assert.Contains("доказательства", Assert.Single(review.Issues), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Remote_agent_critic_cannot_approve_a_step_with_unresolved_counterevidence()
+    {
+        var handler = new AgentOllamaHandler(
+            """{"accepted":true,"summary":"План принят.","issues":[],"step_assessments":[{"step_order":1,"evidence_supports_action":true,"protected_content_detected":false,"exact_arguments_supported":true,"counterevidence_checked":true,"adjacent_context_checked":true,"unresolved_contradictions":["Перекрывающийся vision-проход показывает сюжет внутри диапазона."],"summary":"Факты конфликтуют."}]}""");
+        var options = new AiServerClientOptions(new Uri("https://ai.example.test/"), "agent-secret", "vision-model");
+        using var service = new AiVideoAnalysisService(new FfmpegLocator(), new ProcessRunner(), options, handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask() with
+        {
+            Brief = AgentTaskBrief.Create(AgentTaskKind.Edit, "Удалить фрагмент", "Активная последовательность")
+        };
+        var plan = AgentPlanDraft.Create(
+            "Удалить фрагмент",
+            "Один шаг",
+            [],
+            [new AgentPlanStepDraft("Удалить", "Удалить диапазон")]);
+
+        var review = await model.ReviewPlanAsync(
+            new AgentPlanReviewRequest(task, plan, [], [], 1),
+            CancellationToken.None);
+
+        Assert.False(review.Accepted);
+        Assert.Contains(review.Issues, issue =>
+            issue.Contains("vision-проход", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Remote_agent_critic_cannot_approve_without_counterevidence_and_adjacent_context_checks()
+    {
+        var handler = new AgentOllamaHandler(
+            """{"accepted":true,"summary":"План принят.","issues":[],"step_assessments":[{"step_order":1,"evidence_supports_action":true,"protected_content_detected":false,"exact_arguments_supported":true,"counterevidence_checked":false,"adjacent_context_checked":false,"unresolved_contradictions":[],"summary":"Проверен только выбранный диапазон."}]}""");
+        var options = new AiServerClientOptions(new Uri("https://ai.example.test/"), "agent-secret", "vision-model");
+        using var service = new AiVideoAnalysisService(new FfmpegLocator(), new ProcessRunner(), options, handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask() with
+        {
+            Brief = AgentTaskBrief.Create(AgentTaskKind.Edit, "Удалить фрагмент", "Активная последовательность")
+        };
+        var plan = AgentPlanDraft.Create(
+            "Удалить фрагмент",
+            "Один шаг",
+            [],
+            [new AgentPlanStepDraft("Удалить", "Удалить диапазон")]);
+
+        var review = await model.ReviewPlanAsync(
+            new AgentPlanReviewRequest(task, plan, [], [], 1),
+            CancellationToken.None);
+
+        Assert.False(review.Accepted);
+        Assert.Contains(review.Issues, issue =>
+            issue.Contains("только выбранный диапазон", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -308,9 +363,13 @@ public sealed class AiServerAgentModelTests
             "\"schema\"",
             handler.ChatRequestBody,
             StringComparison.Ordinal);
+        using var requestDocument = JsonDocument.Parse(handler.ChatRequestBody);
+        var responseSchema = requestDocument.RootElement
+            .GetProperty("schema")
+            .GetRawText();
         Assert.DoesNotContain(
             "plan_steps",
-            handler.ChatRequestBody,
+            responseSchema,
             StringComparison.Ordinal);
         Assert.Contains(
             "\"systemPrompt\"",
@@ -375,6 +434,244 @@ public sealed class AiServerAgentModelTests
     }
 
     [Fact]
+    public async Task Remote_agent_model_surfaces_dense_observed_ocr_regions_without_classifying_them()
+    {
+        var handler = new AgentOllamaHandler();
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask();
+        task = task with
+        {
+            EvidenceLedger =
+            [
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(),
+                    1,
+                    AgentEvidenceChannel.Frames,
+                    "inspect_content_overview",
+                    task.SourceSequenceId,
+                    task.SourceSequenceRevision,
+                    0,
+                    1427,
+                    "Tile 1 @ 2.000s: landscape [text: place] | " +
+                    "Tile 2 @ 42.000s: room [text: name] | " +
+                    "Tile 3 @ 121.407s: face [text: credit A] | " +
+                    "Tile 4 @ 131.228s: sky [text: credit B] | " +
+                    "Tile 5 @ 141.049s: motion [text: credit C] | " +
+                    "Tile 6 @ 150.513s: white card [text: episode title]",
+                    ["Observed frame facts"],
+                    null,
+                    DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames)
+            ]
+        };
+
+        await model.DecideAsync(
+            new AgentModelTurnRequest(
+                task,
+                ImmutableArray.Create(new AgentToolDescriptor(
+                    "inspect_project",
+                    "Inspect project facts.",
+                    AgentToolAccess.ReadOnly,
+                    AgentToolJson.EmptyObject())),
+                [],
+                [],
+                1),
+            CancellationToken.None);
+
+        using var requestDocument = JsonDocument.Parse(handler.ChatRequestBody);
+        using var turnDocument = JsonDocument.Parse(
+            requestDocument.RootElement.GetProperty("userPrompt").GetString()!);
+        var regions = turnDocument.RootElement
+            .GetProperty("observed_text_activity_regions")
+            .EnumerateArray()
+            .Select(item => item.GetString()!)
+            .ToArray();
+
+        Assert.Equal(3, regions.Length);
+        Assert.Contains("121.407–150.513s: 4 observed OCR facts", regions[0], StringComparison.Ordinal);
+        Assert.Contains("2–2s: 1 observed OCR facts", regions[1], StringComparison.Ordinal);
+        Assert.Contains("42–42s: 1 observed OCR facts", regions[2], StringComparison.Ordinal);
+        Assert.DoesNotContain("opening", string.Join(' ', regions), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Remote_agent_model_keeps_the_last_overview_window_in_a_bounded_nonduplicated_context()
+    {
+        var handler = new AgentOllamaHandler();
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask();
+        var overview = "Complete overview.\n" + string.Join('\n', Enumerable.Range(1, 20).Select(index =>
+            $"window {index:00} {(index == 20 ? "LAST_WINDOW_SENTINEL " : string.Empty)}{new string('x', 1_200)}"));
+        task = task with
+        {
+            EvidenceLedger =
+            [
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(),
+                    1,
+                    AgentEvidenceChannel.Frames,
+                    "inspect_content_overview",
+                    task.SourceSequenceId,
+                    task.SourceSequenceRevision,
+                    0,
+                    2_000,
+                    overview,
+                    ["Evenly sampled frame facts"],
+                    null,
+                    DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames)
+            ]
+        };
+        var rawObservation = AgentToolJson.ToElement(new
+        {
+            sequence_id = task.SourceSequenceId,
+            start_seconds = 0,
+            end_seconds = 2_000,
+            huge_duplicate = new string('z', 18_000)
+        });
+
+        await model.DecideAsync(
+            new AgentModelTurnRequest(
+                task,
+                ImmutableArray.Create(new AgentToolDescriptor(
+                    "inspect_project",
+                    "Inspect project facts.",
+                    AgentToolAccess.ReadOnly,
+                    AgentToolJson.EmptyObject())),
+                [new AgentModelObservation(
+                    1,
+                    "inspect_content_overview",
+                    AgentToolResultStatus.Succeeded,
+                    overview,
+                    rawObservation,
+                    null,
+                    EvidenceCapabilities: AgentEvidenceCapabilities.Frames)],
+                [],
+                1),
+            CancellationToken.None);
+
+        using var requestDocument = JsonDocument.Parse(handler.ChatRequestBody);
+        var userPrompt = requestDocument.RootElement.GetProperty("userPrompt").GetString()!;
+        using var turnDocument = JsonDocument.Parse(userPrompt);
+        var evidenceSummary = turnDocument.RootElement
+            .GetProperty("evidence_ledger")[0]
+            .GetProperty("summary")
+            .GetString()!;
+        var observation = turnDocument.RootElement.GetProperty("observations")[0];
+
+        Assert.Contains("window 01", evidenceSummary, StringComparison.Ordinal);
+        Assert.Contains("LAST_WINDOW_SENTINEL", evidenceSummary, StringComparison.Ordinal);
+        Assert.InRange(evidenceSummary.Length, 1, 14_000);
+        Assert.Equal(JsonValueKind.Null, observation.GetProperty("data").ValueKind);
+        Assert.DoesNotContain("huge_duplicate", userPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Partial_overview_samples_stay_bounded_and_keep_every_window_without_raw_duplicates()
+    {
+        var handler = new AgentOllamaHandler();
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask();
+        var evidence = ImmutableArray.CreateBuilder<AgentEvidenceRecord>();
+        var observations = ImmutableArray.CreateBuilder<AgentModelObservation>();
+        for (var sequence = 1; sequence <= 12; sequence++)
+        {
+            var summary =
+                $"Content overview sample {sequence * 100}-{(sequence + 1) * 100}s.\n" +
+                $"Time mapping: source {sequence * 100}-{(sequence + 1) * 100}s.\n" +
+                "Measurement: changing scenes and measured audio.\n" +
+                $"Audio loudness change: {new string('a', 900)}\n" +
+                "Audio sample start: -24 LUFS.\n" +
+                $"Sample part: Tile 1 visible person | Tile 3 visible room | " +
+                $"Tile 5 visible title {new string('v', 500)} | " +
+                $"Tile 8 visible transition {(sequence == 12 ? "LAST_SAMPLE_SENTINEL" : string.Empty)}";
+            evidence.Add(new AgentEvidenceRecord(
+                Guid.NewGuid(),
+                sequence,
+                AgentEvidenceChannel.Frames,
+                "inspect_content_sample",
+                task.SourceSequenceId,
+                task.SourceSequenceRevision,
+                sequence * 100,
+                (sequence + 1) * 100,
+                summary,
+                ["Measured sample"],
+                null,
+                DateTimeOffset.UtcNow,
+                AgentEvidenceCapabilities.Frames | AgentEvidenceCapabilities.Audio));
+            observations.Add(new AgentModelObservation(
+                sequence,
+                "inspect_content_sample",
+                AgentToolResultStatus.Succeeded,
+                summary,
+                AgentToolJson.ToElement(new
+                {
+                    sequence,
+                    huge_duplicate = new string('z', 18_000)
+                }),
+                null,
+                AgentEvidenceCapabilities.Frames | AgentEvidenceCapabilities.Audio));
+        }
+        task = task with { EvidenceLedger = evidence.ToImmutable() };
+
+        await model.DecideAsync(
+            new AgentModelTurnRequest(
+                task,
+                ImmutableArray.Create(new AgentToolDescriptor(
+                    "inspect_project",
+                    "Inspect project facts.",
+                    AgentToolAccess.ReadOnly,
+                    AgentToolJson.EmptyObject())),
+                observations.ToImmutable(),
+                [],
+                1),
+            CancellationToken.None);
+
+        using var requestDocument = JsonDocument.Parse(handler.ChatRequestBody);
+        var userPrompt = requestDocument.RootElement.GetProperty("userPrompt").GetString()!;
+        using var turnDocument = JsonDocument.Parse(userPrompt);
+        var ledger = turnDocument.RootElement.GetProperty("evidence_ledger");
+        var sentSummaries = string.Join(
+            '\n',
+            ledger.EnumerateArray().Select(item => item.GetProperty("summary").GetString()));
+
+        Assert.Equal(12, ledger.GetArrayLength());
+        Assert.Contains("LAST_SAMPLE_SENTINEL", sentSummaries, StringComparison.Ordinal);
+        Assert.InRange(userPrompt.Length, 1, 70_000);
+        Assert.All(
+            turnDocument.RootElement.GetProperty("observations").EnumerateArray(),
+            observation => Assert.Equal(JsonValueKind.Null, observation.GetProperty("data").ValueKind));
+        Assert.DoesNotContain("huge_duplicate", userPrompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Remote_agent_model_parses_user_approvable_plan()
     {
         var handler = new AgentOllamaHandler(
@@ -382,7 +679,7 @@ public sealed class AiServerAgentModelTests
             {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","completion_summary":""}
             """,
             """
-            {"plan_objective":"Собрать безопасный черновик.","plan_summary":"Изменения будут выполнены только после утверждения.","plan_constraints":["Не менять основной таймлайн."],"plan_steps":[{"title":"Исследовать","description":"Использовать только необходимые наблюдения.","expected_editing_tool":"","expected_editing_arguments":{},"evidence_requirement":"timeline","evidence_observation_sequences":[],"expected_effect":"Доказательства собраны.","protected_invariants":["Source не меняется."],"verification_checks":[]},{"title":"Смонтировать","description":"Работать в отдельном Agent Draft.","expected_editing_tool":"ripple_delete_ranges","expected_editing_arguments":{"ranges":[{"start_seconds":10,"end_seconds":20}]},"evidence_requirement":"frames","evidence_observation_sequences":[2],"expected_effect":"Диапазон удалён.","protected_invariants":["Остальной монтаж сохранён."],"verification_checks":["Проверить новую склейку."]},{"title":"Проверить","description":"Проверить результат после монтажа.","expected_editing_tool":"","expected_editing_arguments":{},"evidence_requirement":"timeline","evidence_observation_sequences":[],"expected_effect":"Целостность подтверждена.","protected_invariants":["Source не меняется."],"verification_checks":["Сверить edit log."]}]}
+            {"plan_objective":"Собрать безопасный черновик.","plan_summary":"Изменения будут выполнены только после утверждения.","plan_constraints":["Не менять основной таймлайн."],"plan_steps":[{"title":"Смонтировать","description":"Работать в отдельном Agent Draft.","expected_editing_tool":"ripple_delete_ranges","expected_editing_arguments":{"ranges":[{"start_seconds":10,"end_seconds":20}]},"evidence_requirement":"frames","evidence_observation_sequences":[2],"expected_effect":"Диапазон удалён.","protected_invariants":["Остальной монтаж сохранён."],"verification_checks":["Проверить новую склейку."]}]}
             """);
 
         var options = new AiServerClientOptions(
@@ -422,19 +719,35 @@ public sealed class AiServerAgentModelTests
             "Собрать безопасный черновик.",
             decision.Plan!.Objective);
         Assert.Equal(2, handler.ChatRequestBodies.Count);
-        Assert.DoesNotContain("plan_steps", handler.ChatRequestBodies[0], StringComparison.Ordinal);
-        Assert.Contains("plan_steps", handler.ChatRequestBodies[1], StringComparison.Ordinal);
-        Assert.DoesNotContain("ripple_delete_ranges", handler.ChatRequestBodies[0], StringComparison.Ordinal);
-        Assert.Contains("ripple_delete_ranges", handler.ChatRequestBodies[1], StringComparison.Ordinal);
-        Assert.Collection(
-            decision.Plan.Steps,
-            step => Assert.Equal("Исследовать", step.Title),
-            step => Assert.Equal("Смонтировать", step.Title),
-            step => Assert.Equal("Проверить", step.Title));
+        using var investigationRequest = JsonDocument.Parse(handler.ChatRequestBodies[0]);
+        using var planRequest = JsonDocument.Parse(handler.ChatRequestBodies[1]);
+        var investigationSchema = investigationRequest.RootElement
+            .GetProperty("schema")
+            .GetRawText();
+        var planSchema = planRequest.RootElement
+            .GetProperty("schema")
+            .GetRawText();
+        Assert.DoesNotContain("plan_steps", investigationSchema, StringComparison.Ordinal);
+        Assert.Contains("plan_steps", planSchema, StringComparison.Ordinal);
+        Assert.DoesNotContain("ripple_delete_ranges", investigationSchema, StringComparison.Ordinal);
+        Assert.Contains("ripple_delete_ranges", planSchema, StringComparison.Ordinal);
+        var editingToolEnum = planRequest.RootElement
+            .GetProperty("schema")
+            .GetProperty("properties")
+            .GetProperty("plan_steps")
+            .GetProperty("items")
+            .GetProperty("properties")
+            .GetProperty("expected_editing_tool")
+            .GetProperty("enum")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.DoesNotContain(string.Empty, editingToolEnum);
+        var editingStep = Assert.Single(decision.Plan.Steps);
+        Assert.Equal("Смонтировать", editingStep.Title);
         Assert.Contains(
             "Не менять основной таймлайн.",
             decision.Plan.Constraints);
-        var editingStep = decision.Plan.Steps[1];
         Assert.Equal("ripple_delete_ranges", editingStep.ExpectedEditingTool);
         Assert.Equal(AgentEvidenceRequirement.Frames, editingStep.EvidenceRequirement);
         Assert.Equal(10, editingStep.ExpectedEditingArguments!.Value
@@ -444,7 +757,190 @@ public sealed class AiServerAgentModelTests
     }
 
     [Fact]
-    public async Task Remote_agent_model_supports_begin_verification_action()
+    public async Task Published_plan_schema_requires_evidence_while_parser_defensively_defaults_missing_fields()
+    {
+        var handler = new AgentOllamaHandler(
+            """
+            {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","completion_summary":""}
+            """,
+            """
+            {"plan_objective":"Удалить найденный фрагмент.","plan_summary":"План требует проверки доказательств.","plan_constraints":[],"plan_steps":[{"title":"Удалить","description":"Удалить диапазон в Agent Draft.","expected_editing_tool":"ripple_delete_ranges","expected_editing_arguments":{"ranges":[{"start_seconds":10,"end_seconds":20}]}}]}
+            """);
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var decision = await model.DecideAsync(
+            new AgentModelTurnRequest(
+                CreateTask(),
+                ImmutableArray.Create(new AgentToolDescriptor(
+                    "ripple_delete_ranges",
+                    "Delete approved ranges from Agent Draft.",
+                    AgentToolAccess.Editing,
+                    AgentToolJson.EmptyObject())),
+                ImmutableArray<AgentModelObservation>.Empty,
+                ImmutableArray<AgentConversationContextMessage>.Empty,
+                3),
+            CancellationToken.None);
+
+        var step = Assert.Single(decision.Plan!.Steps);
+        Assert.Equal(AgentEvidenceRequirement.Timeline, step.EvidenceRequirement);
+        Assert.Empty(step.EvidenceObservationSequences);
+        Assert.NotEmpty(step.ExpectedEffect);
+        Assert.Contains(
+            step.ProtectedInvariants,
+            item => item.Contains("Исходная последовательность", StringComparison.Ordinal));
+        Assert.NotEmpty(step.VerificationChecks);
+
+        using var request = JsonDocument.Parse(handler.ChatRequestBodies[1]);
+        var required = request.RootElement
+            .GetProperty("schema")
+            .GetProperty("properties")
+            .GetProperty("plan_steps")
+            .GetProperty("items")
+            .GetProperty("required")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.Contains("evidence_requirement", required);
+        Assert.Contains("evidence_observation_sequences", required);
+        Assert.DoesNotContain("expected_effect", required);
+        Assert.DoesNotContain("protected_invariants", required);
+        Assert.DoesNotContain("verification_checks", required);
+        Assert.False(request.RootElement
+            .GetProperty("schema")
+            .GetProperty("properties")
+            .TryGetProperty("plan_constraints", out _));
+    }
+
+    [Fact]
+    public async Task Homogeneous_ripple_steps_are_folded_into_one_atomic_multi_range_action()
+    {
+        var handler = new AgentOllamaHandler(
+            """
+            {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","completion_summary":""}
+            """,
+            """
+            {"plan_objective":"Удалить два блока.","plan_summary":"Два доказанных диапазона.","plan_steps":[{"title":"Первый","description":"Удалить первый диапазон.","expected_editing_tool":"ripple_delete_range","expected_editing_arguments":{"start_seconds":10,"end_seconds":20},"evidence_requirement":"frames","evidence_observation_sequences":[1]},{"title":"Второй","description":"Удалить второй диапазон.","expected_editing_tool":"ripple_delete_ranges","expected_editing_arguments":{"ranges":[{"start_seconds":30,"end_seconds":40}]},"evidence_requirement":"frames","evidence_observation_sequences":[2]}]}
+            """);
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask();
+        task = task with
+        {
+            EvidenceLedger =
+            [
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(), 1, AgentEvidenceChannel.Frames, "inspect_range",
+                    task.SourceSequenceId, task.SourceSequenceRevision, 10, 20,
+                    "Measured first range.", ["frames"], null, DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames),
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(), 2, AgentEvidenceChannel.Frames, "inspect_range",
+                    task.SourceSequenceId, task.SourceSequenceRevision, 30, 40,
+                    "Measured second range.", ["frames"], null, DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames)
+            ]
+        };
+
+        var decision = await model.DecideAsync(
+            new AgentModelTurnRequest(
+                task,
+                ImmutableArray.Create(
+                    new AgentToolDescriptor(
+                        "ripple_delete_range", "Delete one range.", AgentToolAccess.Editing,
+                        AgentToolJson.EmptyObject()),
+                    new AgentToolDescriptor(
+                        "ripple_delete_ranges", "Delete ranges atomically.", AgentToolAccess.Editing,
+                        AgentToolJson.EmptyObject())),
+                [],
+                [],
+                2),
+            CancellationToken.None);
+
+        var step = Assert.Single(decision.Plan!.Steps);
+        Assert.Equal("ripple_delete_ranges", step.ExpectedEditingTool);
+        var ranges = step.ExpectedEditingArguments!.Value.GetProperty("ranges");
+        Assert.Equal(2, ranges.GetArrayLength());
+        Assert.Equal(10, ranges[0].GetProperty("start_seconds").GetDouble());
+        Assert.Equal(40, ranges[1].GetProperty("end_seconds").GetDouble());
+        Assert.Equal([1, 2], step.EvidenceObservationSequences.ToArray());
+    }
+
+    [Fact]
+    public async Task Published_plan_deterministically_attaches_overlapping_typed_evidence()
+    {
+        var handler = new AgentOllamaHandler(
+            """
+            {"action":"publish_plan","progress":"План готов.","tool_name":"","tool_arguments":{},"question":"","question_context":"","completion_summary":""}
+            """,
+            """
+            {"plan_objective":"Удалить блок.","plan_summary":"Диапазон измерен.","plan_steps":[{"title":"Удалить","description":"Удалить измеренный диапазон.","expected_editing_tool":"ripple_delete_range","expected_editing_arguments":{"start_seconds":10,"end_seconds":20},"evidence_requirement":"all","evidence_observation_sequences":[1]}]}
+            """);
+        var options = new AiServerClientOptions(
+            new Uri("https://ai.example.test/"),
+            "agent-secret",
+            "agent-model");
+        using var service = new AiVideoAnalysisService(
+            new FfmpegLocator(),
+            new ProcessRunner(),
+            options,
+            handler);
+        var model = new AiServerAgentModel(service);
+        var task = CreateTask();
+        task = task with
+        {
+            EvidenceLedger =
+            [
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(), 1, AgentEvidenceChannel.Frames, "inspect_boundary",
+                    task.SourceSequenceId, task.SourceSequenceRevision, 2, 18,
+                    "Boundary facts.", ["frames"], null, DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames, BoundarySeconds: 10),
+                new AgentEvidenceRecord(
+                    Guid.NewGuid(), 2, AgentEvidenceChannel.Frames, "inspect_range",
+                    task.SourceSequenceId, task.SourceSequenceRevision, 0, 30,
+                    "Frames, audio and transcript measured.", ["all channels"], null,
+                    DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames |
+                    AgentEvidenceCapabilities.Audio |
+                    AgentEvidenceCapabilities.Transcript)
+            ]
+        };
+
+        var decision = await model.DecideAsync(
+            new AgentModelTurnRequest(
+                task,
+                ImmutableArray.Create(new AgentToolDescriptor(
+                    "ripple_delete_range", "Delete one range.", AgentToolAccess.Editing,
+                    AgentToolJson.EmptyObject())),
+                [],
+                [],
+                2),
+            CancellationToken.None);
+
+        Assert.Equal(
+            [1, 2],
+            Assert.Single(decision.Plan!.Steps).EvidenceObservationSequences.ToArray());
+    }
+
+    [Fact]
+    public async Task Remote_agent_model_rejects_removed_execution_action()
     {
         var handler = new AgentOllamaHandler(
             """
@@ -462,19 +958,15 @@ public sealed class AiServerAgentModelTests
             handler);
 
         var model = new AiServerAgentModel(service);
-        var decision = await model.DecideAsync(
-            new AgentModelTurnRequest(
-                CreateTask(),
-                ImmutableArray<AgentToolDescriptor>.Empty,
-                ImmutableArray<AgentModelObservation>.Empty,
-                ImmutableArray<AgentConversationContextMessage>.Empty,
-                4,
-                AgentModelTurnMode.Execution),
-            CancellationToken.None);
-
-        Assert.Equal(
-            AgentModelActionKind.BeginVerification,
-            decision.Action);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => model.DecideAsync(
+                new AgentModelTurnRequest(
+                    CreateTask(),
+                    ImmutableArray<AgentToolDescriptor>.Empty,
+                    ImmutableArray<AgentModelObservation>.Empty,
+                    ImmutableArray<AgentConversationContextMessage>.Empty,
+                    4),
+                CancellationToken.None)
+            .AsTask());
 
         using var requestDocument = JsonDocument.Parse(
             handler.ChatRequestBody);
@@ -482,18 +974,18 @@ public sealed class AiServerAgentModelTests
             requestDocument.RootElement.GetProperty("userPrompt").GetString()!);
 
         Assert.Equal(
-            "execution",
+            "planning",
             turnDocument.RootElement
                 .GetProperty("mode")
                 .GetString());
     }
 
     [Fact]
-    public async Task Remote_agent_model_parses_verified_completion_summary()
+    public async Task Remote_agent_model_reports_verification_without_owning_the_result()
     {
         var handler = new AgentOllamaHandler(
             """
-            {"action":"complete_task","progress":"Проверка завершена.","tool_name":"","tool_arguments":{},"question":"","question_context":"","plan_objective":"","plan_summary":"","plan_constraints":[],"plan_steps":[],"completion_summary":"Agent Draft проверен; утверждённый план выполнен."}
+            {"accepted":false,"summary":"Факты проверки уже рассчитаны политикой.","issues":["Текстовое замечание модели"]}
             """);
         var options = new AiServerClientOptions(
             new Uri("https://ai.example.test/"),
@@ -507,22 +999,20 @@ public sealed class AiServerAgentModelTests
             handler);
 
         var model = new AiServerAgentModel(service);
-        var decision = await model.DecideAsync(
-            new AgentModelTurnRequest(
+        var report = await model.ReportVerificationAsync(
+            new AgentVerificationReportRequest(
                 CreateTask(),
-                ImmutableArray<AgentToolDescriptor>.Empty,
+                new AgentDeterministicVerificationResult(
+                    false,
+                    "Deterministic verification failed.",
+                    ["Receipt mismatch."]),
                 ImmutableArray<AgentModelObservation>.Empty,
-                ImmutableArray<AgentConversationContextMessage>.Empty,
-                5,
-                AgentModelTurnMode.Verification),
+                5),
             CancellationToken.None);
 
-        Assert.Equal(
-            AgentModelActionKind.CompleteTask,
-            decision.Action);
-        Assert.Equal(
-            "Agent Draft проверен; утверждённый план выполнен.",
-            decision.CompletionSummary);
+        Assert.False(report.Accepted);
+        Assert.Equal("Факты проверки уже рассчитаны политикой.", report.Summary);
+        Assert.Equal("Текстовое замечание модели", Assert.Single(report.Issues));
     }
 
     private static AgentTaskState CreateTask()
@@ -652,10 +1142,6 @@ public sealed class AiServerAgentModelTests
             AgentToolContext context,
             CancellationToken cancellationToken)
             => Empty();
-
-        public void Reset(Guid taskId)
-        {
-        }
 
         private static ValueTask<JsonElement> Empty()
             => ValueTask.FromResult(AgentToolJson.EmptyObject());

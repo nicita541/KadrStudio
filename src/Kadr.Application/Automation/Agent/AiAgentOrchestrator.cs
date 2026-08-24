@@ -6,8 +6,8 @@ namespace KadrStudio.Application.Automation.Agent;
 
 /// <summary>
 /// Owns the lifecycle of a single active AI editing task.
-/// This class deliberately does not call a model or editing tools yet.
-/// Stage 2 is the safe state machine that later agent/tool layers build on.
+/// This state machine deliberately calls neither models nor tools; workflow
+/// services perform those phase-specific operations around it.
 /// </summary>
 public sealed class AiAgentOrchestrator
 {

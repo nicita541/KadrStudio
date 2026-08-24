@@ -32,6 +32,61 @@ public sealed class SourceArchitectureTests
         Assert.DoesNotContain(".GetAwaiter().GetResult()", source, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Desktop_agent_ui_depends_on_the_workflow_facade_only()
+    {
+        var mainWindow = File.ReadAllText(Path.Combine(
+            SourceRoot(),
+            "Kadr",
+            "Views",
+            "MainWindow.xaml.cs"));
+
+        Assert.Contains("AgentWorkflow", mainWindow, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentPlanningLoop", mainWindow, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentExecutionLoop", mainWindow, StringComparison.Ordinal);
+        Assert.DoesNotContain("AiAgentOrchestrator", mainWindow, StringComparison.Ordinal);
+        Assert.DoesNotContain("PersistAgentTaskState", mainWindow, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Deterministic_verification_has_no_model_decision_dependency()
+    {
+        var verification = ReadSources(Path.Combine(
+            SourceRoot(),
+            "Kadr.Application",
+            "Automation",
+            "Agent",
+            "Verification"));
+
+        Assert.DoesNotContain("IAgentModel", verification, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentModelDecision", verification, StringComparison.Ordinal);
+        Assert.DoesNotContain("KadrStudio.Services", verification, StringComparison.Ordinal);
+
+        var executionLoop = File.ReadAllText(Path.Combine(
+            SourceRoot(),
+            "Kadr.Application",
+            "Automation",
+            "Agent",
+            "Runtime",
+            "AgentExecutionLoop.cs"));
+        Assert.DoesNotContain("IAgentModel", executionLoop, StringComparison.Ordinal);
+        Assert.Contains("IAgentVerificationReporter", executionLoop, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Planning_pipeline_has_no_editing_backend_dependency()
+    {
+        var planning = ReadSources(Path.Combine(
+            SourceRoot(),
+            "Kadr.Application",
+            "Automation",
+            "Agent",
+            "Planning"));
+
+        Assert.DoesNotContain("IAgentEditingToolBackend", planning, StringComparison.Ordinal);
+        Assert.DoesNotContain("KadrStudio.Services", planning, StringComparison.Ordinal);
+    }
+
     private static string ReadProductionSources() => ReadSources(SourceRoot());
 
     private static string ReadSources(string directory)

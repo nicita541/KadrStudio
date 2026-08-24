@@ -1,7 +1,9 @@
 using System.Collections.Immutable;
 using System.Text.Json;
 using KadrStudio.Application.Automation.Agent.Diagnostics;
+using KadrStudio.Application.Automation.Agent.Planning;
 using KadrStudio.Application.Automation.Agent.Tools;
+using KadrStudio.Application.Automation.Agent.Tools.ReadOnly;
 
 namespace KadrStudio.Application.Automation.Agent.Runtime;
 
@@ -15,21 +17,31 @@ namespace KadrStudio.Application.Automation.Agent.Runtime;
 /// </summary>
 public sealed class AgentPlanningLoop
 {
+    private const double DetailedLeadingContextSeconds = 30d;
+    private const double DetailedTrailingContextSeconds = 60d;
+    private const double MaximumDetailedWindowSeconds = 120d;
+
     private readonly AiAgentOrchestrator _orchestrator;
     private readonly AgentToolRegistry _registry;
     private readonly AgentToolExecutor _toolExecutor;
     private readonly IAgentModel _model;
     private readonly AgentPlanningLoopOptions _options;
+    private readonly TaskBriefService _taskBriefService;
+    private readonly AgentInvestigationRunner _investigationRunner;
+    private readonly AgentPlanPublisher _planPublisher;
     private readonly Func<ImmutableArray<AgentConversationContextMessage>> _conversationProvider;
     private readonly IAgentDebugLog _debugLog;
     private readonly SemaphoreSlim _runGate = new(1, 1);
 
     private readonly List<AgentModelObservation> _observations = [];
+    private readonly Dictionary<string, int> _boundaryInspectionCounts = new(StringComparer.Ordinal);
     private Guid? _memoryTaskId;
     private long? _memorySourceSequenceRevision;
     private int _nextObservationSequence = 1;
     private string? _lastToolSignature;
     private int _consecutiveIdenticalToolCalls;
+    private bool _publishFromExistingEvidence;
+    private int _lastRejectedPublicationEvidenceSequence;
 
     public AgentPlanningLoop(
         AiAgentOrchestrator orchestrator,
@@ -45,6 +57,12 @@ public sealed class AgentPlanningLoop
         _toolExecutor = toolExecutor ?? throw new ArgumentNullException(nameof(toolExecutor));
         _model = model ?? throw new ArgumentNullException(nameof(model));
         _options = options ?? AgentPlanningLoopOptions.Default;
+        _taskBriefService = new TaskBriefService(_model as IAgentTaskInterpreter);
+        _investigationRunner = new AgentInvestigationRunner(_model);
+        _planPublisher = new AgentPlanPublisher(
+            _orchestrator,
+            new AgentPlanValidator(_registry),
+            _model as IAgentPlanCritic);
         _conversationProvider =
             conversationProvider ?? (() => ImmutableArray<AgentConversationContextMessage>.Empty);
         _debugLog = debugLog ?? NullAgentDebugLog.Instance;
@@ -92,13 +110,13 @@ public sealed class AgentPlanningLoop
 
             if (task.Phase == AgentTaskPhase.Understanding)
             {
-                if (task.Brief is null && _model is IAgentTaskInterpreter interpreter)
+                if (task.Brief is null && _taskBriefService.IsAvailable)
                 {
                     _orchestrator.RecordProgress("Модель размышляет и формирует JSON понимания задачи…");
                     await SeedUnderstandingObservationsAsync(cancellationToken)
                         .ConfigureAwait(false);
 
-                    var understanding = await interpreter.UnderstandAsync(
+                    var understanding = await _taskBriefService.UnderstandAsync(
                         new AgentModelTurnRequest(
                             task,
                             // The brief only needs the seeded editor/project facts.
@@ -107,8 +125,7 @@ public sealed class AgentPlanningLoop
                             ImmutableArray<AgentToolDescriptor>.Empty,
                             GetObservationContext(),
                             GetConversationContext(),
-                            0,
-                            AgentModelTurnMode.Planning),
+                            0),
                         cancellationToken).ConfigureAwait(false);
 
                     task = _orchestrator.SetTaskBrief(understanding.Brief);
@@ -122,6 +139,28 @@ public sealed class AgentPlanningLoop
                     "Agent started task-driven investigation.");
             }
 
+            task = RequireCurrentTask();
+            if (task.Phase == AgentTaskPhase.Investigating &&
+                task.Brief?.InvestigationStrategy == AgentInvestigationStrategy.ContentDiscovery)
+            {
+                if (TryReadSourceDuration(task.SourceSequenceId) is null)
+                {
+                    // Runtime observations are intentionally not persisted. On
+                    // recovery, refresh only the read-only project metadata needed
+                    // to map persisted evidence windows to the complete duration.
+                    await SeedUnderstandingObservationsAsync(cancellationToken)
+                        .ConfigureAwait(false);
+                    task = RequireCurrentTask();
+                }
+                await EnsureDeterministicDiscoveryCoverageAsync(
+                    task,
+                    cancellationToken).ConfigureAwait(false);
+                task = RequireCurrentTask();
+            }
+            await EnsureDeterministicObservedTextProbeAsync(
+                task,
+                cancellationToken).ConfigureAwait(false);
+
             for (var turn = 1; turn <= _options.MaxModelTurns; turn++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -133,6 +172,8 @@ public sealed class AgentPlanningLoop
                 {
                     return task;
                 }
+
+                RequirePublicationWhenInvestigationBudgetIsFull(task);
 
                 AgentModelDecision decision;
                 try
@@ -154,10 +195,12 @@ public sealed class AgentPlanningLoop
                         observations,
                         conversation,
                         turn,
-                        AgentModelTurnMode.Planning);
+                        _publishFromExistingEvidence
+                            ? AgentModelTurnDirective.PublishPlanFromExistingEvidence
+                            : AgentModelTurnDirective.Investigate);
 
                     _orchestrator.RecordProgress("Модель размышляет и формирует JSON следующего исследовательского шага…");
-                    decision = await _model.DecideAsync(
+                    decision = await _investigationRunner.DecideAsync(
                         request,
                         cancellationToken).ConfigureAwait(false);
 
@@ -185,10 +228,11 @@ public sealed class AgentPlanningLoop
                         $"Agent model failed while preparing the plan: {exception.Message}");
                 }
 
-                if (!string.IsNullOrWhiteSpace(decision.Progress))
+                var safeProgress = BuildSafeProgress(decision);
+                if (!string.IsNullOrWhiteSpace(safeProgress))
                 {
                     _orchestrator.RecordProgress(
-                        LimitText(decision.Progress, _options.MaxProgressCharacters));
+                        LimitText(safeProgress, _options.MaxProgressCharacters));
                 }
 
                 switch (decision.Action)
@@ -283,6 +327,26 @@ public sealed class AgentPlanningLoop
             return;
         }
 
+        if (TryCreateBoundaryInspectionKey(
+                decision.ToolName,
+                decision.ToolArguments,
+                out var boundaryKey))
+        {
+            _boundaryInspectionCounts.TryGetValue(boundaryKey, out var equivalentCount);
+            if (equivalentCount >= _options.MaxEquivalentBoundaryInspections)
+            {
+                AddSyntheticObservation(
+                    decision.ToolName,
+                    AgentToolResultStatus.Rejected,
+                    "This candidate boundary was already measured enough times on the same channel. " +
+                    "Reuse those observations, inspect a different part of the material, or publish a plan.",
+                    "repeated_boundary_inspection");
+                return;
+            }
+
+            _boundaryInspectionCounts[boundaryKey] = equivalentCount + 1;
+        }
+
         var signature =
             decision.ToolName.Trim().ToLowerInvariant() + "\n" +
             decision.ToolArguments.GetRawText();
@@ -332,6 +396,17 @@ public sealed class AgentPlanningLoop
     {
         foreach (var toolName in new[] { "inspect_editor_context", "inspect_project" })
         {
+            if (Observations.Any(observation =>
+                    observation.Status == AgentToolResultStatus.Succeeded &&
+                    observation.ToolName.Equals(toolName, StringComparison.OrdinalIgnoreCase) &&
+                    !(observation.Data is { ValueKind: JsonValueKind.Object } restoredData &&
+                      restoredData.TryGetProperty(
+                          "restored_from_evidence_ledger",
+                          out var restoredFlag) &&
+                      restoredFlag.ValueKind == JsonValueKind.True)))
+            {
+                continue;
+            }
             if (!_registry.TryGet(toolName, out var tool) ||
                 tool is null ||
                 tool.Descriptor.Access != AgentToolAccess.ReadOnly)
@@ -352,6 +427,723 @@ public sealed class AgentPlanningLoop
                 _nextObservationSequence++,
                 result));
         }
+    }
+
+    private async Task EnsureDeterministicDiscoveryCoverageAsync(
+        AgentTaskState task,
+        CancellationToken cancellationToken)
+    {
+        if (task.Brief?.InvestigationStrategy != AgentInvestigationStrategy.ContentDiscovery ||
+            !_registry.TryGet("inspect_range", out var rangeTool) ||
+            rangeTool is null ||
+            rangeTool.Descriptor.Access != AgentToolAccess.ReadOnly ||
+            TryReadSourceDuration(task.SourceSequenceId) is not { } duration ||
+            duration <= 0.1)
+        {
+            return;
+        }
+
+        var reusableFrameEvidence = task.Evidence
+            .Where(item =>
+                item.TargetId == task.SourceSequenceId &&
+                item.SourceRevision == task.SourceSequenceRevision &&
+                (item.Capabilities & AgentEvidenceCapabilities.Frames) != 0 &&
+                item.StartSeconds is not null &&
+                item.EndSeconds is not null &&
+                item.ToolName is "inspect_content_overview" or
+                    "inspect_content_sample" or
+                    "inspect_range")
+            .ToArray();
+        if (reusableFrameEvidence.Any(item =>
+                item.StartSeconds!.Value <= 0.25d &&
+                item.EndSeconds!.Value >= duration - 0.25d))
+        {
+            return;
+        }
+
+        const double maximumWindowSeconds = 120;
+        const int maximumWindows = 16;
+        var windows = BuildDiscoveryWindows(
+            duration,
+            maximumWindowSeconds,
+            maximumWindows);
+        _orchestrator.RecordProgress(
+            $"Выполняю обзорное покрытие материала: {windows.Length} независимых диапазона по кадрам.");
+
+        var samples = new List<DiscoveryCoverageSample>(windows.Length);
+        var startedAt = DateTimeOffset.UtcNow;
+        for (var index = 0; index < windows.Length; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var window = windows[index];
+            var reusable = reusableFrameEvidence
+                .Where(item =>
+                    item.StartSeconds!.Value <= window.Start + 0.25d &&
+                    item.EndSeconds!.Value >= window.End - 0.25d)
+                .OrderBy(item => item.EndSeconds!.Value - item.StartSeconds!.Value)
+                .ThenByDescending(item => item.Sequence)
+                .FirstOrDefault();
+            if (reusable is not null)
+            {
+                samples.Add(new DiscoveryCoverageSample(
+                    window.Start,
+                    window.End,
+                    "succeeded",
+                    AgentRangeEvidenceSummary.BuildDiscoveryDigest(
+                        reusable.Summary,
+                        data: null),
+                    null,
+                    0,
+                    HasFrames: true,
+                    HasAudio:
+                        (reusable.Capabilities & AgentEvidenceCapabilities.Audio) != 0));
+                continue;
+            }
+
+            var arguments = AgentToolJson.ToElement(new
+            {
+                target_kind = "sequence",
+                target_id = task.SourceSequenceId,
+                start_seconds = window.Start,
+                end_seconds = window.End,
+                detail = "frames",
+                query =
+                    $"Coarse coverage {index + 1}/{windows.Length}. " +
+                    "Опиши только видимые события, надписи, титры, повторяющиеся визуальные признаки " +
+                    $"и смены контекста с абсолютными таймкодами. Контекст задачи: {task.Brief.Goal}"
+            });
+            AgentToolResult? result = null;
+            var attemptCount = 0;
+            for (var attempt = 1;
+                 attempt <= _options.MaxDiscoveryCoverageAttemptsPerWindow;
+                 attempt++)
+            {
+                attemptCount = attempt;
+                result = await _toolExecutor.ExecuteAsync(
+                    task,
+                    AgentToolCall.Create(task.Id, "inspect_range", arguments),
+                    cancellationToken).ConfigureAwait(false);
+                if (result.IsSuccess &&
+                    (result.EvidenceCapabilities & AgentEvidenceCapabilities.Frames) != 0)
+                {
+                    break;
+                }
+            }
+
+            if (result is null)
+            {
+                throw new InvalidOperationException(
+                    "Discovery coverage did not execute its frame sensor.");
+            }
+            samples.Add(new DiscoveryCoverageSample(
+                window.Start,
+                window.End,
+                result.Status.ToString().ToLowerInvariant(),
+                AgentRangeEvidenceSummary.BuildDiscoveryDigest(
+                    result.Summary,
+                    result.Data),
+                result.ErrorCode,
+                attemptCount,
+                result.IsSuccess &&
+                (result.EvidenceCapabilities & AgentEvidenceCapabilities.Frames) != 0,
+                result.IsSuccess &&
+                (result.EvidenceCapabilities & AgentEvidenceCapabilities.Audio) != 0));
+        }
+
+        var complete = samples.All(sample => sample.HasFrames);
+        var completeAudio = complete && samples.All(sample => sample.HasAudio);
+        var summary = complete
+            ? $"Deterministic content overview covered 0-{duration:0.###}s in {samples.Count} independent frame-sensor windows."
+            : $"Deterministic content overview was incomplete: " +
+              $"{samples.Count(sample => sample.HasFrames)}/{samples.Count} frame-sensor windows succeeded.";
+        var detailedSummary = summary + "\n" + string.Join(
+            "\n",
+            samples.Select(sample =>
+                $"{sample.Start:0.###}-{sample.End:0.###}s [{sample.Status}]: {sample.Summary}"));
+        var data = AgentToolJson.ToElement(new
+        {
+            channel = "frames",
+            sequence_id = task.SourceSequenceId,
+            source_revision = task.SourceSequenceRevision,
+            start_seconds = 0,
+            end_seconds = duration,
+            coverage_complete = complete,
+            samples = samples.Select(sample => new
+            {
+                start_seconds = sample.Start,
+                end_seconds = sample.End,
+                status = sample.Status,
+                error_code = sample.ErrorCode,
+                    attempt_count = sample.AttemptCount,
+                    frames_available = sample.HasFrames,
+                    audio_available = sample.HasAudio
+                }).ToArray()
+        });
+
+        // A single transient sensor failure must not erase every other successful
+        // frame observation. Do not claim one continuous range in that case: retain
+        // each successful window as its own typed, correctly bounded observation.
+        if (!complete)
+        {
+            foreach (var sample in samples.Where(sample => sample.HasFrames))
+            {
+                if (RequireCurrentTask().Evidence.Any(item =>
+                        item.ToolName.Equals(
+                            "inspect_content_sample",
+                            StringComparison.OrdinalIgnoreCase) &&
+                        item.SourceRevision == task.SourceSequenceRevision &&
+                        item.TargetId == task.SourceSequenceId &&
+                        (item.Capabilities & AgentEvidenceCapabilities.Frames) != 0 &&
+                        item.StartSeconds is { } existingStart &&
+                        item.EndSeconds is { } existingEnd &&
+                        existingStart <= sample.Start + 0.25d &&
+                        existingEnd >= sample.End - 0.25d))
+                {
+                    continue;
+                }
+                var sampleData = AgentToolJson.ToElement(new
+                {
+                    channel = "frames",
+                    sequence_id = task.SourceSequenceId,
+                    source_revision = task.SourceSequenceRevision,
+                    start_seconds = sample.Start,
+                    end_seconds = sample.End,
+                    coverage_window = true,
+                    attempt_count = sample.AttemptCount
+                });
+                var partial = new AgentToolResult(
+                    Guid.NewGuid(),
+                    "inspect_content_sample",
+                    AgentToolResultStatus.Succeeded,
+                    $"Content overview sample {sample.Start:0.###}-{sample.End:0.###}s. {sample.Summary}",
+                    sampleData,
+                    null,
+                    startedAt,
+                    DateTimeOffset.UtcNow,
+                    AgentEvidenceCapabilities.Frames |
+                    (sample.HasAudio
+                        ? AgentEvidenceCapabilities.Audio
+                        : AgentEvidenceCapabilities.None));
+                AddObservation(AgentModelObservation.FromResult(
+                    _nextObservationSequence++,
+                    partial));
+            }
+        }
+
+        var aggregate = new AgentToolResult(
+            Guid.NewGuid(),
+            "inspect_content_overview",
+            complete ? AgentToolResultStatus.Succeeded : AgentToolResultStatus.Failed,
+            detailedSummary,
+            data,
+            complete ? null : "content_overview_incomplete",
+            startedAt,
+            DateTimeOffset.UtcNow,
+            complete
+                ? AgentEvidenceCapabilities.Frames |
+                  (completeAudio
+                      ? AgentEvidenceCapabilities.Audio
+                      : AgentEvidenceCapabilities.None)
+                : AgentEvidenceCapabilities.None);
+        AddObservation(AgentModelObservation.FromResult(
+            _nextObservationSequence++,
+            aggregate));
+        if (!complete)
+        {
+            _orchestrator.RecordProgress(summary);
+        }
+    }
+
+    private async Task EnsureDeterministicObservedTextProbeAsync(
+        AgentTaskState task,
+        CancellationToken cancellationToken)
+    {
+        var isContentDiscovery =
+            task.Brief?.InvestigationStrategy == AgentInvestigationStrategy.ContentDiscovery ||
+            task.Evidence.Any(item => item.ToolName.Equals(
+                "inspect_content_overview",
+                StringComparison.OrdinalIgnoreCase));
+        if (!isContentDiscovery ||
+            !_registry.TryGet("inspect_range", out var rangeTool) ||
+            rangeTool is null ||
+            rangeTool.Descriptor.Access != AgentToolAccess.ReadOnly)
+        {
+            return;
+        }
+
+        var duration = TryReadSourceDuration(task.SourceSequenceId)
+                       ?? task.Evidence
+                           .Where(item => item.TargetId == task.SourceSequenceId)
+                           .Select(item => item.EndSeconds)
+                           .Where(value => value is not null)
+                           .Select(value => value!.Value)
+                           .DefaultIfEmpty(0)
+                           .Max();
+        if (duration <= 0.1)
+        {
+            return;
+        }
+
+        var unprobed = AgentObservedTextActivityIndexer.Build(task.Evidence)
+            .Where(region => !HasDetailedTextActivityProbe(task, region, duration))
+            .ToArray();
+        if (unprobed.Length == 0)
+        {
+            return;
+        }
+
+        // Investigate the densest factual OCR region and, independently, the
+        // latest edge region. This is content-agnostic: it does not call either
+        // one an opening/ending, but prevents a long file's tail from being
+        // reduced to a few coarse samples or omitted from the planner context.
+        var candidates = new List<(AgentObservedTextActivityRegion Region, bool IsTailEdge)>();
+        foreach (var anchor in unprobed.Take(2))
+        {
+            AddCandidate(
+                ExpandWithNearbyObservedTextRegions(anchor, unprobed),
+                isTailEdge: false);
+        }
+        var latestEdge = unprobed
+            .Where(region => region.StartSeconds >= duration * 0.75)
+            .OrderByDescending(region => region.EndSeconds)
+            .FirstOrDefault();
+        if (latestEdge is not null)
+        {
+            AddCandidate(
+                ExpandWithNearbyObservedTextRegions(latestEdge, unprobed),
+                isTailEdge: true);
+        }
+
+        void AddCandidate(
+            AgentObservedTextActivityRegion region,
+            bool isTailEdge)
+        {
+            var existing = candidates.FindIndex(candidate =>
+                Math.Abs(candidate.Region.StartSeconds - region.StartSeconds) < 0.5 &&
+                Math.Abs(candidate.Region.EndSeconds - region.EndSeconds) < 0.5);
+            if (existing < 0)
+            {
+                candidates.Add((region, isTailEdge));
+            }
+            else if (isTailEdge && !candidates[existing].IsTailEdge)
+            {
+                candidates[existing] = (candidates[existing].Region, true);
+            }
+        }
+
+        const double minimumProbeSeconds = 45d;
+        foreach (var selectedCandidate in candidates)
+        {
+            var candidate = selectedCandidate.Region;
+            var start = Math.Max(0, candidate.StartSeconds - DetailedLeadingContextSeconds);
+            var end = Math.Min(duration, candidate.EndSeconds + DetailedTrailingContextSeconds);
+            if (selectedCandidate.IsTailEdge)
+            {
+                // A late factual text region can begin after the visual/audio
+                // transition that introduced it. Measure the complete final
+                // sensor-sized window without assuming what that content means.
+                start = Math.Min(start, Math.Max(0, duration - MaximumDetailedWindowSeconds));
+                end = duration;
+            }
+            var center = (candidate.StartSeconds + candidate.EndSeconds) / 2d;
+            if (end - start < minimumProbeSeconds)
+            {
+                start = Math.Max(0, center - minimumProbeSeconds / 2d);
+                end = Math.Min(duration, start + minimumProbeSeconds);
+                start = Math.Max(0, end - minimumProbeSeconds);
+            }
+
+            var windows = BuildExactCoverageWindows(start, end, MaximumDetailedWindowSeconds);
+            var hasMeasuredAudio = HasCurrentCapability(
+                RequireCurrentTask(),
+                AgentEvidenceCapabilities.Audio);
+            var preferredDetail = hasMeasuredAudio ? "all" : "frames";
+            _orchestrator.RecordProgress(
+                $"Подробно проверяю весь фактический OCR-регион {start:0.###}–{end:0.###}с " +
+                $"в {windows.Length} независимых окнах; использую все реально доступные каналы.");
+            foreach (var window in windows)
+            {
+                AgentToolResult result;
+                async Task<AgentToolResult> InspectAsync(string detail)
+                {
+                    var currentTask = RequireCurrentTask();
+                    var arguments = AgentToolJson.ToElement(new
+                    {
+                        target_kind = "sequence",
+                        target_id = currentTask.SourceSequenceId,
+                        start_seconds = window.Start,
+                        end_seconds = window.End,
+                        detail,
+                        query =
+                            "Deterministic detail probe selected from observed OCR density. " +
+                            "Return neutral measured facts from the requested channels only."
+                    });
+                    return await _toolExecutor.ExecuteAsync(
+                        currentTask,
+                        AgentToolCall.Create(currentTask.Id, "inspect_range", arguments),
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                result = await InspectAsync(preferredDetail).ConfigureAwait(false);
+                AddObservation(AgentModelObservation.FromResult(
+                    _nextObservationSequence++,
+                    result));
+                if (!result.IsSuccess &&
+                    preferredDetail == "all" &&
+                    result.ErrorCode is "media_has_no_audio" or "transcript_evidence_incomplete")
+                {
+                    // A universal agent must remain useful for silent media and for a
+                    // temporarily unavailable transcript sensor. Frames still carry
+                    // technical audio capability when an audio stream was measured.
+                    result = await InspectAsync("frames").ConfigureAwait(false);
+                    AddObservation(AgentModelObservation.FromResult(
+                        _nextObservationSequence++,
+                        result));
+                }
+                if (result.IsSuccess)
+                {
+                    await InspectObservedTransitionCandidatesAsync(
+                        RequireCurrentTask(),
+                        candidate,
+                        duration,
+                        result.Data,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+    }
+
+    private static AgentObservedTextActivityRegion ExpandWithNearbyObservedTextRegions(
+        AgentObservedTextActivityRegion anchor,
+        IReadOnlyCollection<AgentObservedTextActivityRegion> regions)
+    {
+        const double nearbyGapSeconds = 45d;
+        var nearby = regions
+            .Where(region =>
+                region.EndSeconds >= anchor.StartSeconds - nearbyGapSeconds &&
+                region.StartSeconds <= anchor.EndSeconds + nearbyGapSeconds)
+            .ToArray();
+        if (nearby.Length <= 1)
+        {
+            return anchor;
+        }
+
+        return new AgentObservedTextActivityRegion(
+            nearby.Min(region => region.StartSeconds),
+            nearby.Max(region => region.EndSeconds),
+            nearby
+                .SelectMany(region => region.Facts)
+                .Distinct()
+                .OrderBy(fact => fact.Seconds)
+                .ToImmutableArray());
+    }
+
+    private async Task InspectObservedTransitionCandidatesAsync(
+        AgentTaskState task,
+        AgentObservedTextActivityRegion region,
+        double durationSeconds,
+        JsonElement? detailedObservation,
+        CancellationToken cancellationToken)
+    {
+        if (!_registry.TryGet("inspect_boundary", out var boundaryTool) ||
+            boundaryTool is null ||
+            boundaryTool.Descriptor.Access != AgentToolAccess.ReadOnly)
+        {
+            return;
+        }
+
+        foreach (var candidate in AgentObservedTransitionCandidateIndexer.Build(
+                     detailedObservation,
+                     region,
+                     durationSeconds))
+        {
+            await InspectObservedTransitionCandidateAsync(
+                candidate,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        var edgeThreshold = Math.Max(90d, durationSeconds * 0.1d);
+        foreach (var edgeRegion in AgentObservedTextActivityIndexer.Build(
+                         RequireCurrentTask().Evidence)
+                     .Where(item => item.StartSeconds >= durationSeconds - edgeThreshold)
+                     .Take(2))
+        {
+            foreach (var seconds in new[]
+                     {
+                         Math.Max(0, edgeRegion.StartSeconds - 20d),
+                         edgeRegion.StartSeconds,
+                         edgeRegion.StartSeconds + 20d,
+                         edgeRegion.StartSeconds + 40d,
+                         edgeRegion.StartSeconds + 60d
+                     })
+            {
+                if (seconds >= durationSeconds)
+                {
+                    continue;
+                }
+                await InspectObservedTransitionCandidateAsync(
+                    new AgentObservedTransitionCandidate(
+                        seconds,
+                        "near_end_text_activity_onset"),
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task InspectObservedTransitionCandidateAsync(
+        AgentObservedTransitionCandidate candidate,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var task = RequireCurrentTask();
+        if (task.Evidence.Any(item =>
+                item.SourceRevision == task.SourceSequenceRevision &&
+                item.TargetId == task.SourceSequenceId &&
+                item.ToolName.Equals("inspect_boundary", StringComparison.OrdinalIgnoreCase) &&
+                item.StartSeconds is { } existingStart &&
+                item.EndSeconds is { } existingEnd &&
+                Math.Abs(
+                    (item.BoundarySeconds ?? (existingStart + existingEnd) / 2d) -
+                    candidate.Seconds) <= 1d))
+        {
+            return;
+        }
+
+        _orchestrator.RecordProgress(
+            $"Проверяю наблюдаемый переход около {candidate.Seconds:0.###}с ({candidate.Signal}).");
+        var arguments = AgentToolJson.ToElement(new
+        {
+            target_kind = "sequence",
+            target_id = task.SourceSequenceId,
+            at_seconds = candidate.Seconds,
+            window_seconds = 15,
+            detail = HasCurrentCapability(task, AgentEvidenceCapabilities.Transcript)
+                ? "all"
+                : "frames",
+            query =
+                $"Deterministic boundary probe for factual signal '{candidate.Signal}'. " +
+                "Describe neutral differences and continuity on both sides."
+        });
+        var result = await _toolExecutor.ExecuteAsync(
+            task,
+            AgentToolCall.Create(task.Id, "inspect_boundary", arguments),
+            cancellationToken).ConfigureAwait(false);
+        if (result.IsSuccess)
+        {
+            result = result with
+            {
+                Summary =
+                    $"Deterministic candidate provenance: {candidate.Signal} at " +
+                    $"{candidate.Seconds:0.###}s. This is a factual search signal, not a semantic label.\n" +
+                    result.Summary
+            };
+        }
+        AddObservation(AgentModelObservation.FromResult(
+            _nextObservationSequence++,
+            result));
+    }
+
+    private static bool HasCurrentCapability(
+        AgentTaskState task,
+        AgentEvidenceCapabilities capability)
+        => task.Evidence.Any(evidence =>
+            evidence.TargetId == task.SourceSequenceId &&
+            evidence.SourceRevision == task.SourceSequenceRevision &&
+            (evidence.Capabilities & capability) == capability);
+
+    private static bool HasDetailedTextActivityProbe(
+        AgentTaskState task,
+        AgentObservedTextActivityRegion region,
+        double durationSeconds)
+    {
+        var expectedStart = Math.Max(
+            0,
+            region.StartSeconds - DetailedLeadingContextSeconds);
+        var expectedEnd = Math.Min(
+            durationSeconds,
+            region.EndSeconds + DetailedTrailingContextSeconds);
+        if (region.StartSeconds >= durationSeconds * 0.75d)
+        {
+            expectedStart = Math.Min(
+                expectedStart,
+                Math.Max(0, durationSeconds - MaximumDetailedWindowSeconds));
+            expectedEnd = durationSeconds;
+        }
+        var covered = task.Evidence
+            .Where(item =>
+                item.SourceRevision == task.SourceSequenceRevision &&
+                item.TargetId == task.SourceSequenceId &&
+                item.ToolName.Equals("inspect_range", StringComparison.OrdinalIgnoreCase) &&
+                (item.Capabilities & AgentEvidenceCapabilities.Frames) != 0 &&
+                item.StartSeconds is not null &&
+                item.EndSeconds is not null)
+            .Select(item => (
+                Math.Max(expectedStart, item.StartSeconds!.Value),
+                Math.Min(expectedEnd, item.EndSeconds!.Value)));
+        return MergeCoveredSeconds(covered) >=
+               Math.Max(0, expectedEnd - expectedStart - 0.5);
+    }
+
+    private static ImmutableArray<(double Start, double End)> BuildExactCoverageWindows(
+        double start,
+        double end,
+        double maximumWindowSeconds)
+    {
+        var duration = Math.Max(0, end - start);
+        if (duration <= 0)
+        {
+            return [];
+        }
+
+        var count = Math.Max(1, (int)Math.Ceiling(duration / maximumWindowSeconds));
+        var width = duration / count;
+        var result = ImmutableArray.CreateBuilder<(double Start, double End)>(count);
+        for (var index = 0; index < count; index++)
+        {
+            result.Add((
+                start + index * width,
+                index == count - 1 ? end : start + (index + 1) * width));
+        }
+        return result.ToImmutable();
+    }
+
+    private double? TryReadSourceDuration(Guid sourceSequenceId)
+    {
+        foreach (var observation in Observations
+                     .Where(item => item.Status == AgentToolResultStatus.Succeeded)
+                     .OrderByDescending(item => item.Sequence))
+        {
+            if (observation.Data is not { ValueKind: JsonValueKind.Object } data)
+            {
+                continue;
+            }
+            if (data.TryGetProperty("sequence_id", out var sequenceId) &&
+                sequenceId.TryGetGuid(out var directId) &&
+                directId == sourceSequenceId &&
+                TryReadDouble(data, "duration_seconds") is { } directDuration)
+            {
+                return directDuration;
+            }
+            if (!data.TryGetProperty("sequences", out var sequences) ||
+                sequences.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+            foreach (var sequence in sequences.EnumerateArray())
+            {
+                if (TryReadGuid(sequence, "id") == sourceSequenceId &&
+                    TryReadDouble(sequence, "duration_seconds") is { } duration)
+                {
+                    return duration;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static ImmutableArray<(double Start, double End)> BuildDiscoveryWindows(
+        double duration,
+        double maximumWindowSeconds,
+        int maximumWindows)
+    {
+        var required = Math.Max(1, (int)Math.Ceiling(duration / maximumWindowSeconds));
+        var count = Math.Min(required, maximumWindows);
+        var result = ImmutableArray.CreateBuilder<(double Start, double End)>(count);
+        if (required <= maximumWindows)
+        {
+            var window = duration / count;
+            for (var index = 0; index < count; index++)
+            {
+                result.Add((index * window, index == count - 1 ? duration : (index + 1) * window));
+            }
+        }
+        else
+        {
+            var lastStart = Math.Max(0, duration - maximumWindowSeconds);
+            for (var index = 0; index < count; index++)
+            {
+                var start = count == 1 ? 0 : lastStart * index / (count - 1);
+                result.Add((start, Math.Min(duration, start + maximumWindowSeconds)));
+            }
+        }
+        return result.ToImmutable();
+    }
+
+    private static double MergeCoveredSeconds(
+        IEnumerable<(double Start, double End)> source)
+    {
+        var ranges = source
+            .Where(item => item.End > item.Start)
+            .OrderBy(item => item.Start)
+            .ToArray();
+        if (ranges.Length == 0)
+        {
+            return 0;
+        }
+
+        var total = 0d;
+        var start = ranges[0].Start;
+        var end = ranges[0].End;
+        foreach (var range in ranges.Skip(1))
+        {
+            if (range.Start <= end)
+            {
+                end = Math.Max(end, range.End);
+                continue;
+            }
+            total += end - start;
+            start = range.Start;
+            end = range.End;
+        }
+        return total + end - start;
+    }
+
+    /// <summary>
+    /// Converts a retry after a malformed model response into a bounded plan
+    /// publication attempt when this task already owns reusable, typed evidence.
+    /// This is task-agnostic: no edit type, tool name, range, or media position is
+    /// inferred here. If validation rejects the plan, normal investigation is
+    /// reopened on the following turn.
+    /// </summary>
+    public bool PrepareRetryFromExistingEvidence()
+    {
+        var task = RequireCurrentTask();
+        EnsureMemoryFor(task);
+
+        var hasTypedEvidence = task.Brief is { Kind: AgentTaskKind.Edit or AgentTaskKind.Mixed } &&
+                               task.Evidence.Any(item =>
+                                   item.SourceRevision == task.SourceSequenceRevision &&
+                                   item.Capabilities != AgentEvidenceCapabilities.None);
+        if (hasTypedEvidence &&
+            (task.Brief?.InvestigationStrategy == AgentInvestigationStrategy.ContentDiscovery ||
+             task.Evidence.Any(item => item.ToolName.Equals(
+                 "inspect_content_overview",
+                 StringComparison.OrdinalIgnoreCase))) &&
+            !task.Evidence.Any(item =>
+                item.SourceRevision == task.SourceSequenceRevision &&
+                item.ToolName.Equals("inspect_boundary", StringComparison.OrdinalIgnoreCase) &&
+                item.Capabilities != AgentEvidenceCapabilities.None))
+        {
+            // A coarse overview is reusable after restart, but it cannot produce
+            // exact semantic edit coordinates on its own. Reopen investigation
+            // instead of forcing the model to fabricate a publishable plan.
+            hasTypedEvidence = false;
+        }
+        if (!hasTypedEvidence)
+        {
+            _publishFromExistingEvidence = false;
+            return false;
+        }
+
+        lock (_observations)
+        {
+            hasTypedEvidence = _observations.Any(item =>
+                item.Status == AgentToolResultStatus.Succeeded &&
+                item.EvidenceCapabilities != AgentEvidenceCapabilities.None);
+        }
+
+        _publishFromExistingEvidence = hasTypedEvidence;
+        return hasTypedEvidence;
     }
 
     private AgentTaskState HandleQuestionDecision(
@@ -381,222 +1173,67 @@ public sealed class AgentPlanningLoop
                 "Agent model selected publish_plan without a plan.");
         }
 
-        var task = RequireCurrentTask();
-        if (!ValidateMachineCheckablePlan(decision.Plan, out var validationError))
+        var publication = await _planPublisher.PublishAsync(
+            RequireCurrentTask(),
+            decision.Plan,
+            GetObservationContext(),
+            GetConversationContext(),
+            turn,
+            cancellationToken).ConfigureAwait(false);
+        if (publication.IsPublished)
         {
-            AddSyntheticObservation(
-                "publish_plan",
-                AgentToolResultStatus.Rejected,
-                validationError,
-                "plan_evidence_required");
-            return null;
+            _publishFromExistingEvidence = false;
+            return publication.PublishedState;
         }
 
-        if (_model is IAgentPlanCritic critic)
-        {
-            var review = await critic.ReviewPlanAsync(
-                new AgentPlanReviewRequest(
-                    task,
-                    decision.Plan,
-                    GetObservationContext(),
-                    GetConversationContext(),
-                    turn),
-                cancellationToken).ConfigureAwait(false);
-            if (!review.Accepted)
-            {
-                var issues = review.Issues.IsDefaultOrEmpty
-                    ? review.Summary
-                    : review.Summary + " " + string.Join(" ", review.Issues);
-                AddSyntheticObservation(
-                    "review_plan",
-                    AgentToolResultStatus.Rejected,
-                    LimitText(issues, 8_000),
-                    "plan_rejected_by_critic");
-                return null;
-            }
-        }
+        // A deterministic validator or independent critic found a real gap.
+        // Only plan-shape mistakes can be republished without more research;
+        // every evidence or semantic rejection reopens the read-only catalog.
+        _lastRejectedPublicationEvidenceSequence = RequireCurrentTask().Evidence
+            .Select(item => item.Sequence)
+            .DefaultIfEmpty(0)
+            .Max();
+        var currentTask = RequireCurrentTask();
+        _publishFromExistingEvidence =
+            publication.ErrorCode == "plan_invalid" &&
+            currentTask.Evidence.Any(item =>
+                item.SourceRevision == currentTask.SourceSequenceRevision &&
+                item.ToolName.Equals("inspect_boundary", StringComparison.OrdinalIgnoreCase) &&
+                item.Capabilities != AgentEvidenceCapabilities.None);
 
-        if (task.Phase == AgentTaskPhase.Investigating)
-        {
-            task = _orchestrator.BeginPlanning(
-                "Agent finished investigation and is preparing the proposed edit plan.");
-        }
+        _orchestrator.RecordProgress(
+            "План отклонён проверкой: " + LimitText(publication.Error, 450));
 
-        return task.Plan is null
-            ? _orchestrator.PublishPlan(decision.Plan)
-            : _orchestrator.RevisePlan(
-                decision.Plan,
-                AgentPlanRevisionSource.Agent,
-                "Agent updated the plan from the latest user instructions and evidence.");
+        Log(
+            RequireCurrentTask(),
+            "plan_publication_rejected",
+            turn,
+            "Plan publication was rejected by deterministic validation or independent review.",
+            $"error_code={publication.ErrorCode}; error={LimitText(publication.Error, 8_000)}");
+
+        AddSyntheticObservation(
+            publication.ErrorCode == "plan_rejected_by_critic"
+                ? "review_plan"
+                : "publish_plan",
+            AgentToolResultStatus.Rejected,
+            LimitText(publication.Error, 8_000),
+            publication.ErrorCode);
+        return null;
     }
 
-    private bool ValidateMachineCheckablePlan(
-        AgentPlanDraft plan,
-        out string error)
-    {
-        var editingSteps = plan.Steps
-            .Where(step => !string.IsNullOrWhiteSpace(step.ExpectedEditingTool))
-            .ToArray();
-        if (editingSteps.Length == 0)
+    private static string BuildSafeProgress(AgentModelDecision decision)
+        => decision.Action switch
         {
-            // Plans created by older persisted tasks remain readable. New model plans
-            // include these fields because the response schema requires them.
-            error = string.Empty;
-            return true;
-        }
-
-        var rippleDeleteSteps = editingSteps.Count(step =>
-            step.ExpectedEditingTool is "ripple_delete_range" or "ripple_delete_ranges");
-        if (rippleDeleteSteps > 1)
-        {
-            error = "Multiple ripple-delete actions would invalidate later coordinates. Use one ripple_delete_ranges action for ranges measured on the same sequence revision.";
-            return false;
-        }
-
-        var observations = GetObservationContext();
-        foreach (var step in editingSteps)
-        {
-            if (!_registry.TryGet(step.ExpectedEditingTool!, out var tool) ||
-                tool is null ||
-                tool.Descriptor.Access != AgentToolAccess.Editing)
-            {
-                error = $"Plan step '{step.Title}' names an unavailable editing action '{step.ExpectedEditingTool}'.";
-                return false;
-            }
-
-            if (step.ExpectedEditingArguments is not { ValueKind: JsonValueKind.Object })
-            {
-                error = $"Plan step '{step.Title}' has no exact editing arguments.";
-                return false;
-            }
-
-            if (step.EvidenceObservationSequences.IsDefaultOrEmpty)
-            {
-                error = $"Plan step '{step.Title}' has no evidence observation references.";
-                return false;
-            }
-
-            var referenced = observations
-                .Where(item => step.EvidenceObservationSequences.Contains(item.Sequence))
-                .ToArray();
-            if (referenced.Length != step.EvidenceObservationSequences.Distinct().Count() ||
-                referenced.Any(item => item.Status != AgentToolResultStatus.Succeeded))
-            {
-                error = $"Plan step '{step.Title}' references missing or unsuccessful observations.";
-                return false;
-            }
-
-            if (!referenced.Any(item => SatisfiesEvidenceRequirement(
-                    item,
-                    step.EvidenceRequirement)))
-            {
-                error = $"Plan step '{step.Title}' needs successful {step.EvidenceRequirement.ToString().ToLowerInvariant()} evidence. The referenced observations do not provide that channel.";
-                return false;
-            }
-        }
-
-        error = string.Empty;
-        return true;
-    }
-
-    private static bool SatisfiesEvidenceRequirement(
-        AgentModelObservation observation,
-        AgentEvidenceRequirement requirement)
-    {
-        if (observation.Status != AgentToolResultStatus.Succeeded)
-        {
-            return false;
-        }
-
-        if (requirement == AgentEvidenceRequirement.Timeline)
-        {
-            return observation.ToolName is "inspect_timeline" or
-                "inspect_timeline_integrity" or "inspect_project" or "inspect_range";
-        }
-
-        return IsRangeEvidence(observation, requirement);
-    }
-
-    private static bool IsRangeEvidence(
-        AgentModelObservation observation,
-        AgentEvidenceRequirement requirement)
-    {
-        if (observation.ToolName is not ("inspect_range" or "inspect_boundary") ||
-            observation.Data is not { } data ||
-            data.ValueKind != JsonValueKind.Object ||
-            !data.TryGetProperty("detail", out var detailElement))
-        {
-            return false;
-        }
-
-        var detail = detailElement.GetString()?.ToLowerInvariant();
-        var detailMatches = requirement switch
-        {
-            AgentEvidenceRequirement.Frames => detail is "frames" or "all",
-            AgentEvidenceRequirement.Audio => detail is "audio" or "all",
-            AgentEvidenceRequirement.Transcript => detail is "transcript" or "all",
-            AgentEvidenceRequirement.All => detail == "all",
-            _ => true
+            AgentModelActionKind.UseTool =>
+                $"Выполняю read-only измерение: {decision.ToolName}.",
+            AgentModelActionKind.PublishPlan =>
+                "Формирую и проверяю точный монтажный план по собранным доказательствам.",
+            AgentModelActionKind.AskUser =>
+                "Найден блокирующий вопрос, который нельзя доказать инструментами.",
+            AgentModelActionKind.CompleteReadOnly =>
+                "Проверяю доказанный ответ перед завершением.",
+            _ => string.Empty
         };
-        if (!detailMatches)
-        {
-            return false;
-        }
-
-        if (data.TryGetProperty("analysis_deferred", out var deferredElement) &&
-            deferredElement.ValueKind == JsonValueKind.True)
-        {
-            return false;
-        }
-
-        return requirement switch
-        {
-            AgentEvidenceRequirement.Frames => HasEvidenceProperty(data, "vision", "observations"),
-            AgentEvidenceRequirement.Transcript => HasEvidenceProperty(data, "transcript", "cues"),
-            AgentEvidenceRequirement.Audio => HasAudioEvidence(data),
-            AgentEvidenceRequirement.All =>
-                HasEvidenceProperty(data, "vision", "observations") && HasAudioEvidence(data),
-            _ => true
-        };
-    }
-
-    private static bool HasEvidenceProperty(
-        JsonElement data,
-        string propertyName,
-        string collectionName)
-    {
-        if (data.TryGetProperty(propertyName, out var evidence) &&
-            evidence.ValueKind == JsonValueKind.Object &&
-            evidence.TryGetProperty(collectionName, out var values) &&
-            values.ValueKind == JsonValueKind.Array &&
-            values.GetArrayLength() > 0)
-        {
-            return true;
-        }
-
-        return data.TryGetProperty("analyses", out var analyses) &&
-               analyses.ValueKind == JsonValueKind.Array &&
-               analyses.EnumerateArray().Any(item =>
-                   item.ValueKind == JsonValueKind.Object &&
-                   item.TryGetProperty("status", out var status) &&
-                   string.Equals(status.GetString(), "succeeded", StringComparison.OrdinalIgnoreCase) &&
-                   item.TryGetProperty("observation", out var nested) &&
-                   nested.ValueKind == JsonValueKind.Object &&
-                   HasEvidenceProperty(nested, propertyName, collectionName));
-    }
-
-    private static bool HasAudioEvidence(JsonElement data)
-        => (data.TryGetProperty("analysis", out var analysis) &&
-            analysis.ValueKind == JsonValueKind.Object) ||
-           (data.TryGetProperty("analyses", out var analyses) &&
-            analyses.ValueKind == JsonValueKind.Array &&
-            analyses.EnumerateArray().Any(item =>
-                item.ValueKind == JsonValueKind.Object &&
-                item.TryGetProperty("status", out var status) &&
-                string.Equals(status.GetString(), "succeeded", StringComparison.OrdinalIgnoreCase) &&
-                item.TryGetProperty("observation", out var nested) &&
-                nested.ValueKind == JsonValueKind.Object &&
-                HasAudioEvidence(nested)));
 
     private ImmutableArray<AgentToolDescriptor> GetPlanningToolDescriptors()
         => _registry.Descriptors
@@ -604,7 +1241,40 @@ public sealed class AgentPlanningLoop
                                      descriptor.Name,
                                      "inspect_agent_edits",
                                      StringComparison.OrdinalIgnoreCase))
+            .Where(descriptor => !_publishFromExistingEvidence ||
+                                 descriptor.Access == AgentToolAccess.Editing)
             .ToImmutableArray();
+
+    private void RequirePublicationWhenInvestigationBudgetIsFull(AgentTaskState task)
+    {
+        if (_publishFromExistingEvidence ||
+            task.Brief is not { Kind: AgentTaskKind.Edit or AgentTaskKind.Mixed })
+        {
+            return;
+        }
+
+        var successful = task.Evidence
+            .Where(item =>
+                item.SourceRevision == task.SourceSequenceRevision &&
+                item.Capabilities != AgentEvidenceCapabilities.None &&
+                (item.Capabilities &
+                 (AgentEvidenceCapabilities.Project |
+                  AgentEvidenceCapabilities.EditorContext)) == 0)
+            .ToArray();
+
+        if (successful.Length < _options.MaxSuccessfulInvestigationsBeforePublication)
+        {
+            return;
+        }
+
+        var latestSequence = successful.Max(item => item.Sequence);
+        if (latestSequence <= _lastRejectedPublicationEvidenceSequence)
+        {
+            return;
+        }
+
+        _publishFromExistingEvidence = true;
+    }
 
     private ImmutableArray<AgentModelObservation> GetObservationContext()
     {
@@ -672,9 +1342,10 @@ public sealed class AgentPlanningLoop
 
     private void AddObservation(AgentModelObservation observation)
     {
+        var retainedObservation = CompactObservationForMemory(observation);
         lock (_observations)
         {
-            _observations.Add(observation);
+            _observations.Add(retainedObservation);
             AgentObservationRetention.Trim(
                 _observations,
                 RequireCurrentTask(),
@@ -697,20 +1368,54 @@ public sealed class AgentPlanningLoop
                 ToEvidenceChannel(observation.ToolName, data),
                 observation.ToolName,
                 targetId,
-                TryReadInt64(data, "revision")
-                ?? TryReadInt64(data, "source_revision")
+                TryReadInt64(data, "source_revision")
+                ?? TryReadInt64(data, "sequence_revision")
                 ?? task.SourceSequenceRevision,
                 TryReadDouble(data, "start_seconds"),
                 TryReadDouble(data, "end_seconds"),
                 observation.Summary,
                 ImmutableArray.Create(observation.Summary),
                 TryReadString(data, "artifact_reference"),
-                DateTimeOffset.UtcNow);
+                DateTimeOffset.UtcNow,
+                observation.EvidenceCapabilities,
+                TryReadDouble(data, "boundary_at_seconds"));
             _orchestrator.ReplaceEvidenceLedger(
                 task.Evidence
                     .Where(item => item.Sequence != observation.Sequence)
                     .Append(record));
         }
+    }
+
+    private static AgentModelObservation CompactObservationForMemory(
+        AgentModelObservation observation)
+    {
+        if (observation.Data is not { ValueKind: JsonValueKind.Object } data ||
+            data.GetRawText().Length <= 20_000)
+        {
+            return observation;
+        }
+
+        var retained = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var name in new[]
+                 {
+                     "channel", "project_revision", "sequence_id", "sequence_revision",
+                     "revision", "source_revision", "draft_revision", "target",
+                     "start_seconds", "end_seconds", "detail", "truncated",
+                     "boundary_at_seconds", "requested_window_seconds",
+                     "artifact_reference", "recommended_next_inspection", "next_cursor",
+                     "total_matches", "gap_count", "overlap_count", "link_issue_count",
+                     "edit_count"
+                 })
+        {
+            if (data.TryGetProperty(name, out var property))
+            {
+                retained[name] = property.Clone();
+            }
+        }
+
+        retained["observation_data_compacted"] = true;
+        retained["omitted_character_count"] = data.GetRawText().Length;
+        return observation with { Data = AgentToolJson.ToElement(retained) };
     }
 
     private static AgentEvidenceChannel ToEvidenceChannel(
@@ -752,6 +1457,7 @@ public sealed class AgentPlanningLoop
     private static Guid? TryReadGuid(JsonElement? data, string propertyName)
         => data is { ValueKind: JsonValueKind.Object } value &&
            value.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.String &&
            property.TryGetGuid(out var result)
             ? result
             : null;
@@ -759,6 +1465,7 @@ public sealed class AgentPlanningLoop
     private static long? TryReadInt64(JsonElement? data, string propertyName)
         => data is { ValueKind: JsonValueKind.Object } value &&
            value.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.Number &&
            property.TryGetInt64(out var result)
             ? result
             : null;
@@ -766,6 +1473,7 @@ public sealed class AgentPlanningLoop
     private static double? TryReadDouble(JsonElement? data, string propertyName)
         => data is { ValueKind: JsonValueKind.Object } value &&
            value.TryGetProperty(propertyName, out var property) &&
+           property.ValueKind == JsonValueKind.Number &&
            property.TryGetDouble(out var result)
             ? result
             : null;
@@ -811,19 +1519,84 @@ public sealed class AgentPlanningLoop
         lock (_observations)
         {
             _observations.Clear();
+            foreach (var evidence in task.Evidence
+                         .Where(item => task.SourceSequenceRevision is null ||
+                                        item.SourceRevision == task.SourceSequenceRevision)
+                         .GroupBy(item => item.Sequence)
+                         .Select(group => group.Last())
+                         .OrderBy(item => item.Sequence))
+            {
+                var restoredData = AgentToolJson.ToElement(new
+                {
+                    target_id = evidence.TargetId,
+                    source_revision = evidence.SourceRevision,
+                    start_seconds = evidence.StartSeconds,
+                    end_seconds = evidence.EndSeconds,
+                    boundary_at_seconds = evidence.BoundarySeconds,
+                    channel = evidence.Channel.ToString().ToLowerInvariant(),
+                    artifact_reference = evidence.ArtifactReference,
+                    restored_from_evidence_ledger = true
+                });
+                _observations.Add(new AgentModelObservation(
+                    evidence.Sequence,
+                    evidence.ToolName,
+                    AgentToolResultStatus.Succeeded,
+                    $"Restored typed evidence E{evidence.Sequence}; see evidence_ledger.",
+                    restoredData,
+                    null,
+                    evidence.Capabilities));
+            }
+
+            AgentObservationRetention.Trim(
+                _observations,
+                task,
+                _options.MaxObservationCount,
+                _options.MaxObservationContextCharacters);
         }
 
         _memoryTaskId = task.Id;
         _memorySourceSequenceRevision = task.SourceSequenceRevision;
-        _nextObservationSequence = 1;
+        _nextObservationSequence = task.Evidence
+            .Select(item => item.Sequence)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
         _lastToolSignature = null;
         _consecutiveIdenticalToolCalls = 0;
+        _boundaryInspectionCounts.Clear();
+        _publishFromExistingEvidence = false;
+        _lastRejectedPublicationEvidenceSequence = 0;
     }
 
     private AgentTaskState RequireCurrentTask()
         => _orchestrator.CurrentTask
            ?? throw new AgentTaskTransitionException(
                "There is no active AI agent task.");
+
+    private static bool TryCreateBoundaryInspectionKey(
+        string toolName,
+        JsonElement arguments,
+        out string key)
+    {
+        key = string.Empty;
+        if (!string.Equals(toolName, "inspect_boundary", StringComparison.OrdinalIgnoreCase) ||
+            arguments.ValueKind != JsonValueKind.Object ||
+            !arguments.TryGetProperty("at_seconds", out var atValue) ||
+            !atValue.TryGetDouble(out var atSeconds) ||
+            !double.IsFinite(atSeconds))
+        {
+            return false;
+        }
+
+        var targetKind = TryReadString(arguments, "target_kind") ?? "sequence";
+        var targetId = TryReadGuid(arguments, "target_id")?.ToString("N") ?? "default";
+        var detail = TryReadString(arguments, "detail") ?? "all";
+        var quarterSecond = Math.Round(
+            atSeconds * 4,
+            MidpointRounding.AwayFromZero);
+        key = $"{targetKind.Trim().ToLowerInvariant()}|{targetId}|" +
+              $"{detail.Trim().ToLowerInvariant()}|{quarterSecond:0}";
+        return true;
+    }
 
     private AgentTaskState FailTask(string message)
     {
@@ -840,6 +1613,16 @@ public sealed class AgentPlanningLoop
 
         return _orchestrator.Fail(message);
     }
+
+    private sealed record DiscoveryCoverageSample(
+        double Start,
+        double End,
+        string Status,
+        string Summary,
+        string? ErrorCode,
+        int AttemptCount,
+        bool HasFrames,
+        bool HasAudio);
 
     private void Log(
         AgentTaskState task,

@@ -16,7 +16,7 @@ public sealed class InspectBoundaryTool(IAgentReadOnlyToolBackend backend) : IAg
                 "target_kind":{"type":"string","enum":["media","sequence"]},
                 "target_id":{"type":"string","format":"uuid"},
                 "at_seconds":{"type":"number","minimum":0},
-                "window_seconds":{"type":"number","exclusiveMinimum":0,"maximum":120,"default":8},
+                "window_seconds":{"type":"number","exclusiveMinimum":0,"maximum":15,"default":8},
                 "detail":{"type":"string","enum":["frames","audio","transcript","all"],"default":"all"},
                 "query":{"type":"string","maxLength":2000}
               },
@@ -45,9 +45,9 @@ public sealed class InspectBoundaryTool(IAgentReadOnlyToolBackend backend) : IAg
         var window = arguments.TryGetProperty("window_seconds", out _)
             ? AgentToolJson.RequireFiniteDouble(arguments, "window_seconds", double.Epsilon)
             : 8;
-        if (window > 120)
+        if (window > 15)
         {
-            throw new AgentToolInputException("'window_seconds' cannot exceed 120 seconds.");
+            throw new AgentToolInputException("'window_seconds' cannot exceed 15 seconds; use inspect_range for wider exploration.");
         }
 
         var detail = (AgentToolJson.OptionalString(arguments, "detail") ?? "all").ToLowerInvariant() switch
@@ -67,8 +67,17 @@ public sealed class InspectBoundaryTool(IAgentReadOnlyToolBackend backend) : IAg
             AgentToolJson.OptionalString(arguments, "query") ??
             "Describe only measured differences and continuity immediately before and after the candidate boundary.");
         var data = await backend.InspectRangeAsync(context, request, cancellationToken);
+        var annotatedData = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var property in data.EnumerateObject())
+        {
+            annotatedData[property.Name] = property.Value.Clone();
+        }
+        annotatedData["boundary_at_seconds"] = at;
+        annotatedData["requested_window_seconds"] = window;
+        var prefix = $"Boundary at {at:0.###}s inspected within a ±{window:0.###}s window.";
         return new AgentToolExecutionOutput(
-            $"Boundary at {at:0.###}s inspected within a ±{window:0.###}s window.",
-            data.Clone());
+            AgentRangeEvidenceSummary.Build(prefix, data),
+            AgentToolJson.ToElement(annotatedData),
+            AgentRangeEvidenceCapabilities.From(detail, data));
     }
 }

@@ -1,10 +1,51 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 
 namespace KadrStudio.AiServer.Inference;
 
 public static class StructuredOutputValidator
 {
+    public static bool TryRemoveDisallowedProperties(
+        string content,
+        JsonElement schema,
+        out string normalizedContent)
+    {
+        normalizedContent = string.Empty;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(content);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                var removedProperties = 0;
+                WriteWithoutDisallowedProperties(
+                    writer,
+                    document.RootElement,
+                    schema,
+                    ref removedProperties);
+                writer.Flush();
+                if (removedProperties == 0)
+                {
+                    return false;
+                }
+            }
+
+            normalizedContent = Encoding.UTF8.GetString(stream.ToArray());
+            return true;
+        }
+        catch (JsonException)
+        {
+            normalizedContent = string.Empty;
+            return false;
+        }
+    }
+
     public static bool TryCloseOpenContainers(
         string content,
         out string completedContent)
@@ -15,13 +56,23 @@ public static class StructuredOutputValidator
             return false;
         }
 
+        var trimmedInput = content.Trim();
+        var rootStart = trimmedInput.IndexOfAny(['{', '[']);
+        if (rootStart < 0)
+        {
+            return false;
+        }
+
         var stack = new Stack<char>();
+        var builder = new StringBuilder(trimmedInput.Length + 16);
         var inString = false;
         var escaped = false;
-        foreach (var character in content)
+        var rootCompleted = false;
+        foreach (var character in trimmedInput.AsSpan(rootStart))
         {
             if (inString)
             {
+                builder.Append(character);
                 if (escaped)
                 {
                     escaped = false;
@@ -41,33 +92,63 @@ public static class StructuredOutputValidator
             {
                 case '"':
                     inString = true;
+                    builder.Append(character);
                     break;
                 case '{':
+                    stack.Push('}');
+                    builder.Append(character);
+                    break;
                 case '[':
-                    stack.Push(character);
+                    stack.Push(']');
+                    builder.Append(character);
                     break;
                 case '}':
-                    if (stack.Count == 0 || stack.Pop() != '{') return false;
-                    break;
                 case ']':
-                    if (stack.Count == 0 || stack.Pop() != '[') return false;
+                    if (stack.Count == 0)
+                    {
+                        rootCompleted = true;
+                        break;
+                    }
+                    // A model occasionally emits the other container closer at
+                    // the correct structural position. Replace only that delimiter;
+                    // schema validation below remains authoritative for all values.
+                    builder.Append(stack.Pop());
+                    if (stack.Count == 0)
+                    {
+                        rootCompleted = true;
+                    }
                     break;
+                default:
+                    builder.Append(character);
+                    break;
+            }
+
+            if (rootCompleted)
+            {
+                break;
             }
         }
 
-        if (inString || escaped || stack.Count is 0 or > 64)
+        if (inString || escaped || stack.Count > 64)
         {
             return false;
         }
 
-        var trimmed = content.TrimEnd();
-        if (trimmed.Length == 0 || trimmed[^1] is ':' or ',' or '{' or '[')
+        var repaired = builder.ToString().TrimEnd();
+        if (repaired.Length == 0 || repaired[^1] is ':' or ',' or '{' or '[')
         {
             return false;
         }
 
-        var suffix = new string(stack.Select(character => character == '{' ? '}' : ']').ToArray());
-        completedContent = trimmed + suffix;
+        if (!rootCompleted)
+        {
+            while (stack.Count > 0)
+            {
+                builder.Append(stack.Pop());
+            }
+            repaired = builder.ToString();
+        }
+        completedContent = repaired;
         try
         {
             using var _ = JsonDocument.Parse(completedContent);
@@ -113,6 +194,66 @@ public static class StructuredOutputValidator
             errors = [$"Invalid JSON: {exception.Message}"];
             return false;
         }
+    }
+
+    private static void WriteWithoutDisallowedProperties(
+        Utf8JsonWriter writer,
+        JsonElement value,
+        JsonElement schema,
+        ref int removedProperties)
+    {
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            var properties = schema.ValueKind == JsonValueKind.Object &&
+                             schema.TryGetProperty("properties", out var configuredProperties) &&
+                             configuredProperties.ValueKind == JsonValueKind.Object
+                ? configuredProperties
+                : default;
+            var rejectAdditional = schema.ValueKind == JsonValueKind.Object &&
+                                   schema.TryGetProperty("additionalProperties", out var additional) &&
+                                   additional.ValueKind == JsonValueKind.False;
+
+            writer.WriteStartObject();
+            foreach (var property in value.EnumerateObject())
+            {
+                if (properties.ValueKind == JsonValueKind.Object &&
+                    properties.TryGetProperty(property.Name, out var propertySchema))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteWithoutDisallowedProperties(
+                        writer,
+                        property.Value,
+                        propertySchema,
+                        ref removedProperties);
+                }
+                else if (rejectAdditional)
+                {
+                    removedProperties++;
+                }
+                else
+                {
+                    property.WriteTo(writer);
+                }
+            }
+            writer.WriteEndObject();
+            return;
+        }
+
+        if (value.ValueKind == JsonValueKind.Array &&
+            schema.ValueKind == JsonValueKind.Object &&
+            schema.TryGetProperty("items", out var itemSchema) &&
+            itemSchema.ValueKind == JsonValueKind.Object)
+        {
+            writer.WriteStartArray();
+            foreach (var item in value.EnumerateArray())
+            {
+                WriteWithoutDisallowedProperties(writer, item, itemSchema, ref removedProperties);
+            }
+            writer.WriteEndArray();
+            return;
+        }
+
+        value.WriteTo(writer);
     }
 
     private static void ValidateValue(

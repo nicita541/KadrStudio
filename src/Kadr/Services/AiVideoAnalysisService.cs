@@ -6,6 +6,7 @@ using System.Net.Http.Json;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using KadrStudio.Application.Automation;
 using KadrStudio.Models;
 using CoreMediaClip = KadrStudio.Core.Domain.MediaClip;
@@ -181,10 +182,10 @@ public sealed class AiVideoAnalysisService : IDisposable
         IProgress<VideoAnalysisProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        _ = query; // Legacy API context is never forwarded to the neutral vision sensor.
         var inspection = await InspectRangeAsync(
             asset,
             baseline,
-            query,
             model,
             progress,
             cancellationToken).ConfigureAwait(false);
@@ -196,7 +197,7 @@ public sealed class AiVideoAnalysisService : IDisposable
             item.Description,
             item.Confidence)).ToArray();
         return new AiAnalysisEnhancement(
-            inspection.Summary,
+            $"Получено визуальных наблюдений: {inspection.Observations.Count}.",
             observations,
             model,
             inspection.UsedVision);
@@ -205,7 +206,6 @@ public sealed class AiVideoAnalysisService : IDisposable
     public async Task<AiRangeInspection> InspectRangeAsync(
         MediaAsset asset,
         VideoAnalysisResult baseline,
-        string query,
         string model,
         IProgress<VideoAnalysisProgress>? progress = null,
         CancellationToken cancellationToken = default)
@@ -219,7 +219,10 @@ public sealed class AiVideoAnalysisService : IDisposable
             throw new InvalidOperationException($"Модель {model} не поддерживает анализ изображений.");
 
         var duration = Math.Max(0.1, baseline.SourceEnd - baseline.SourceStart);
-        var sheetCount = Math.Clamp((int)Math.Ceiling(duration / 180d), 1, 4);
+        // Keep every image temporally narrow enough for the vision model to read
+        // the first and last tiles reliably. inspect_range is bounded to 120s, so
+        // this produces at most three contact sheets for ordinary agent probes.
+        var sheetCount = Math.Clamp((int)Math.Ceiling(duration / 45d), 1, 4);
         var window = duration / sheetCount;
         var specs = new List<ContactSheetSpec>(sheetCount);
         for (var index = 0; index < sheetCount; index++)
@@ -231,20 +234,20 @@ public sealed class AiVideoAnalysisService : IDisposable
             specs.Add(new ContactSheetSpec(
                 start,
                 end,
-                duration >= 3 ? 16 : 4,
+                duration >= 3 ? 8 : 4,
                 $"часть {index + 1}/{sheetCount}"));
         }
 
         var paths = new List<string>();
-        var images = new List<string>();
         try
         {
+            var parsedSheets = new List<ParsedContactSheetObservation>(specs.Count);
             for (var index = 0; index < specs.Count; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 progress?.Report(new VideoAnalysisProgress(
-                    90 + 5d * index / Math.Max(1, specs.Count),
-                    $"Agent vision: диапазон {index + 1}/{specs.Count}"));
+                    90 + 8d * index / Math.Max(1, specs.Count),
+                    $"Agent vision: независимый контактный лист {index + 1}/{specs.Count}"));
                 var spec = specs[index];
                 var path = await CreateContactSheetAsync(
                     asset.Path,
@@ -253,171 +256,54 @@ public sealed class AiVideoAnalysisService : IDisposable
                     spec.FrameCount,
                     cancellationToken).ConfigureAwait(false);
                 paths.Add(path);
-                images.Add(Convert.ToBase64String(
-                    await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false)));
-            }
+                var image = Convert.ToBase64String(
+                    await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false));
 
-            using var schema = JsonDocument.Parse(
-                """
+                ParsedContactSheetObservation? parsed = null;
+                Exception? lastError = null;
+                for (var attempt = 1; attempt <= 2 && parsed is null; attempt++)
                 {
-                  "type": "object",
-                  "properties": {
-                    "summary": { "type": "string" },
-                    "observations": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "start": { "type": "number" },
-                          "end": { "type": "number" },
-                          "title": { "type": "string" },
-                          "description": { "type": "string" },
-                          "confidence": { "type": "number" },
-                          "tags": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                          }
-                        },
-                        "required": [
-                          "start",
-                          "end",
-                          "title",
-                          "description",
-                          "confidence",
-                          "tags"
-                        ],
-                        "additionalProperties": false
-                      }
+                    try
+                    {
+                        parsed = await InspectSingleContactSheetAsync(
+                            spec,
+                            image,
+                            correctionAttempt: attempt > 1,
+                            cancellationToken).ConfigureAwait(false);
                     }
-                  },
-                  "required": ["summary", "observations"],
-                  "additionalProperties": false
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception exception)
+                    {
+                        lastError = exception;
+                    }
                 }
-                """);
-
-            var sheetDescription = string.Join(
-                Environment.NewLine,
-                specs.Select((spec, index) =>
+                if (parsed is null)
                 {
-                    var step = Math.Max(0.001, (spec.End - spec.Start) / spec.FrameCount);
-                    return
-                        $"- image {index + 1}: {Format(spec.Start)}–{Format(spec.End)} sec, " +
-                        $"{spec.FrameCount} frames left-to-right/top-to-bottom; " +
-                        $"approx frame N time = {Format(spec.Start)} + (N-0.5)*{Format(step)} sec";
-                }));
-
-            var technicalRanges = string.Join(
-                Environment.NewLine,
-                baseline.Ranges
-                    .Where(item => item.Kind is MarkerKind.Scene or MarkerKind.BlackFrame or
-                        MarkerKind.Silence or MarkerKind.Freeze)
-                    .OrderBy(item => item.SourceStart)
-                    .Take(80)
-                    .Select(item =>
-                        $"- {item.Kind}: {Format(item.SourceStart)}–" +
-                        $"{Format(item.SourceStart + item.Duration)}, confidence {Format(item.Confidence)}"));
-
-            var messages = new object[]
-            {
-                new
-                {
-                    role = "system",
-                    content =
-                        "/no_think\n" +
-                        "Ты визуальный исследователь материала для монтажного AI-агента. " +
-                        "Верни только JSON строго по JSON Schema. " +
-                        "Отвечай на конкретный вопрос агента, используя только видимое на приложенных кадрах " +
-                        "и технические факты. Не решай, что удалять или как монтировать: твоя задача — наблюдения. " +
-                        "Не выдумывай события между редкими кадрами. start/end — абсолютные секунды исходника " +
-                        "и должны оставаться внутри анализируемого диапазона. " +
-                        "Создавай observations только для фактов, полезных для вопроса; максимум 24."
-                },
-                new
-                {
-                    role = "user",
-                    content =
-                        $"Файл: {asset.Name}\n" +
-                        $"Вопрос агента: {(string.IsNullOrWhiteSpace(query) ? "Опиши значимые визуальные факты диапазона." : query.Trim())}\n" +
-                        $"Диапазон: {Format(baseline.SourceStart)}–{Format(baseline.SourceEnd)} сек.\n" +
-                        $"Техническая сводка: {baseline.Summary}\n" +
-                        $"Технические события:\n{technicalRanges}\n" +
-                        $"Контактные листы:\n{sheetDescription}",
-                    images = images.ToArray()
+                    throw new InvalidOperationException(
+                        $"Vision sensor could not produce a trustworthy independent observation for contact sheet {index + 1}/{specs.Count}.",
+                        lastError);
                 }
-            };
-
-            progress?.Report(new VideoAnalysisProgress(96, $"Agent vision: смысловая проверка ({model})"));
-            var responseJson = await RunLegacyEnvelopeAsync(
-                schema.RootElement, messages, 0, 16384, 4096, cancellationToken).ConfigureAwait(false);
-            using var envelope = JsonDocument.Parse(responseJson);
-            var raw = envelope.RootElement
-                .GetProperty("message")
-                .GetProperty("content")
-                .GetString() ?? string.Empty;
-
-            var doneReason = envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
-                ? doneReasonElement.GetString()
-                : null;
-            if (string.IsNullOrWhiteSpace(raw))
-                throw new InvalidOperationException(
-                    $"ИИ вернул пустой анализ диапазона. done_reason={doneReason ?? "unknown"}.");
-            if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
-                !raw.TrimEnd().EndsWith("}", StringComparison.Ordinal))
-                throw new InvalidOperationException(
-                    $"ИИ оборвал JSON анализа диапазона. done_reason={doneReason ?? "unknown"}.");
-
-            using var document = JsonDocument.Parse(ExtractJson(raw));
-            var summary = GetString(document.RootElement, "summary");
-            var observations = new List<AiRangeObservation>();
-
-            if (document.RootElement.TryGetProperty("observations", out var items) &&
-                items.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var item in items.EnumerateArray().Take(24))
-                {
-                    if (!TryGetNumber(item, "start", out var start) ||
-                        !TryGetNumber(item, "end", out var end))
-                        continue;
-
-                    start = Math.Clamp(start, baseline.SourceStart, baseline.SourceEnd);
-                    end = Math.Clamp(end, baseline.SourceStart, baseline.SourceEnd);
-                    if (end <= start + 0.05)
-                        continue;
-
-                    var confidence = TryGetNumber(item, "confidence", out var parsedConfidence)
-                        ? Math.Clamp(parsedConfidence, 0, 1)
-                        : 0.5;
-                    var tags = item.TryGetProperty("tags", out var tagsElement) &&
-                               tagsElement.ValueKind == JsonValueKind.Array
-                        ? tagsElement.EnumerateArray()
-                            .Where(tag => tag.ValueKind == JsonValueKind.String)
-                            .Select(tag => tag.GetString()?.Trim())
-                            .Where(tag => !string.IsNullOrWhiteSpace(tag))
-                            .Select(tag => tag!)
-                            .Distinct(StringComparer.OrdinalIgnoreCase)
-                            .Take(12)
-                            .ToArray()
-                        : Array.Empty<string>();
-
-                    observations.Add(new AiRangeObservation(
-                        start,
-                        end,
-                        GetString(item, "title"),
-                        GetString(item, "description"),
-                        confidence,
-                        tags));
-                }
+                parsedSheets.Add(parsed);
             }
 
-            progress?.Report(new VideoAnalysisProgress(100, "Agent vision: диапазон исследован"));
+            RejectCrossSheetContradiction(baseline, parsedSheets);
+            var observations = parsedSheets
+                .Select(item => item.Observation)
+                .OrderBy(item => item.Start)
+                .ThenByDescending(item => item.Confidence)
+                .ToArray();
+
+            progress?.Report(new VideoAnalysisProgress(
+                100,
+                "Agent vision: каждый контактный лист независимо проверен"));
             return new AiRangeInspection(
-                summary,
-                observations
-                    .OrderBy(item => item.Start)
-                    .ThenByDescending(item => item.Confidence)
-                    .ToArray(),
+                observations,
                 model,
-                UsedVision: true);
+                UsedVision: true,
+                CoverageComplete: observations.Length == specs.Count);
         }
         finally
         {
@@ -438,7 +324,6 @@ public sealed class AiVideoAnalysisService : IDisposable
         var inspection = await InspectRangeAsync(
             asset,
             baseline,
-            "Опиши только наблюдаемые события, действия, речь, эмоции и технические изменения без жанровых ярлыков и монтажных решений.",
             model,
             progress,
             cancellationToken).ConfigureAwait(false);
@@ -868,6 +753,274 @@ public sealed class AiVideoAnalysisService : IDisposable
         _httpClient.Dispose();
     }
 
+    private async Task<ParsedContactSheetObservation> InspectSingleContactSheetAsync(
+        ContactSheetSpec spec,
+        string image,
+        bool correctionAttempt,
+        CancellationToken cancellationToken)
+    {
+        using var schema = JsonDocument.Parse(
+            $$"""
+            {
+              "type":"object",
+              "properties":{
+                "tiles":{
+                  "type":"array",
+                  "minItems":{{spec.FrameCount}},
+                  "maxItems":{{spec.FrameCount}},
+                  "items":{
+                    "type":"object",
+                    "properties":{
+                      "description":{"type":"string","minLength":1,"maxLength":240},
+                      "visible_text":{
+                        "type":"array",
+                        "maxItems":6,
+                        "items":{"type":"string","maxLength":100}
+                      }
+                    },
+                    "required":["description","visible_text"],
+                    "additionalProperties":false
+                  }
+                },
+                "confidence":{"type":"number","minimum":0,"maximum":1}
+              },
+              "required":["tiles","confidence"],
+              "additionalProperties":false
+            }
+            """);
+        var messages = new object[]
+        {
+            new
+            {
+                role = "system",
+                content =
+                    "/no_think\n" +
+                    "Ты нейтральный визуальный сенсор. Получаешь ровно одно изображение: " +
+                    "контактный лист из независимых кадров одного видео. Смысловая задача, " +
+                    "имя файла и абсолютные таймкоды намеренно не передаются. Верни только JSON. " +
+                    "Опиши каждый tile отдельно слева направо и сверху вниз. Не переноси объекты, " +
+                    "текст или описание из соседнего tile. Не сравнивай tiles и не делай общий вывод. " +
+                    "Не называй материал опенингом, эндингом, основным сюжетом или дефектом, не решай, " +
+                    "что монтировать, и не выставляй pass/fail. description содержит только видимые " +
+                    "объекты, персонажей, действие и композицию конкретного tile. visible_text содержит " +
+                    "только символы, реально различимые внутри этого tile; никогда не копируй туда " +
+                    "числа, индексы, диапазоны или инструкции из prompt. Таймкоды добавит приложение."
+            },
+            new
+            {
+                role = "user",
+                content =
+                    $"На изображении {spec.FrameCount} tiles. Верни ровно {spec.FrameCount} элементов " +
+                    "в исходном порядке. Если текст не читается, visible_text должен быть пустым массивом. " +
+                    "Не описывай сетку, поля контактного листа или сведения, которых нет в пикселях кадра." +
+                    (correctionAttempt
+                        ? " Это корректирующая независимая попытка: каждое description начни непосредственно " +
+                          "с видимого объекта, персонажа или композиции; не употребляй слова tile, кадр, " +
+                          "контактный лист, диапазон, опенинг, эндинг или основной сюжет."
+                        : string.Empty),
+                images = new[] { image }
+            }
+        };
+
+        var responseJson = await RunLegacyEnvelopeAsync(
+            schema.RootElement,
+            messages,
+            0,
+            6144,
+            1024,
+            cancellationToken).ConfigureAwait(false);
+        using var envelope = JsonDocument.Parse(responseJson);
+        var raw = envelope.RootElement
+            .GetProperty("message")
+            .GetProperty("content")
+            .GetString() ?? string.Empty;
+        var doneReason = envelope.RootElement.TryGetProperty("done_reason", out var doneReasonElement)
+            ? doneReasonElement.GetString()
+            : null;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            throw new InvalidOperationException(
+                $"Vision sensor returned an empty contact-sheet observation. done_reason={doneReason ?? "unknown"}.");
+        }
+        if (string.Equals(doneReason, "length", StringComparison.OrdinalIgnoreCase) ||
+            !raw.TrimEnd().EndsWith("}", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Vision sensor truncated the contact-sheet JSON. done_reason={doneReason ?? "unknown"}.");
+        }
+
+        using var document = JsonDocument.Parse(ExtractJson(raw));
+        var root = document.RootElement;
+        if (!root.TryGetProperty("tiles", out var tilesElement) ||
+            tilesElement.ValueKind != JsonValueKind.Array ||
+            tilesElement.GetArrayLength() != spec.FrameCount)
+        {
+            throw new InvalidOperationException(
+                $"Vision sensor returned an incomplete tile list; expected {spec.FrameCount} exact observations.");
+        }
+
+        var confidence = TryGetNumber(root, "confidence", out var parsedConfidence)
+            ? Math.Clamp(parsedConfidence, 0, 1)
+            : 0.5;
+        var step = (spec.End - spec.Start) / spec.FrameCount;
+        var tileFacts = new List<string>(spec.FrameCount);
+        var normalizedDescriptions = new List<string>(spec.FrameCount);
+        var metadataEchoCount = 0;
+        var tileIndex = 0;
+        foreach (var tile in tilesElement.EnumerateArray())
+        {
+            var tileDescription = GetString(tile, "description").Trim();
+            var rejectionReason = string.IsNullOrWhiteSpace(tileDescription)
+                ? "empty_description"
+                : ContainsForbiddenSensorVerdict(tileDescription)
+                    ? "semantic_verdict"
+                    : ContainsDescriptionMetadataEcho(tileDescription)
+                        ? "request_metadata_echo"
+                        : null;
+            if (rejectionReason is not null)
+            {
+                var diagnostic = tileDescription
+                    .Replace('\r', ' ')
+                    .Replace('\n', ' ');
+                if (diagnostic.Length > 180)
+                {
+                    diagnostic = diagnostic[..179] + "…";
+                }
+                throw new InvalidOperationException(
+                    $"Vision sensor tile {tileIndex + 1} was rejected: {rejectionReason}. " +
+                    $"Observed description: {diagnostic}");
+            }
+            tileDescription = NormalizeVisualDescription(tileDescription);
+
+            var visibleText = tile.TryGetProperty("visible_text", out var textElement) &&
+                              textElement.ValueKind == JsonValueKind.Array
+                ? textElement.EnumerateArray()
+                    .Where(text => text.ValueKind == JsonValueKind.String)
+                    .Select(text => text.GetString()?.Trim())
+                    .Where(text => !string.IsNullOrWhiteSpace(text))
+                    .Select(text => text!)
+                    .Distinct(StringComparer.Ordinal)
+                    .Take(6)
+                    .ToArray()
+                : [];
+            metadataEchoCount += visibleText.Count(ContainsSensorMetadataEcho);
+            visibleText = visibleText
+                .Where(text => !ContainsSensorMetadataEcho(text))
+                .ToArray();
+
+            var at = spec.Start + (tileIndex + 0.5) * step;
+            tileFacts.Add(
+                $"Tile {tileIndex + 1} @ {Format(at)}s: {tileDescription}" +
+                (visibleText.Length == 0
+                    ? string.Empty
+                    : $" [text: {string.Join(" | ", visibleText)}]"));
+            normalizedDescriptions.Add(NormalizeSensorText(tileDescription));
+            tileIndex++;
+        }
+        if (metadataEchoCount >= 2)
+        {
+            throw new InvalidOperationException(
+                "Vision sensor copied non-visual request metadata into OCR observations.");
+        }
+
+        return new ParsedContactSheetObservation(
+            new AiRangeObservation(
+                spec.Start,
+                spec.End,
+                $"Visual observation {Format(spec.Start)}–{Format(spec.End)}s",
+                string.Join(" ", tileFacts),
+                confidence,
+                []),
+            normalizedDescriptions.ToImmutableArray());
+    }
+
+    private static void RejectCrossSheetContradiction(
+        VideoAnalysisResult baseline,
+        IReadOnlyCollection<ParsedContactSheetObservation> sheets)
+    {
+        var descriptions = sheets
+            .SelectMany(sheet => sheet.NormalizedDescriptions)
+            .Where(description => !string.IsNullOrWhiteSpace(description))
+            .ToArray();
+        if (descriptions.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "Vision sensor returned no usable frame descriptions.");
+        }
+
+        var measuredSceneSegments = baseline.Ranges.Count(range =>
+            range.Kind == MarkerKind.Scene);
+        var largestExactRepetition = descriptions
+            .GroupBy(description => description, StringComparer.Ordinal)
+            .Select(group => group.Count())
+            .DefaultIfEmpty(0)
+            .Max();
+        var suspiciousThreshold = Math.Max(4, (int)Math.Ceiling(descriptions.Length * 0.35));
+        if (measuredSceneSegments >= 12 &&
+            largestExactRepetition >= suspiciousThreshold)
+        {
+            throw new InvalidOperationException(
+                "Vision sensor repeated one identical frame description across a technically changing range. " +
+                "The observation is internally contradictory and must be measured again.");
+        }
+    }
+
+    private static bool ContainsSensorMetadataEcho(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized.Contains("contact sheet", StringComparison.Ordinal) ||
+               normalized.Contains("контактн", StringComparison.Ordinal) ||
+               normalized.Contains("frame n time", StringComparison.Ordinal) ||
+               Regex.IsMatch(
+                   normalized,
+                   @"(?:^|\s)(?:tile|кадр)\s*#?\d+\b",
+                   RegexOptions.CultureInvariant | RegexOptions.IgnoreCase) ||
+               Regex.IsMatch(
+                   normalized,
+                   @"\d{2,}(?:[.,]\d+)?\s*[-–—]\s*\d{2,}(?:[.,]\d+)?\s*(?:s|sec|second|seconds|с|сек|секунд)",
+                   RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    }
+
+    private static bool ContainsDescriptionMetadataEcho(string value)
+    {
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized.Contains("frame n time", StringComparison.Ordinal) ||
+               Regex.IsMatch(
+                   normalized,
+                   @"(?:^|\s)(?:tile|кадр)\s*#?\d+\b",
+                   RegexOptions.CultureInvariant | RegexOptions.IgnoreCase) ||
+               Regex.IsMatch(
+                   normalized,
+                   @"(?:contact sheet|контактн\w*\s+лист\w*)\s*\d+\s*/\s*\d+",
+                   RegexOptions.CultureInvariant | RegexOptions.IgnoreCase) ||
+               Regex.IsMatch(
+                   normalized,
+                   @"\d{2,}(?:[.,]\d+)?\s*[-–—]\s*\d{2,}(?:[.,]\d+)?\s*(?:s|sec|second|seconds|с|сек|секунд)",
+                   RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    }
+
+    private static string NormalizeVisualDescription(string value)
+    {
+        var normalized = Regex.Replace(
+            value,
+            @"^\s*контактн\w*\s+лист\w*\s*",
+            "Изображение ",
+            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+        normalized = Regex.Replace(
+            normalized,
+            @"^\s*contact\s+sheet\s*",
+            "Image ",
+            RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+        return normalized.Trim();
+    }
+
+    private static string NormalizeSensorText(string value)
+        => string.Join(
+            ' ',
+            value.Trim()
+                .ToLowerInvariant()
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
     private async Task<IReadOnlyList<string>> GetCapabilitiesAsync(string model, CancellationToken cancellationToken)
     {
         var selected = (await GetModelsAsync(cancellationToken).ConfigureAwait(false))
@@ -955,6 +1108,21 @@ public sealed class AiVideoAnalysisService : IDisposable
         => element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() ?? string.Empty
             : string.Empty;
+
+    private static bool ContainsForbiddenSensorVerdict(string description)
+    {
+        var normalized = description.Trim().ToLowerInvariant();
+        return normalized.Contains("основной сюжет", StringComparison.Ordinal) ||
+               normalized.Contains("это опенинг", StringComparison.Ordinal) ||
+               normalized.Contains("это эндинг", StringComparison.Ordinal) ||
+               normalized.Contains("является опенинг", StringComparison.Ordinal) ||
+               normalized.Contains("является эндинг", StringComparison.Ordinal) ||
+               normalized.Contains("main story", StringComparison.Ordinal) ||
+               normalized.Contains("this is an opening", StringComparison.Ordinal) ||
+               normalized.Contains("this is an ending", StringComparison.Ordinal) ||
+               normalized.Contains("pass/fail", StringComparison.Ordinal) ||
+               normalized is "pass" or "fail";
+    }
 
     private static bool TryGetNumber(JsonElement element, string name, out double value)
     {
@@ -1144,9 +1312,12 @@ public sealed class AiVideoAnalysisService : IDisposable
                                    attemptElement.TryGetInt32(out var parsedAttempts)
                     ? parsedAttempts
                     : 0;
+                var serverError = GetString(root, "error");
                 throw new InvalidOperationException(
                     $"{message}: {friendly} Код: {errorCode}; done: {doneReason}; " +
-                    $"tokens: {evalCount}; attempts: {attemptCount}. Можно безопасно повторить задачу.");
+                    $"tokens: {evalCount}; attempts: {attemptCount}. " +
+                    $"{(string.IsNullOrWhiteSpace(serverError) ? string.Empty : $"Детали: {serverError} ")}" +
+                    "Можно безопасно повторить задачу.");
             }
         }
         catch (JsonException)
@@ -1174,6 +1345,10 @@ public sealed class AiVideoAnalysisService : IDisposable
     }
 
     private sealed record ContactSheetSpec(double Start, double End, int FrameCount, string Label);
+
+    private sealed record ParsedContactSheetObservation(
+        AiRangeObservation Observation,
+        ImmutableArray<string> NormalizedDescriptions);
     private sealed record StructuredInferenceResult(
         string Content,
         string? DoneReason,
@@ -1242,7 +1417,7 @@ public sealed record AiRangeObservation(
     IReadOnlyList<string> Tags);
 
 public sealed record AiRangeInspection(
-    string Summary,
     IReadOnlyList<AiRangeObservation> Observations,
     string Model,
-    bool UsedVision);
+    bool UsedVision,
+    bool CoverageComplete = true);

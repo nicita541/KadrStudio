@@ -76,6 +76,35 @@ public sealed class AgentReadOnlyToolBackendTests
     }
 
     [Fact]
+    public async Task Sequence_range_propagates_child_sensor_rejection_instead_of_reporting_success()
+    {
+        var fixture = CreateProject();
+        var inspector = new FakeRangeInspector
+        {
+            Error = new AgentToolRejectedException(
+                "transcript_evidence_incomplete",
+                "Transcript sensor is unavailable.")
+        };
+        var backend = new KadrAgentReadOnlyToolBackend(
+            () => fixture.Project,
+            inspector);
+
+        var error = await Assert.ThrowsAsync<AgentToolRejectedException>(
+            async () => await backend.InspectRangeAsync(
+                Context(fixture.Project, fixture.SequenceId),
+                new AgentRangeInspectionRequest(
+                    AgentRangeTargetKind.Sequence,
+                    fixture.SequenceId,
+                    12,
+                    15,
+                    AgentRangeInspectionDetail.All),
+                CancellationToken.None));
+
+        Assert.Equal("transcript_evidence_incomplete", error.ErrorCode);
+        Assert.Contains("12-15s", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Project_change_invalidates_old_agent_context()
     {
         var fixture = CreateProject();
@@ -175,6 +204,7 @@ public sealed class AgentReadOnlyToolBackendTests
     private sealed class FakeRangeInspector : IAgentMediaRangeInspector
     {
         public List<(Guid SourceId, AgentRangeInspectionRequest Request)> Requests { get; } = [];
+        public AgentToolRejectedException? Error { get; init; }
 
         public ValueTask<JsonElement> InspectAsync(
             MediaSource source,
@@ -182,6 +212,10 @@ public sealed class AgentReadOnlyToolBackendTests
             CancellationToken cancellationToken)
         {
             Requests.Add((source.Id, request));
+            if (Error is not null)
+            {
+                throw Error;
+            }
             return ValueTask.FromResult(
                 AgentToolJson.ToElement(new
                 {

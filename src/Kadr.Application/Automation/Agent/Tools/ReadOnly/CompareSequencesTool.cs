@@ -33,6 +33,9 @@ public sealed class CompareSequencesTool(IAgentReadOnlyToolBackend backend) : IA
                       ?? context.DraftSequenceId
                       ?? throw new AgentToolRejectedException("Agent Draft does not exist yet.", "draft_required");
         var data = await backend.CompareSequencesAsync(context, sourceId, draftId, cancellationToken);
-        return new AgentToolExecutionOutput("Source and Agent Draft compared.", data.Clone());
+        return new AgentToolExecutionOutput(
+            "Source and Agent Draft compared.",
+            data.Clone(),
+            AgentEvidenceCapabilities.SequenceDiff);
     }
 }

@@ -6,7 +6,8 @@ public enum TrackKind
 {
     Visual,
     Audio,
-    Text
+    Text,
+    Subtitle
 }
 
 public enum MediaKind
@@ -27,7 +28,9 @@ public enum MediaOnlineState
 public enum MediaStreamKind
 {
     Video,
-    Audio
+    Audio,
+    Subtitle,
+    Attachment
 }
 
 public enum TransitionKind
@@ -94,7 +97,11 @@ public sealed record MediaStreamDescriptor(
     int SampleRate = 0,
     int Channels = 0,
     FrameRate? FrameRate = null,
-    bool IsVariableFrameRate = false);
+    bool IsVariableFrameRate = false,
+    string Language = "",
+    string Title = "",
+    bool IsDefault = false,
+    bool IsForced = false);
 
 public sealed record MediaSource(
     Guid Id,
@@ -154,7 +161,24 @@ public sealed record MediaClip(
     TimelineTime Duration,
     Guid? LinkGroupId = null,
     VideoParameters? Video = null,
-    AudioParameters? Audio = null)
+    AudioParameters? Audio = null,
+    int? StreamIndex = null)
+{
+    public TimelineTime End => Start + Duration;
+    public TimeRange Range => new(Start, Duration);
+}
+
+public sealed record SubtitleClip(
+    Guid Id,
+    Guid SourceId,
+    int StreamIndex,
+    Guid TrackId,
+    TimelineTime Start,
+    TimelineTime SourceIn,
+    TimelineTime Duration,
+    Guid? LinkGroupId = null,
+    bool IsEnabled = true,
+    bool PreserveAssStyling = true)
 {
     public TimelineTime End => Start + Duration;
     public TimeRange Range => new(Start, Duration);
@@ -228,14 +252,21 @@ public sealed record ProjectState
     public ImmutableArray<TimelineTrack> Tracks { get; init; } = [];
     public ImmutableDictionary<Guid, MediaSource> Sources { get; init; } = ImmutableDictionary<Guid, MediaSource>.Empty;
     public ImmutableArray<MediaClip> MediaClips { get; init; } = [];
+    public ImmutableArray<SubtitleClip> SubtitleClips { get; init; } = [];
     public ImmutableArray<TextClip> TextClips { get; init; } = [];
     public ImmutableArray<TimelineTransition> Transitions { get; init; } = [];
     public ImmutableArray<TimelineMarker> Markers { get; init; } = [];
     public ImmutableArray<SequenceState> Sequences { get; init; } = [];
     public Guid? ActiveSequenceId { get; init; }
     public ImmutableArray<SourceAnnotation> SourceAnnotations { get; init; } = [];
-    public ImmutableArray<MediaAnalysisReference> AnalysisReferences { get; init; } = [];
-    public ImmutableArray<MontagePlan> MontagePlans { get; init; } = [];
+    public ImmutableArray<MediaUnderstandingIndex> UnderstandingIndexes { get; init; } = [];
+    public ImmutableArray<MontageGraph> MontageGraphs { get; init; } = [];
+    public ImmutableArray<DraftPatch> DraftPatches { get; init; } = [];
+    public ImmutableArray<DraftQualityReport> DraftQualityReports { get; init; } = [];
+    public ImmutableArray<DraftCommandReceipt> DraftCommandReceipts { get; init; } = [];
+    public ImmutableArray<ExternalReference> ExternalReferences { get; init; } = [];
+    public ImmutableArray<TrackRenditionGroup> RenditionGroups { get; init; } = [];
+    public ImmutableArray<UpscaleJob> UpscaleJobs { get; init; } = [];
     public AiConversation AiConversation { get; init; } = AiConversation.Create();
     public TimelineTime? InPoint { get; init; }
     public TimelineTime? OutPoint { get; init; }
@@ -250,16 +281,19 @@ public sealed record ProjectState
         {
             var mediaEnd = MediaClips.IsDefaultOrEmpty ? TimelineTime.Zero : MediaClips.Max(item => item.End);
             var textEnd = TextClips.IsDefaultOrEmpty ? TimelineTime.Zero : TextClips.Max(item => item.End);
-            return mediaEnd >= textEnd ? mediaEnd : textEnd;
+            var subtitleEnd = SubtitleClips.IsDefaultOrEmpty ? TimelineTime.Zero : SubtitleClips.Max(item => item.End);
+            return mediaEnd >= textEnd
+                ? mediaEnd >= subtitleEnd ? mediaEnd : subtitleEnd
+                : textEnd >= subtitleEnd ? textEnd : subtitleEnd;
         }
     }
 
     public TimelineTrack? FindTrack(Guid id) => Tracks.FirstOrDefault(item => item.Id == id);
     public MediaClip? FindMediaClip(Guid id) => MediaClips.FirstOrDefault(item => item.Id == id);
     public TextClip? FindTextClip(Guid id) => TextClips.FirstOrDefault(item => item.Id == id);
+    public SubtitleClip? FindSubtitleClip(Guid id) => SubtitleClips.FirstOrDefault(item => item.Id == id);
 
     public SequenceState? FindSequence(Guid id) => Sequences.FirstOrDefault(item => item.Id == id);
-    public MontagePlan? FindMontagePlan(Guid id) => MontagePlans.FirstOrDefault(item => item.Id == id);
 
     public ProjectState EnsureSequenceContainer(string name = "Исходный монтаж")
     {
@@ -291,9 +325,12 @@ public sealed record ProjectState
             Sequence = target.Settings,
             Tracks = target.Tracks,
             MediaClips = target.MediaClips,
+            SubtitleClips = target.SubtitleClips,
             TextClips = target.TextClips,
             Transitions = target.Transitions,
             Markers = target.Markers,
+            RenditionGroups = target.RenditionGroups,
+            UpscaleJobs = target.UpscaleJobs,
             InPoint = target.InPoint,
             OutPoint = target.OutPoint
         };
@@ -306,7 +343,8 @@ public sealed record ProjectState
             new TimelineTrack(Guid.NewGuid(), TrackKind.Visual, 1, "V2"),
             new TimelineTrack(Guid.NewGuid(), TrackKind.Audio, 0, "A1"),
             new TimelineTrack(Guid.NewGuid(), TrackKind.Audio, 1, "A2"),
-            new TimelineTrack(Guid.NewGuid(), TrackKind.Text, 0, "T1"));
+            new TimelineTrack(Guid.NewGuid(), TrackKind.Text, 0, "T1"),
+            new TimelineTrack(Guid.NewGuid(), TrackKind.Subtitle, 0, "S1"));
         return new ProjectState
         {
             Name = string.IsNullOrWhiteSpace(name) ? "Новый проект" : name.Trim(),

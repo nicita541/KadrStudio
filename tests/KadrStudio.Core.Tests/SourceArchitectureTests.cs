@@ -49,42 +49,47 @@ public sealed class SourceArchitectureTests
     }
 
     [Fact]
-    public void Deterministic_verification_has_no_model_decision_dependency()
+    public void Deterministic_draft_qc_has_no_model_or_tool_dependency()
     {
-        var verification = ReadSources(Path.Combine(
+        var editorial = ReadSources(Path.Combine(
             SourceRoot(),
-            "Kadr.Application",
-            "Automation",
-            "Agent",
-            "Verification"));
+            "Kadr.Application", "Automation", "Editorial"));
 
-        Assert.DoesNotContain("IAgentModel", verification, StringComparison.Ordinal);
-        Assert.DoesNotContain("AgentModelDecision", verification, StringComparison.Ordinal);
-        Assert.DoesNotContain("KadrStudio.Services", verification, StringComparison.Ordinal);
-
-        var executionLoop = File.ReadAllText(Path.Combine(
-            SourceRoot(),
-            "Kadr.Application",
-            "Automation",
-            "Agent",
-            "Runtime",
-            "AgentExecutionLoop.cs"));
-        Assert.DoesNotContain("IAgentModel", executionLoop, StringComparison.Ordinal);
-        Assert.Contains("IAgentVerificationReporter", executionLoop, StringComparison.Ordinal);
+        Assert.DoesNotContain("IAgentModel", editorial, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentTool", editorial, StringComparison.Ordinal);
+        Assert.Contains("DeterministicDraftQualityAnalyzer", editorial, StringComparison.Ordinal);
+        Assert.Contains("TimelineRangeTransformer", editorial, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Planning_pipeline_has_no_editing_backend_dependency()
+    public void Removed_legacy_agent_and_v1_api_cannot_reappear()
     {
-        var planning = ReadSources(Path.Combine(
-            SourceRoot(),
-            "Kadr.Application",
-            "Automation",
-            "Agent",
-            "Planning"));
+        var sourceRoot = SourceRoot();
+        var source = ReadProductionSources();
+        var forbiddenFiles = new[]
+        {
+            "AgentPlanningLoop.cs", "AgentExecutionLoop.cs", "AiServerAgentModel.cs",
+            "AiMontage.cs", "AiMontageCommands.cs", "AiMontageContracts.cs",
+            "MontagePlanCompiler.cs", "GameEditingProfiles.cs", "KadrV1Endpoints.cs",
+            "KadrV1Contracts.cs", "OllamaRuntime.cs", "OllamaWarmupService.cs",
+            "OllamaRequestRewriter.cs", "StructuredInferencePipeline.cs",
+            "EditingCommandPlanner.cs", "VideoAnalysisService.cs", "MediaPyramid.cs"
+        };
+        var fileNames = Directory.EnumerateFiles(sourceRoot, "*.cs", SearchOption.AllDirectories)
+            .Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.All(forbiddenFiles, name => Assert.DoesNotContain(name, fileNames));
 
-        Assert.DoesNotContain("IAgentEditingToolBackend", planning, StringComparison.Ordinal);
-        Assert.DoesNotContain("KadrStudio.Services", planning, StringComparison.Ordinal);
+        Assert.DoesNotContain("/v1/inference/structured", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentToolRegistry", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("WaitingForApproval", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("ApproveAsync", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("record MontagePlan(", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("MontagePlanId", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("AgentDraftCheckpoint", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("montage_plan_id", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("KADR_AI_OLLAMA", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("HasPendingEditReview", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("BeginEditPlanReview", source, StringComparison.Ordinal);
     }
 
     private static string ReadProductionSources() => ReadSources(SourceRoot());

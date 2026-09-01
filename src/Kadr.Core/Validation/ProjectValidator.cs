@@ -24,13 +24,14 @@ public sealed class ProjectValidator : IProjectValidator
         ValidateTracks(project, errors);
         ValidateSources(project, errors);
         ValidateClips(project, errors);
+        ValidateSubtitles(project, errors);
         ValidateText(project, errors);
         ValidateTransitions(project, errors);
         ValidateMarkers(project, errors);
         ValidateInOut(project, errors);
         ValidateSequenceWorkspace(project, errors);
         ValidateSourceAnnotations(project, errors);
-        ValidateMontagePlans(project, errors);
+        ValidateUpscale(project, errors);
         ValidateAiConversation(project, errors);
         return errors.Count == 0 ? ValidationResult.Valid : new ValidationResult(errors);
     }
@@ -109,6 +110,15 @@ public sealed class ProjectValidator : IProjectValidator
                     errors.Add(new("clip.audio-source", "Audio tracks require a source with audio.", clip.Id));
                 if (track.Kind == TrackKind.Text)
                     errors.Add(new("clip.text-track", "Media clips cannot be placed on a text track.", clip.Id));
+                if (track.Kind == TrackKind.Subtitle)
+                    errors.Add(new("clip.subtitle-track", "Media clips cannot be placed on a subtitle track.", clip.Id));
+                if (clip.StreamIndex is { } streamIndex && !source.Streams.IsDefaultOrEmpty)
+                {
+                    var stream = source.Streams.FirstOrDefault(item => item.StreamIndex == streamIndex);
+                    var requiredKind = track.Kind == TrackKind.Visual ? MediaStreamKind.Video : MediaStreamKind.Audio;
+                    if (stream is null || stream.Kind != requiredKind)
+                        errors.Add(new("clip.stream", "Clip stream does not match its timeline track.", clip.Id));
+                }
                 if (source.Kind != MediaKind.Image && clip.SourceIn + clip.Duration > source.Duration)
                     errors.Add(new("clip.source-range", "Clip range exceeds source duration.", clip.Id));
             }
@@ -136,8 +146,41 @@ public sealed class ProjectValidator : IProjectValidator
             var first = clips[0];
             if (clips.Any(item => item.Start != first.Start || item.SourceIn != first.SourceIn || item.Duration != first.Duration))
                 errors.Add(new("link.timing", "Linked clips must have identical timeline and source ranges.", linkGroup.Key));
-            if (clips.GroupBy(item => project.FindTrack(item.TrackId)?.Kind).Any(group => group.Count() > 1))
-                errors.Add(new("link.kind", "A link group may contain only one clip of each track kind.", linkGroup.Key));
+            if (clips.GroupBy(item => (project.FindTrack(item.TrackId)?.Kind, item.StreamIndex))
+                .Any(group => group.Count() > 1))
+                errors.Add(new("link.kind", "A link group may contain only one clip for each media stream.", linkGroup.Key));
+        }
+    }
+
+    private static void ValidateSubtitles(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.SubtitleClips.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("subtitle.duplicate-id", "Subtitle clip IDs must be unique.", duplicate.Key));
+        foreach (var clip in project.SubtitleClips)
+        {
+            var track = project.FindTrack(clip.TrackId);
+            project.Sources.TryGetValue(clip.SourceId, out var source);
+            if (clip.Id == Guid.Empty) errors.Add(new("subtitle.id", "Subtitle clip ID cannot be empty."));
+            if (track?.Kind != TrackKind.Subtitle)
+                errors.Add(new("subtitle.track", "Stream-backed subtitles require a subtitle track.", clip.Id));
+            if (source is null)
+            {
+                errors.Add(new("subtitle.source", "Subtitle clip references a missing source.", clip.Id));
+                continue;
+            }
+            if (clip.StreamIndex < 0 || clip.Start < TimelineTime.Zero || clip.SourceIn < TimelineTime.Zero ||
+                clip.Duration <= TimelineTime.Zero || clip.SourceIn + clip.Duration > source.Duration)
+                errors.Add(new("subtitle.time", "Subtitle stream mapping is outside its source.", clip.Id));
+            if (!source.Streams.IsDefaultOrEmpty && !source.Streams.Any(item =>
+                    item.StreamIndex == clip.StreamIndex && item.Kind == MediaStreamKind.Subtitle))
+                errors.Add(new("subtitle.stream", "Subtitle stream mapping references a non-subtitle stream.", clip.Id));
+        }
+        foreach (var group in project.SubtitleClips.GroupBy(item => item.TrackId))
+        {
+            var ordered = group.OrderBy(item => item.Start).ThenBy(item => item.Id).ToArray();
+            for (var index = 1; index < ordered.Length; index++)
+                if (ordered[index].Start < ordered[index - 1].End)
+                    errors.Add(new("subtitle.overlap", "Subtitle mappings on the same track cannot overlap.", ordered[index].Id));
         }
     }
 
@@ -269,9 +312,6 @@ public sealed class ProjectValidator : IProjectValidator
             }
             if (sequence.ParentSequenceId is { } parentId && project.FindSequence(parentId) is null)
                 errors.Add(new("sequence.parent", "Sequence parent is missing.", sequence.Id));
-            if (sequence.MontagePlanId is { } planId && project.FindMontagePlan(planId) is null)
-                errors.Add(new("sequence.plan", "Sequence montage plan is missing.", sequence.Id));
-
             if (sequence.Id == activeId) continue;
             var view = project with
             {
@@ -280,19 +320,50 @@ public sealed class ProjectValidator : IProjectValidator
                 Sequence = sequence.Settings,
                 Tracks = sequence.Tracks,
                 MediaClips = sequence.MediaClips,
+                SubtitleClips = sequence.SubtitleClips,
                 TextClips = sequence.TextClips,
                 Transitions = sequence.Transitions,
                 Markers = sequence.Markers,
+                RenditionGroups = sequence.RenditionGroups,
+                UpscaleJobs = sequence.UpscaleJobs,
                 InPoint = sequence.InPoint,
                 OutPoint = sequence.OutPoint
             };
             ValidateProject(view, errors);
             ValidateTracks(view, errors);
             ValidateClips(view, errors);
+            ValidateSubtitles(view, errors);
             ValidateText(view, errors);
             ValidateTransitions(view, errors);
             ValidateMarkers(view, errors);
             ValidateInOut(view, errors);
+            ValidateUpscale(view, errors);
+        }
+    }
+
+    private static void ValidateUpscale(ProjectState project, ICollection<ValidationError> errors)
+    {
+        foreach (var duplicate in project.RenditionGroups.GroupBy(item => item.Id).Where(group => group.Count() > 1))
+            errors.Add(new("upscale.duplicate-group", "Upscale rendition group IDs must be unique.", duplicate.Key));
+        foreach (var duplicate in project.RenditionGroups.GroupBy(item => item.OriginalTrackId).Where(group => group.Count() > 1))
+            errors.Add(new("upscale.duplicate-original", "A visual track may have only one upscaled rendition.", duplicate.Key));
+        foreach (var group in project.RenditionGroups)
+        {
+            var original = project.FindTrack(group.OriginalTrackId);
+            var upscaled = project.FindTrack(group.UpscaledTrackId);
+            if (group.Id == Guid.Empty || group.SequenceId == Guid.Empty || original?.Kind != TrackKind.Visual ||
+                upscaled?.Kind != TrackKind.Visual || original.Id == upscaled.Id)
+                errors.Add(new("upscale.track-reference", "Upscale rendition references invalid visual tracks.", group.Id));
+            if (group.IsStale && group.ActiveRendition == TrackRenditionKind.Upscaled)
+                errors.Add(new("upscale.stale-active", "A stale upscale rendition cannot be active.", group.Id));
+            if (group.ModelSha256.Length != 64 || group.InputFingerprint.Length != 64)
+                errors.Add(new("upscale.fingerprint", "Upscale model and input fingerprints must be SHA-256 values.", group.Id));
+        }
+        foreach (var job in project.UpscaleJobs)
+        {
+            if (job.Id == Guid.Empty || job.SequenceId == Guid.Empty || job.Progress is < 0 or > 1 ||
+                job.OriginalTrackIds.IsDefaultOrEmpty || job.OriginalTrackIds.Distinct().Count() != job.OriginalTrackIds.Length)
+                errors.Add(new("upscale.job", "Upscale job is invalid.", job.Id));
         }
     }
 
@@ -310,30 +381,6 @@ public sealed class ProjectValidator : IProjectValidator
             if (annotation.SourceRange.Start < TimelineTime.Zero || annotation.SourceRange.Duration <= TimelineTime.Zero ||
                 annotation.SourceRange.End > source.Duration)
                 errors.Add(new("annotation.range", "Source annotation is outside the media range.", annotation.Id));
-        }
-    }
-
-    private static void ValidateMontagePlans(ProjectState project, ICollection<ValidationError> errors)
-    {
-        foreach (var duplicate in project.MontagePlans.GroupBy(item => item.Id).Where(group => group.Count() > 1))
-            errors.Add(new("montage-plan.duplicate-id", "Montage plan IDs must be unique.", duplicate.Key));
-        foreach (var plan in project.MontagePlans)
-        {
-            if (plan.Id == Guid.Empty || plan.Dependencies.ProjectId != project.Id || string.IsNullOrWhiteSpace(plan.Title))
-                errors.Add(new("montage-plan.identity", "Montage plan identity is invalid.", plan.Id));
-            if (plan.Items.Select(item => item.Order).Distinct().Count() != plan.Items.Length)
-                errors.Add(new("montage-plan.order", "Montage plan item order must be unique.", plan.Id));
-            if (plan.Items.Select(item => item.Id).Distinct().Count() != plan.Items.Length)
-                errors.Add(new("montage-plan.item-id", "Montage plan item IDs must be unique.", plan.Id));
-            foreach (var item in plan.Items)
-            {
-                if (!project.Sources.TryGetValue(item.SourceId, out var source) ||
-                    item.SourceRange.Start < TimelineTime.Zero || item.SourceRange.Duration <= TimelineTime.Zero ||
-                    source is not null && item.SourceRange.End > source.Duration)
-                    errors.Add(new("montage-plan.range", "Montage plan item references an invalid source range.", item.Id));
-                if (item.Confidence is < 0 or > 1 || item.Volume is < 0 or > 2)
-                    errors.Add(new("montage-plan.parameters", "Montage plan item parameters are invalid.", item.Id));
-            }
         }
     }
 

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using KadrStudio.Core.Domain;
 using KadrStudio.Core.Validation;
 
@@ -49,6 +50,7 @@ public sealed class EditorSession : IEditorSession
         if (ReferenceEquals(candidate, before) || candidate == before)
             return new EditResult(false, before, transaction.Description, before.Revision, ProjectChangeSet.Empty);
 
+        candidate = InvalidateChangedRenditions(before, candidate);
         candidate = candidate with
         {
             Revision = checked(before.Revision + 1),
@@ -130,6 +132,36 @@ public sealed class EditorSession : IEditorSession
                 "Проект не прошёл проверку целостности: " +
                 string.Join("; ", validation.Errors.Select(item => item.Message)),
                 validation.Errors);
+    }
+
+    private static ProjectState InvalidateChangedRenditions(ProjectState before, ProjectState candidate)
+    {
+        if (before.RenditionGroups.IsDefaultOrEmpty || candidate.RenditionGroups.IsDefaultOrEmpty)
+            return candidate;
+        var changed = false;
+        var tracks = candidate.Tracks;
+        var groups = candidate.RenditionGroups.Select(group =>
+        {
+            var previous = before.RenditionGroups.FirstOrDefault(item => item.Id == group.Id);
+            if (previous is null || group.IsStale) return group;
+            var beforeClips = before.MediaClips.Where(item => item.TrackId == group.OriginalTrackId).OrderBy(item => item.Start);
+            var afterClips = candidate.MediaClips.Where(item => item.TrackId == group.OriginalTrackId).OrderBy(item => item.Start);
+            if (beforeClips.SequenceEqual(afterClips)) return group;
+            changed = true;
+            tracks = tracks.Select(track => track.Id switch
+            {
+                var id when id == group.OriginalTrackId => track with { IsVisible = true },
+                var id when id == group.UpscaledTrackId => track with { IsVisible = false },
+                _ => track
+            }).ToImmutableArray();
+            return group with
+            {
+                IsStale = true,
+                ActiveRendition = TrackRenditionKind.Original,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+        }).ToImmutableArray();
+        return changed ? candidate with { Tracks = tracks, RenditionGroups = groups } : candidate;
     }
 
     private sealed record HistoryEntry(ProjectState Before, ProjectState After, string Description);

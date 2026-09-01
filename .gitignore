@@ -25,3 +25,6 @@ TestResults/
 AI
 Logs/
 LocalData/
+.kadr-ai/
+__pycache__/
+*.py[cod]

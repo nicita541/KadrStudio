@@ -1,59 +1,52 @@
-# Kadr AI Server
+# Kadr AI Server v2
 
-Kadr Studio использует один AI-путь:
+Единственный AI-путь Kadr Studio:
 
 ```text
-KadrStudio.exe -> HTTP -> KadrStudio.AiServer.exe -> private Ollama backend
+KadrStudio.exe → HTTP API v2 → C# trust gateway
+  → versioned loopback gRPC workers → local model/artifact stores
 ```
 
-Desktop не запускает Ollama, не скачивает модель и не хранит AI runtime в проекте. По умолчанию он подключается к `http://127.0.0.1:5080/`. Для другого GPU-ПК задаются `KADR_STUDIO_AI_ENDPOINT`, `KADR_STUDIO_AI_API_KEY` и при необходимости публичные aliases vision/planner. Desktop не принимает приватное имя Ollama-модели.
+Ollama и API v1 больше не участвуют в архитектуре. Desktop не передаёт workers исходные пути: он создаёт analysis proxy и аудиочанки, загружает их по SHA-256, а оригинал остаётся локальным.
 
 ## Локальная установка
 
-Рабочий корень фиксирован вне репозитория: `F:\KadrStudioData\AiServer`.
+Runtime, веса и все AI-кэши находятся в `.kadr-ai` внутри папки проекта на `F:`. Каталог целиком исключён из Git; `TEMP`, pip/Hugging Face/PyTorch/CUDA/Triton caches для worker-процессов также перенаправлены туда:
 
 ```powershell
-.\scripts\install-ai-server-local.ps1 -DataRoot 'F:\KadrStudioData\AiServer'
-.\scripts\run-ai-server.ps1 -DataRoot 'F:\KadrStudioData\AiServer'
+.\scripts\install-ai-server-local.ps1
+.\scripts\setup-ai-workers.ps1 -InstallDependencies
+.\scripts\install-production-models.ps1
+# После montage-eval отдельно активируйте vision и planner capability manifests.
+.\scripts\run-ai-server.ps1
 .\scripts\test-ai-server-connection.ps1
 ```
 
-Структура:
+Структура данных: `runtime`, `workers`, `models`, `data`, `eval`, `cache`. Setup добавляет runtime-корень в локальное исключение Git и проверяет, что веса не видны в `git status`.
 
-- `runtime` — self-contained Kadr AI Server;
-- `ollama-runtime` — приватный Ollama runtime;
-- `ollama-models` — server-managed model store.
+## API
 
-Installer публикует сервер во временный каталог, атомарно заменяет runtime и умеет один раз перенести валидный старый Ollama store (`blobs` + `manifests`) из `.ollama`/`AI\models` без второй копии. Неизвестные каталоги он не удаляет.
+- `POST /v2/assets`, `GET /v2/assets/{sha256}` — возобновляемая content-addressed загрузка;
+- `POST /v2/jobs`, `GET /v2/jobs/{id}`, `GET /v2/jobs/{id}/events`, `DELETE /v2/jobs/{id}`;
+- `GET /v2/artifacts/{id}`;
+- `POST /v2/reason/structured` — role-isolated constrained JSON;
+- `GET /health/live`, `GET /health/ready`.
 
-## API v1
+Маршруты `/v1/*`, `/api/*` и прямой model discovery удалены. `health/ready` требует manifests основных workers и успешно прошедшие montage-eval capability manifests для planner и vision.
 
-Внешняя граница содержит только model discovery и единый structured inference:
+Для локального smoke до набора 30-кейсного montage-eval можно явно запустить desktop с `KADR_STUDIO_AI_ALLOW_DEV_MODELS=1`. Это отключает только требование production-manifest на стороне клиента; source isolation, typed commands, Agent Draft и QC остаются обязательными. Переменная не устанавливается setup-скриптами и не должна использоваться для release gate.
 
-- `GET /v1/models`;
-- `POST /v1/inference/structured`.
+## Конфигурация
 
-`GET /v1/models` возвращает две роли: `kadr-planner:latest` и `kadr-vision:latest`. Inference request содержит `schema`, `systemPrompt`, `userPrompt`, optional `model`, `think`, `reasoningTokens`, `images`, `temperature`, `contextTokens`, `maxTokens`. Ответ содержит `content`, `doneReason`, `evalCount`, `reasoningEvalCount`, `attemptCount`. Planner не принимает изображения. Ollama-compatible `/api/*`, старые `/v1/agent/turn` и `/v1/vision/analyze` не публикуются.
+- `KADR_AI_DATA_ROOT` — общий корень (по умолчанию `<project>\.kadr-ai`);
+- `KADR_AI_WORKERS_ROOT`, `KADR_AI_PRODUCTION_MODELS_ROOT`, `KADR_AI_RUNTIME_DATA_ROOT`;
+- `KADR_AI_VISION_MODEL`, `KADR_AI_PLANNER_MODEL` — идентификаторы, совпадающие с capability manifests;
+- `KADR_VISION_MODEL` — локальный каталог Qwen3-VL; `KADR_DIRECTOR_MODEL` — единственный GGUF-файл;
+- `KADR_DIRECTOR_TOKENIZER`, `KADR_LLAMA_SERVER`, `KADR_REASONING_BACKEND=llama.cpp`;
+- `KADR_PLANNER_CONTEXT_TOKENS=16384`, `KADR_LLAMA_GPU_LAYERS=12` — лимиты локального workstation-профиля;
+- `KADR_AI_URLS`, `KADR_AI_API_KEY`;
+- `KADR_STUDIO_AI_ENDPOINT`, `KADR_STUDIO_AI_API_KEY` — настройки desktop.
 
-Служебные проверки: `GET /health/live`, `GET /health/ready`, `GET /health`.
+Вне loopback обязателен Bearer key. Для другой машины нужен HTTPS reverse proxy или VPN: API key поверх обычного HTTP не шифрует proxy и артефакты.
 
-## Переменные сервера
-
-- `KADR_AI_URLS` — listen URL, default `http://127.0.0.1:5080`;
-- `KADR_AI_API_KEY` — Bearer key для не-loopback клиентов;
-- `KADR_AI_OLLAMA_ENDPOINT` — приватный backend, default `http://127.0.0.1:11436/`;
-- `KADR_AI_OLLAMA_EXE` — путь к внешнему `ollama.exe`;
-- `KADR_AI_MODELS_ROOT` — внешний model store;
-- `KADR_AI_MODEL` — backend model, default `qwen3-vl:4b-instruct`;
-- `KADR_AI_PUBLIC_MODEL` — публичный alias, default `kadr-vision:latest`;
-- `KADR_AI_PLANNER_MODEL` — planner/critic backend, default `qwen3.5:9b`;
-- `KADR_AI_PLANNER_PUBLIC_MODEL` — публичный planner alias, default `kadr-planner:latest`;
-- `KADR_AI_MANAGE_OLLAMA`, `KADR_AI_AUTO_PULL` — server-side управление backend/model.
-
-При публикации вне loopback обязателен API key. Bearer key поверх обычного HTTP не шифрует трафик: для LAN/Internet нужен HTTPS reverse proxy или VPN. Ollama наружу не публикуется.
-
-Планировщик работает с thinking и динамическим контекстом до 32K, vision — без thinking и с контекстом до 8K. Сервер выбирает минимальное подходящее окно, заранее резервируя место под reasoning, финальный JSON и safety margin. `reasoningTokens` задаёт отдельный бюджет размышления, а `maxTokens` относится только к финальному JSON. При пустом, оборванном или нарушающем schema результате сервер делает один finalizer-вызов с `think=false` из исходных pinned system/user/schema; повреждённый ответ и hidden thinking в retry не копируются. JSON Schema включается в system prompt и проверяется сервером; ошибка возвращает типизированный `errorCode`, `doneReason`, `evalCount` и `attemptCount`. Скрытые рассуждения Ollama не возвращаются desktop и не записываются в agent log. При смене роли сервер сначала освобождает предыдущую модель через `keep_alive=0`, затем загружает нужную; качество имеет приоритет над задержкой переключения.
-
-## Release
-
-Desktop release содержит FFmpeg/FFprobe и MediaHost, но не содержит Ollama или модель. AI Server публикуется отдельно. Agent logs хранятся в `KADR_STUDIO_DATA_ROOT` либо в per-user local application data; `Logs/` в workspace не используется.
+Planner и Critic запускаются отдельными worker-процессами и не делят историю. Каждый процесс управляет собственным дочерним `llama-server`, который supervisor завершает вместе с worker перед сменой GPU-роли. Ввод измеряется тем же Qwen tokenizer без загрузки весов: 65% окна на stage input, 20% на reasoning/JSON, 15% резерв. JSON ограничивается schema grammar в llama.cpp и повторно проверяется C# gateway. Падение worker, повреждённый JSON и context overflow остаются восстанавливаемыми ошибками стадии.

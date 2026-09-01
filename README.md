@@ -1,5 +1,9 @@
 # Kadr Studio
 
+Самодостаточный контекст проекта для разработчика или другого ИИ: [PROJECT_AUDIT.md](PROJECT_AUDIT.md).
+
+Архитектура режиссёрского AI-конвейера: [docs/KADR_AI_EDITOR_V2.md](docs/KADR_AI_EDITOR_V2.md).
+
 Kadr Studio — нативный видеоредактор для Windows на C# и WPF. Исходные медиа, timeline и фактический монтаж остаются на компьютере пользователя; AI inference вынесен в независимый Kadr AI Server, который может работать на том же ПК или на отдельной GPU-машине.
 
 ## Ядро
@@ -14,7 +18,7 @@ Kadr Studio — нативный видеоредактор для Windows на 
 - Premiere-подобные Selection/Razor, linked V/A-разрез, pixel-based snapping, обычный и Ripple Delete и точная навигация на fractional FPS;
 - многоуровневая stereo min/max/RMS-пирамида waveform с детализацией по масштабу;
 - локальный FFmpeg/FFprobe и независимый Kadr AI Server с server-managed inference backend, SQLite-проекты и контрольные точки истории;
-- безопасный универсальный ИИ-монтаж любого видеоматериала: точные аргументы утверждённых действий, типизированные доказательства, edit log, проверка целостности и независимые последовательности;
+- режиссёрский ИИ-конвейер с мультимодальным индексом, семантическим MontageGraph, безопасным Agent Draft, A/B/diff и детерминированным QC;
 - MP4-экспорт H.264/AAC в 480p, 720p и 1080p с NVENC/fallback на CPU.
 
 ## Сборка Windows x64
@@ -45,7 +49,7 @@ dotnet run --project src\Kadr\KadrStudio.csproj -c Debug --no-restore
 - `src/Kadr.Application` — команды, транзакции, render plan, preview-контракты;
 - `src/Kadr.Infrastructure` — SQLite, FFmpeg-композиция, кэш и планировщик;
 - `src/Kadr` — WPF-представления и внешние адаптеры;
-- `src/Kadr.AiServer` — независимый HTTP AI runtime, model routing/auth и Ollama backend;
+- `src/Kadr.AiServer` — C# trust gateway, API v2, supervisor versioned Python/CUDA workers и production model gate;
 - `LocalData` — все изменяемые desktop-данные (логи, настройки, recovery, cache и временные артефакты); каталог создаётся рядом с solution и не попадает в Git;
 - `tests` — unit, архитектурные и реальные FFmpeg integration-тесты;
 - `tools/win-x64` — локальные FFmpeg и FFprobe;

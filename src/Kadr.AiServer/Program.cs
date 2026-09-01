@@ -1,8 +1,10 @@
-using System.Net;
 using KadrStudio.AiServer.Api;
 using KadrStudio.AiServer.Configuration;
 using KadrStudio.AiServer.Infrastructure;
 using KadrStudio.AiServer.Inference;
+using KadrStudio.AiServer.Jobs;
+using KadrStudio.AiServer.Storage;
+using KadrStudio.AiServer.Workers;
 
 var builder = WebApplication.CreateBuilder(args);
 var options = AiServerOptions.FromEnvironment();
@@ -38,25 +40,21 @@ builder.WebHost.ConfigureKestrel(serverOptions =>
 });
 
 builder.Services.AddSingleton(options);
-builder.Services.AddSingleton(_ =>
+builder.Services.AddSingleton(serviceProvider =>
 {
-    var handler = new SocketsHttpHandler
-    {
-        UseProxy = false,
-        PooledConnectionLifetime = TimeSpan.FromMinutes(10),
-        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-    };
-    return new HttpClient(handler, disposeHandler: true)
-    {
-        BaseAddress = options.OllamaEndpoint,
-        Timeout = options.RequestTimeout
-    };
+    var configured = serviceProvider.GetRequiredService<AiServerOptions>();
+    return new ContentAddressedAssetStore(configured.DataRoot, configured.MaxAssetBytes);
 });
-builder.Services.AddSingleton<OllamaRuntime>();
-builder.Services.AddSingleton<IInferenceChatRuntime>(serviceProvider =>
-    serviceProvider.GetRequiredService<OllamaRuntime>());
-builder.Services.AddSingleton<StructuredInferencePipeline>();
-builder.Services.AddHostedService<OllamaWarmupService>();
+builder.Services.AddSingleton(serviceProvider =>
+{
+    var configured = serviceProvider.GetRequiredService<AiServerOptions>();
+    return new ContentAddressedArtifactStore(configured.DataRoot);
+});
+builder.Services.AddSingleton<IWorkerGateway, LoopbackGrpcWorkerGateway>();
+builder.Services.AddSingleton<RoleStructuredReasoningService>();
+builder.Services.AddSingleton<ModelCapabilityGate>();
+builder.Services.AddSingleton<AnalyzerJobService>();
+builder.Services.AddHostedService(serviceProvider => serviceProvider.GetRequiredService<AnalyzerJobService>());
 
 var app = builder.Build();
 
@@ -78,34 +76,32 @@ app.MapGet("/health/live", () => Results.Json(new
     version = "0.1.0"
 }));
 
-app.MapGet("/health/ready", (OllamaRuntime runtime) =>
+app.MapGet("/health/ready", async (AiServerOptions configured, ModelCapabilityGate gate, CancellationToken token) =>
 {
-    var status = runtime.Status;
-    var statusCode = status.State == OllamaRuntimeState.Ready
-        ? StatusCodes.Status200OK
-        : StatusCodes.Status503ServiceUnavailable;
+    var requiredWorkers = new[] { "video-understanding", "audio-events", "embedding", "director", "critic" };
+    var missingWorkers = requiredWorkers.Where(name =>
+        !File.Exists(Path.Combine(configured.WorkersRoot, name, "worker-manifest.json"))).ToArray();
+    var model = await gate.CheckAsync(
+        configured.PlannerBackendModel, "Director", "anime-episode", true, token);
+    var vision = await gate.CheckAsync(
+        configured.VisionBackendModel, "VideoUnderstanding", "anime-episode", true, token);
+    // The exact anime profile uses Qwen3-VL for candidate classification and
+    // the 30B planner for a bounded Director brief. The heavy models are still
+    // isolated by the worker gateway and are never resident simultaneously.
+    var ready = missingWorkers.Length == 0 && vision.IsAllowed && model.IsAllowed;
     return Results.Json(new
     {
-        status = status.State.ToString().ToLowerInvariant(),
-        message = status.Message,
-        updatedAt = status.UpdatedAt
-    }, statusCode: statusCode);
+        status = ready ? "ready" : "not_ready",
+        missingWorkers,
+        plannerRequired = true,
+        plannerModelError = model.Error,
+        visionModelError = vision.Error
+    }, statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
 });
 
-app.MapGet("/health", (OllamaRuntime runtime) =>
-{
-    var status = runtime.Status;
-    var statusCode = status.State == OllamaRuntimeState.Ready
-        ? StatusCodes.Status200OK
-        : StatusCodes.Status503ServiceUnavailable;
-    return Results.Json(new
-    {
-        status = status.State.ToString().ToLowerInvariant(),
-        message = status.Message
-    }, statusCode: statusCode);
-});
+app.MapGet("/health", () => Results.Redirect("/health/ready"));
 
-app.MapKadrV1Endpoints();
+app.MapKadrV2Endpoints();
 
 app.Run();
 

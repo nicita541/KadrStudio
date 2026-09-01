@@ -20,6 +20,9 @@ public static class KadrLocalDataPaths
     public static string AgentLogsRoot =>
         EnsureDirectory(Path.Combine(Root, "Logs", "Agent"));
 
+    public static string EditorialTelemetryRoot =>
+        EnsureDirectory(Path.Combine(Root, "Logs", "Editorial"));
+
     public static string SettingsRoot =>
         EnsureDirectory(Path.Combine(Root, "Settings"));
 

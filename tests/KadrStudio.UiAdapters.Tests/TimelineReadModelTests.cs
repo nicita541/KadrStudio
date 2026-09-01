@@ -31,6 +31,9 @@ public sealed class TimelineReadModelTests
         project.Media.Add(asset);
 
         var snapshot = TimelineReadModel.From(project);
+        var visualTrack = project.Tracks.Single(item =>
+            item.Kind == KadrStudio.Core.Domain.TrackKind.Visual && item.Index == 0);
+        visualTrack.IsVisible = false;
         clip.Start = 20;
         text.Text = "after";
         asset.Name = "after.mp4";
@@ -40,5 +43,6 @@ public sealed class TimelineReadModelTests
         Assert.Equal(2, snapshot.Clips[0].Start);
         Assert.Equal("before", snapshot.TextOverlays[0].Text);
         Assert.Equal("source.mp4", snapshot.Media[0].Name);
+        Assert.True(snapshot.FindTrack(KadrStudio.Core.Domain.TrackKind.Visual, 0)!.IsVisible);
     }
 }

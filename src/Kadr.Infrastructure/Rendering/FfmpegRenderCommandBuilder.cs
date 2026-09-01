@@ -95,7 +95,7 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             var canvas = $"vcanvas{index}";
             var layout = $"vlayout{index}";
             filters.Add(
-                $"[{inputs.Indexes[layer.ClipId]}:v:0]" + BuildVideoSurfaceFilters(layer.Parameters, options) +
+                InputStream(inputs.Indexes[layer.ClipId], "v", layer.StreamIndex) + BuildVideoSurfaceFilters(layer.Parameters, options) +
                 $"fps={frameRate},format=rgba,setpts=PTS-STARTPTS[{surface}]");
             filters.Add($"color=c=black@0:s={options.Width}x{options.Height}:r={frameRate}:" +
                         $"d={Format(window.Duration.TotalSeconds)},format=rgba[{canvas}]");
@@ -152,7 +152,7 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
                 MidpointRounding.AwayFromZero));
             var label = $"aprepared{index}";
             filters.Add(
-                $"[{inputs.Indexes[layer.ClipId]}:a:0]aresample={plan.AudioSampleRate}," +
+                $"{InputStream(inputs.Indexes[layer.ClipId], "a", layer.StreamIndex)}aresample={plan.AudioSampleRate}," +
                 "aformat=sample_fmts=fltp:channel_layouts=stereo," +
                 $"atrim=0:{Format(duration)},asetpts=PTS-STARTPTS," +
                 $"volume={Format(layer.Parameters.Volume)}," + BuildAudioFilters(layer.Parameters, duration) +
@@ -165,6 +165,9 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             $"atrim=0:{Format(plan.Duration.TotalSeconds)}[aout]");
         return "aout";
     }
+
+    private static string InputStream(int inputIndex, string kind, int? streamIndex)
+        => streamIndex is { } globalIndex ? $"[{inputIndex}:{globalIndex}]" : $"[{inputIndex}:{kind}:0]";
 
     private static void AddEncoding(
         ICollection<string> arguments,

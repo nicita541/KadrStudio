@@ -436,10 +436,14 @@ public sealed class MediaHostIntegrationTests
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root is not null && !File.Exists(Path.Combine(root.FullName, "KadrStudio.sln"))) root = root.Parent;
         if (root is null) throw new DirectoryNotFoundException("KadrStudio solution root was not found.");
-        var path = Path.Combine(root.FullName, "src", "Kadr.MediaHost", "bin", "Release",
-            "net10.0-windows", "win-x64", "Kadr.MediaHost.exe");
-        if (!File.Exists(path)) throw new FileNotFoundException("Kadr.MediaHost test binary was not found.", path);
-        return path;
+        var candidates = new[] { "Debug", "Release" }
+            .Select(configuration => Path.Combine(
+                root.FullName, "src", "Kadr.MediaHost", "bin", configuration,
+                "net10.0-windows", "win-x64", "Kadr.MediaHost.exe"))
+            .ToArray();
+        return candidates.FirstOrDefault(File.Exists)
+               ?? throw new FileNotFoundException(
+                   "Kadr.MediaHost test binary was not found. Checked: " + string.Join(", ", candidates));
     }
 
     private static string CreateRoot()

@@ -8,16 +8,21 @@ dotnet build KadrStudio.sln -c Release --no-restore -m:1 -nr:false -warnaserror
 dotnet test KadrStudio.sln -c Release --no-build --no-restore -m:1 -nr:false
 ```
 
+`-warnaserror` проверяет уровень анализаторов, заданный проектами
+(`AnalysisLevel=latest`). `latest-all` является отдельным opt-in triage-режимом и не
+заменяет обязательный gate: часть его правил предлагает менять JSON/persistence DTO,
+публичность API-контрактов и соглашения об именах тестов.
+
 Набор включает:
 
 - domain/property tests точного времени, edit-команд, undo/redo, link groups, transitions и range invalidation;
 - architecture tests направления зависимостей, отсутствия старого mutable project/JSON bridge и Process/File construction во ViewModel;
-- SQLite schema 1/2/3/4, миграция старого таймлайна в исходную последовательность, checksum corruption, history, 20 recovery-версий и write lease;
+- SQLite schema v1–v9, миграция старого таймлайна в исходную последовательность, upscale/rendition persistence, checksum corruption, history, 20 recovery-версий и write lease;
 - ИИ-монтаж: независимые последовательности и Undo/Redo, Required/Excluded/locked-инварианты, stale fingerprint/revision, source-range scope, связанный V/A rough cut, субтитры и статический 9:16 reframe;
 - cache fingerprint/checksum/LRU/move/budget и stereo waveform pyramid;
 - UI geometry/render snapshots общего viewport, thumbnail virtualization/zoom precision и DPI-dependent waveform density;
 - Razor без предварительного выделения, linked/Alt-unlink, Ripple Delete, pixel snapping, отсутствие отскока, toolbar icons и 10 000 точных frame steps на 23.976/29.97;
-- agent-планы с exact editing arguments и типом evidence, запрет повторного/изменённого действия и измерение timeline integrity;
+- AI Editor V2: hierarchical index, typed evidence gaps, MontageGraph validation, native Draft compiler, exact-complement QC, запрет повтора rejected graph без новых evidence и timeline integrity;
 - реальные FFmpeg V-only/A-only/AV, multitrack, transitions, proxy corruption, точные on-demand thumbnail, fractional FPS, subtitles и analysis;
 - MediaHost crash/restart, generation filtering, exact seek, bounded workers и orphan-process checks;
 - CPU export и принудительный NVENC failure с автоматическим CPU fallback.
@@ -35,22 +40,19 @@ dotnet test KadrStudio.sln -c Release --no-build --no-restore -m:1 -nr:false
 добавляются отдельным компактным вызовом лишь при публикации плана:
 
 ```powershell
-$env:KADR_STUDIO_RUN_AI_AGENT_TESTS = '1'
-$env:KADR_STUDIO_AI_ENDPOINT = 'http://127.0.0.1:5080'
-dotnet test tests\KadrStudio.UiAdapters.Tests\KadrStudio.UiAdapters.Tests.csproj `
+$env:KADR_ANIME_EPISODE_PATH = 'F:\KadrStudio\Tsue_to_Tsurugi_no_Wistoria_[02]_[AniLibria]_[WEBRip_1080p_HEVC].mkv'
+dotnet test tests\KadrStudio.Integration.Tests\KadrStudio.Integration.Tests.csproj `
   -c Release --no-build -m:1 -nr:false `
-  --filter 'FullyQualifiedName~Real_planner_completes_two_investigation_turns'
+  --filter 'FullyQualifiedName~AnimeEpisodeLiveIntegrationTests'
 ```
 
-Переменную `KADR_STUDIO_RUN_AI_AGENT_TESTS` не задают в обычном CI: этот smoke требует
-локально установленных моделей и занимает десятки секунд.
+Без `KADR_ANIME_EPISODE_PATH` live fixture безопасно пропускает внешний файл. Тест читает MKV,
+проверяет verified SHA-256 и собирает Agent Draft in-memory; source не открывается на запись.
 
-Обычный тест
-`Request_to_plan_approval_real_edit_log_and_verification_changes_only_agent_draft`
-покрывает весь безопасный путь без зависимости от модели: свободный запрос → evidence →
-машинный план → критика → утверждение → реальный `ripple_delete_range` в Agent Draft →
-edit log → integrity/diff verification. Он дополнительно подтверждает, что source
-sequence не изменяется и утверждённое действие выполняется ровно один раз.
+Обычный synthetic fixture покрывает путь `Cold open → OP → Episode body → ED → Post-credit → Preview`:
+индекс → graph с двумя Remove → native Draft compiler → exact-complement QC → ReviewingDraft.
+Он подтверждает, что source не меняется, post-credit/preview сохраняются, а video, обе audio
+и обе ASS mappings сдвигаются синхронно.
 
 ## Release одним сценарием
 

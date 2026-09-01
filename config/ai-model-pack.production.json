@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "kadr-anime-production-2026-08",
+  "displayName": "Kadr AI Anime — quantized local pack",
+  "modelBudgetBytes": 30000000000,
+  "aiRootBudgetBytes": 45000000000,
+  "artifacts": [
+    {
+      "id": "vision",
+      "displayName": "Qwen3-VL 8B Instruct Q4_K_M",
+      "repository": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+      "revision": "f982a07559d4a2f6c8744d840bf6fccab30eea96",
+      "targetDirectory": "qwen3-vl-8b-instruct-q4-k-m",
+      "files": [
+        { "path": "Qwen3VL-8B-Instruct-Q4_K_M.gguf", "size": 5027784800, "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2" },
+        { "path": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf", "size": 752289728, "sha256": "c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd" }
+      ]
+    },
+    {
+      "id": "planner",
+      "displayName": "Qwen3 30B-A3B Instruct 2507 Q4_K_M",
+      "repository": "lmstudio-community/Qwen3-30B-A3B-Instruct-2507-GGUF",
+      "revision": "02db009a02d5f8817f8a79e952cb0e8d79e9bd34",
+      "targetDirectory": "qwen3-30b-a3b-instruct-2507-q4-k-m",
+      "files": [
+        { "path": "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", "size": 18556685824, "sha256": "88168cc35481e44b7d3d03ce79f59a90d15197e4d633006555a0bc44c57886d8" }
+      ]
+    },
+    {
+      "id": "embedding",
+      "displayName": "Multilingual MiniLM L12 ONNX INT8 AVX2",
+      "repository": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+      "targetDirectory": "multilingual-minilm-l12-int8",
+      "files": [
+        { "path": "onnx/model_quint8_avx2.onnx", "size": 118453870, "sha256": "98a01d88b7de996cdea58c32ca71208c09968d143798814b2ea09d3439dc334f" },
+        { "path": "1_Pooling/config.json", "size": 190, "sha256": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23" },
+        { "path": "config.json", "size": 645, "sha256": "6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e" },
+        { "path": "config_sentence_transformers.json", "size": 122, "sha256": "b8c64b5cece00d8424b4896ea75b512b6008576088497609dfeb6bd63e6d36b8" },
+        { "path": "modules.json", "size": 229, "sha256": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460" },
+        { "path": "sentence_bert_config.json", "size": 53, "sha256": "70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f" },
+        { "path": "special_tokens_map.json", "size": 239, "sha256": "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d" },
+        { "path": "tokenizer.json", "size": 9081518, "sha256": "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8" },
+        { "path": "tokenizer_config.json", "size": 526, "sha256": "5036ea374ffedd706e3bef33e2e0d6953cb868ef8a490e76e32ba0faa37a6b9b" }
+      ]
+    },
+    {
+      "id": "asr",
+      "displayName": "faster-whisper large-v3 (int8_float16 runtime)",
+      "repository": "Systran/faster-whisper-large-v3",
+      "revision": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+      "targetDirectory": "faster-whisper-large-v3",
+      "files": [
+        { "path": "config.json", "size": 2394, "sha256": "a9306624f5ec14270a014b647e5c316b6e03a662c369758d1b90697a7b0655b9" },
+        { "path": "model.bin", "size": 3087284237, "sha256": "69f74147e3334731bc3a76048724833325d2ec74642fb52620eda87352e3d4f1" },
+        { "path": "preprocessor_config.json", "size": 340, "sha256": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711" },
+        { "path": "tokenizer.json", "size": 2480617, "sha256": "6d8cbd7cd0d8d5815e478dac67b85a26bbe77c1f5e0c6d76d1ce2abc0e5f21ca" },
+        { "path": "vocabulary.json", "size": 1068114, "sha256": "c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1" }
+      ]
+    },
+    {
+      "id": "upscaler",
+      "displayName": "AnimeSR-X short-run best (experimental)",
+      "targetDirectory": "animesr-x-experimental",
+      "localFile": {
+        "targetPath": "AnimeSR-X_first_short_run_best.pth",
+        "size": 5999605,
+        "sha256": "5302034b463cded6497eb2c53e7e6be22d3e4f16bed190d7cfff4415ff81c548"
+      }
+    }
+  ]
+}

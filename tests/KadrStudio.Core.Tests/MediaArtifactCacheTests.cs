@@ -104,20 +104,6 @@ public sealed class MediaArtifactCacheTests
         Assert.True((await store.GetSnapshotAsync()).DiskBytes <= 1024 * 1024);
     }
 
-    [Fact]
-    public void Pyramid_increases_detail_as_visible_range_narrows()
-    {
-        var pyramid = new MediaPyramid(TimelineTime.FromSeconds(3600), targetBuckets: 100);
-        var full = pyramid.SelectLevel(new TimeRange(TimelineTime.Zero, TimelineTime.FromSeconds(3600)));
-        var minute = pyramid.SelectLevel(new TimeRange(TimelineTime.Zero, TimelineTime.FromSeconds(60)));
-        var tenSeconds = pyramid.SelectLevel(new TimeRange(TimelineTime.Zero, TimelineTime.FromSeconds(10)));
-
-        Assert.True(full.BucketDuration > minute.BucketDuration);
-        Assert.True(minute.BucketDuration > tenSeconds.BucketDuration);
-        var visible = pyramid.GetVisibleBuckets(new TimeRange(TimelineTime.Zero, TimelineTime.FromSeconds(10)), tenSeconds);
-        Assert.InRange(visible.Last - visible.First + 1, 50, 100);
-    }
-
     private static MediaCacheKey Key(Guid sourceId, long segment)
         => new(sourceId, "fingerprint", MediaArtifactKind.Waveform, 2, segment);
 

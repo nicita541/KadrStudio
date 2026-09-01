@@ -12,7 +12,8 @@ public sealed record RenderVisualLayer(
     MediaKind SourceKind,
     TimeRange TimelineRange,
     TimelineTime SourceIn,
-    VideoParameters Parameters);
+    VideoParameters Parameters,
+    int? StreamIndex = null);
 
 public sealed record RenderAudioLayer(
     Guid ClipId,
@@ -22,7 +23,8 @@ public sealed record RenderAudioLayer(
     string SourcePath,
     TimeRange TimelineRange,
     TimelineTime SourceIn,
-    AudioParameters Parameters);
+    AudioParameters Parameters,
+    int? StreamIndex = null);
 
 public sealed record RenderTextLayer(
     Guid ClipId,

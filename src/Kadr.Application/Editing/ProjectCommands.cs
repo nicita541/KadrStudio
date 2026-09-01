@@ -130,31 +130,6 @@ public sealed record UpsertMediaClipCommand(MediaClip Clip) : IEditCommand
     }
 }
 
-public sealed record EnsureTrackAndAddMediaClipsCommand(
-    IReadOnlyList<(TrackKind Kind, int Index, MediaClip Clip)> Items) : IEditCommand
-{
-    public string Description => "Добавить клипы на дорожки";
-
-    public ProjectState Apply(ProjectState project)
-    {
-        var tracks = project.Tracks;
-        var clips = project.MediaClips;
-        foreach (var (kind, index, template) in Items)
-        {
-            var track = tracks.FirstOrDefault(item => item.Kind == kind && item.Index == index);
-            if (track is null)
-            {
-                track = new TimelineTrack(Guid.NewGuid(), kind, index, $"{(kind == TrackKind.Visual ? 'V' : 'A')}{index + 1}");
-                tracks = tracks.Add(track);
-            }
-            if (!project.Sources.ContainsKey(template.SourceId))
-                throw new EditRejectedException("Исходник клипа не найден в проекте.");
-            clips = clips.Add(template with { TrackId = track.Id });
-        }
-        return project with { Tracks = tracks, MediaClips = clips };
-    }
-}
-
 public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool IncludeLinked = true) : IEditCommand
 {
     public string Description => "Удалить клипы";
@@ -378,6 +353,48 @@ public sealed record UnlinkMediaClipCommand(Guid ClipId) : IEditCommand
     }
 }
 
+public sealed record EnsureTracksAndAddMediaStreamsCommand(
+    IReadOnlyList<(TrackKind Kind, int Index, MediaClip Clip)> MediaItems,
+    IReadOnlyList<(int Index, SubtitleClip Clip)> SubtitleItems) : IEditCommand
+{
+    public string Description => "Добавить все потоки исходника на таймлайн";
+
+    public ProjectState Apply(ProjectState project)
+    {
+        var tracks = project.Tracks;
+        var media = project.MediaClips;
+        var subtitles = project.SubtitleClips;
+        foreach (var (kind, index, template) in MediaItems)
+        {
+            if (kind is not (TrackKind.Visual or TrackKind.Audio))
+                throw new EditRejectedException("Video/audio stream uses an invalid track kind.");
+            var track = tracks.FirstOrDefault(item => item.Kind == kind && item.Index == index);
+            if (track is null)
+            {
+                var prefix = kind == TrackKind.Visual ? 'V' : 'A';
+                track = new TimelineTrack(Guid.NewGuid(), kind, index, $"{prefix}{index + 1}");
+                tracks = tracks.Add(track);
+            }
+            if (!project.Sources.ContainsKey(template.SourceId))
+                throw new EditRejectedException("Исходник клипа не найден в проекте.");
+            media = media.Add(template with { TrackId = track.Id });
+        }
+        foreach (var (index, template) in SubtitleItems)
+        {
+            var track = tracks.FirstOrDefault(item => item.Kind == TrackKind.Subtitle && item.Index == index);
+            if (track is null)
+            {
+                track = new TimelineTrack(Guid.NewGuid(), TrackKind.Subtitle, index, $"S{index + 1}");
+                tracks = tracks.Add(track);
+            }
+            if (!project.Sources.ContainsKey(template.SourceId))
+                throw new EditRejectedException("Исходник субтитров не найден в проекте.");
+            subtitles = subtitles.Add(template with { TrackId = track.Id });
+        }
+        return project with { Tracks = tracks, MediaClips = media, SubtitleClips = subtitles };
+    }
+}
+
 public sealed record RippleDeleteSelectedMediaClipCommand(Guid ClipId) : IEditCommand
 {
     public string Description => "Удалить выбранный клип со сдвигом";
@@ -415,156 +432,7 @@ public sealed record RippleDeleteRangeCommand(TimeRange Range) : IEditCommand
     public string Description => "Удалить диапазон со сдвигом";
 
     public ProjectState Apply(ProjectState project)
-    {
-        var rightLinkGroups = project.MediaClips
-            .Where(item => item.LinkGroupId.HasValue && item.Start < Range.Start && item.End > Range.End)
-            .Select(item => item.LinkGroupId!.Value)
-            .Distinct()
-            .ToDictionary(item => item, _ => Guid.NewGuid());
-        var media = new List<MediaClip>(project.MediaClips.Length);
-        foreach (var clip in project.MediaClips)
-            TransformMediaClip(project, clip, Range, rightLinkGroups, media);
-
-        var text = new List<TextClip>(project.TextClips.Length);
-        foreach (var clip in project.TextClips)
-            TransformTextClip(clip, Range, text);
-
-        var markers = new List<TimelineMarker>(project.Markers.Length);
-        foreach (var marker in project.Markers)
-            TransformMarker(marker, Range, markers);
-
-        return project with
-        {
-            MediaClips = media.ToImmutableArray(),
-            TextClips = text.ToImmutableArray(),
-            Markers = markers.ToImmutableArray(),
-            Transitions = TransformTransitions(project.Transitions, Range, media),
-            InPoint = TransformPoint(project.InPoint, Range),
-            OutPoint = TransformPoint(project.OutPoint, Range)
-        };
-    }
-
-    private static void TransformMediaClip(
-        ProjectState project,
-        MediaClip clip,
-        TimeRange range,
-        IReadOnlyDictionary<Guid, Guid> rightLinkGroups,
-        ICollection<MediaClip> output)
-    {
-        if (clip.End <= range.Start)
-        {
-            output.Add(clip);
-            return;
-        }
-        if (clip.Start >= range.End)
-        {
-            output.Add(clip with { Start = clip.Start - range.Duration });
-            return;
-        }
-        if (clip.Start >= range.Start && clip.End <= range.End) return;
-
-        var source = project.Sources[clip.SourceId];
-        if (clip.Start < range.Start && clip.End > range.End)
-        {
-            var leftDuration = range.Start - clip.Start;
-            var rightDuration = clip.End - range.End;
-            output.Add(clip with
-            {
-                Duration = leftDuration,
-                Audio = ClampAudioFades(clip.Audio, leftDuration)
-            });
-            output.Add(clip with
-            {
-                Id = Guid.NewGuid(),
-                LinkGroupId = clip.LinkGroupId is { } group ? rightLinkGroups[group] : null,
-                Start = range.Start,
-                SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + (range.End - clip.Start),
-                Duration = rightDuration,
-                Audio = ClampAudioFades(clip.Audio, rightDuration)
-            });
-            return;
-        }
-        if (clip.Start < range.Start)
-        {
-            var duration = range.Start - clip.Start;
-            output.Add(clip with { Duration = duration, Audio = ClampAudioFades(clip.Audio, duration) });
-            return;
-        }
-
-        var trimmed = range.End - clip.Start;
-        var remaining = clip.End - range.End;
-        output.Add(clip with
-        {
-            Start = range.Start,
-            SourceIn = source.Kind == MediaKind.Image ? clip.SourceIn : clip.SourceIn + trimmed,
-            Duration = remaining,
-            Audio = ClampAudioFades(clip.Audio, remaining)
-        });
-    }
-
-    private static void TransformTextClip(TextClip clip, TimeRange range, ICollection<TextClip> output)
-    {
-        if (clip.End <= range.Start)
-        {
-            output.Add(clip);
-            return;
-        }
-        if (clip.Start >= range.End)
-        {
-            output.Add(clip with { Start = clip.Start - range.Duration });
-            return;
-        }
-        if (clip.Start >= range.Start && clip.End <= range.End) return;
-        if (clip.Start < range.Start && clip.End > range.End)
-        {
-            output.Add(clip with { Duration = clip.Duration - range.Duration });
-            return;
-        }
-        if (clip.Start < range.Start)
-        {
-            output.Add(clip with { Duration = range.Start - clip.Start });
-            return;
-        }
-        output.Add(clip with { Start = range.Start, Duration = clip.End - range.End });
-    }
-
-    private static void TransformMarker(TimelineMarker marker, TimeRange range, ICollection<TimelineMarker> output)
-    {
-        if (marker.End <= range.Start)
-        {
-            output.Add(marker);
-            return;
-        }
-        if (marker.Start >= range.End)
-        {
-            output.Add(marker with { Start = marker.Start - range.Duration });
-            return;
-        }
-        if (marker.Start >= range.Start && marker.End <= range.End) return;
-        if (marker.Start < range.Start && marker.End > range.End)
-        {
-            output.Add(marker with { Duration = marker.Duration - range.Duration });
-            return;
-        }
-        if (marker.Start < range.Start)
-        {
-            output.Add(marker with { Duration = range.Start - marker.Start });
-            return;
-        }
-        output.Add(marker with
-        {
-            Start = range.Start,
-            SourceStart = marker.SourceStart + (range.End - marker.Start),
-            Duration = marker.End - range.End
-        });
-    }
-
-    private static TimelineTime? TransformPoint(TimelineTime? point, TimeRange range)
-    {
-        if (point is null || point <= range.Start) return point;
-        if (point >= range.End) return point - range.Duration;
-        return range.Start;
-    }
+        => TimelineRangeTransformer.RippleDelete(project, Range);
 }
 
 public sealed record UpsertTextClipCommand(TextClip Clip) : IEditCommand
@@ -851,18 +719,23 @@ internal static class CommandHelpers
     public static ImmutableArray<TimelineTransition> TransformTransitions(
         IEnumerable<TimelineTransition> transitions,
         TimeRange removedRange,
-        IReadOnlyCollection<MediaClip> media)
+        IReadOnlyCollection<MediaClip> media,
+        IReadOnlyDictionary<Guid, Guid> transitionStartClipIds,
+        IReadOnlyDictionary<Guid, Guid> transitionEndClipIds)
     {
         var clips = media.ToDictionary(item => item.Id);
         var result = ImmutableArray.CreateBuilder<TimelineTransition>();
         foreach (var transition in transitions)
         {
-            if (!clips.TryGetValue(transition.FromClipId, out var from) ||
-                !clips.TryGetValue(transition.ToClipId, out var to)) continue;
+            if (!transitionEndClipIds.TryGetValue(transition.FromClipId, out var fromId) ||
+                !transitionStartClipIds.TryGetValue(transition.ToClipId, out var toId) ||
+                !clips.TryGetValue(fromId, out var from) ||
+                !clips.TryGetValue(toId, out var to)) continue;
+            var remapped = transition with { FromClipId = fromId, ToClipId = toId };
             TimelineTransition? transformed = transition.End <= removedRange.Start
-                ? transition
+                ? remapped
                 : transition.Start >= removedRange.End
-                    ? transition with { Start = transition.Start - removedRange.Duration }
+                    ? remapped with { Start = transition.Start - removedRange.Duration }
                     : null;
             if (transformed is null || from.TrackId != to.TrackId || from.End != to.Start ||
                 transformed.Duration > from.Duration || transformed.Duration > to.Duration ||

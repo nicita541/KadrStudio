@@ -60,7 +60,8 @@ public sealed class MediaProbeService(
 
         var duration = ReadDuration(root, videoStream, audioStream);
         var descriptors = streams
-            .Where(stream => IsVideoStream(stream) || IsAudioStream(stream))
+            .Where(stream => IsVideoStream(stream) || IsAudioStream(stream) ||
+                             IsSubtitleStream(stream) || IsAttachmentStream(stream))
             .Select(ToDescriptor)
             .ToImmutableArray();
         var exactFrameRate = ReadExactFrameRate(videoStream, "avg_frame_rate") ??
@@ -89,6 +90,12 @@ public sealed class MediaProbeService(
 
     private static bool IsAudioStream(JsonElement stream)
         => ReadString(stream, "codec_type").Equals("audio", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsSubtitleStream(JsonElement stream)
+        => ReadString(stream, "codec_type").Equals("subtitle", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsAttachmentStream(JsonElement stream)
+        => ReadString(stream, "codec_type").Equals("attachment", StringComparison.OrdinalIgnoreCase);
 
     private static double ReadDuration(JsonElement root, JsonElement videoStream, JsonElement audioStream)
     {
@@ -154,15 +161,31 @@ public sealed class MediaProbeService(
     private static MediaStreamDescriptor ToDescriptor(JsonElement stream)
     {
         var isVideo = IsVideoStream(stream);
+        var isAudio = IsAudioStream(stream);
+        var kind = isVideo
+            ? MediaStreamKind.Video
+            : isAudio
+                ? MediaStreamKind.Audio
+                : IsSubtitleStream(stream)
+                    ? MediaStreamKind.Subtitle
+                    : MediaStreamKind.Attachment;
+        var tags = stream.TryGetProperty("tags", out var tagElement) ? tagElement : default;
+        var disposition = stream.TryGetProperty("disposition", out var dispositionElement)
+            ? dispositionElement
+            : default;
         return new MediaStreamDescriptor(
             ReadInt(stream, "index"),
-            isVideo ? MediaStreamKind.Video : MediaStreamKind.Audio,
+            kind,
             ReadString(stream, "codec_name"),
-            isVideo ? ReadString(stream, "pix_fmt") : ReadString(stream, "sample_fmt"),
+            isVideo ? ReadString(stream, "pix_fmt") : isAudio ? ReadString(stream, "sample_fmt") : string.Empty,
             ReadInt(stream, "width"), ReadInt(stream, "height"),
             ReadInt(stream, "sample_rate"), ReadInt(stream, "channels"),
             isVideo ? ReadExactFrameRate(stream, "avg_frame_rate") ?? ReadExactFrameRate(stream, "r_frame_rate") : null,
-            isVideo && ReadString(stream, "avg_frame_rate") != ReadString(stream, "r_frame_rate"));
+            isVideo && ReadString(stream, "avg_frame_rate") != ReadString(stream, "r_frame_rate"),
+            ReadString(tags, "language"),
+            ReadString(tags, "title"),
+            ReadInt(disposition, "default") == 1,
+            ReadInt(disposition, "forced") == 1);
     }
 
     private static MediaAsset ToAsset(MediaProbeResult result)

@@ -17,13 +17,10 @@ public sealed class UiStyleSourceTests
     }
 
     [Fact]
-    public void Analysis_has_no_single_thread_ffmpeg_override_and_ui_continuations_stay_on_owner_context()
+    public void Ui_continuations_stay_on_owner_context()
     {
-        var analysis = File.ReadAllText(Path.Combine(SourceRoot(), "Kadr", "Services", "VideoAnalysisService.cs"));
         var viewModel = File.ReadAllText(Path.Combine(SourceRoot(), "Kadr", "ViewModels", "MainViewModel.cs"));
 
-        Assert.DoesNotContain("\"-threads\", \"1\"", analysis, StringComparison.Ordinal);
-        Assert.DoesNotContain("\"-filter_threads\", \"1\"", analysis, StringComparison.Ordinal);
         Assert.DoesNotContain("ConfigureAwait(false)", viewModel, StringComparison.Ordinal);
         Assert.Contains("timelineAssetIds", viewModel, StringComparison.Ordinal);
     }

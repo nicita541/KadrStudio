@@ -95,13 +95,13 @@ public sealed class RenderGraphCompiler(IProjectValidator? validator = null) : I
         (MediaClip Clip, TimelineTrack Track, MediaSource Source) item)
         => new(item.Clip.Id, item.Source.Id, item.Track.Id, item.Track.Index,
             item.Source.Path, item.Source.Kind, item.Clip.Range, item.Clip.SourceIn,
-            item.Clip.Video ?? new VideoParameters());
+            item.Clip.Video ?? new VideoParameters(), item.Clip.StreamIndex);
 
     private static RenderAudioLayer CreateAudioLayer(
         (MediaClip Clip, TimelineTrack Track, MediaSource Source) item)
         => new(item.Clip.Id, item.Source.Id, item.Track.Id, item.Track.Index,
             item.Source.Path, item.Clip.Range, item.Clip.SourceIn,
-            item.Clip.Audio ?? new AudioParameters());
+            item.Clip.Audio ?? new AudioParameters(), item.Clip.StreamIndex);
 
     private static TimeRange ResolveRange(ProjectState project, TimeRange? requestedRange)
     {
@@ -152,6 +152,7 @@ public sealed class RenderGraphCompiler(IProjectValidator? validator = null) : I
             builder.Append("|V|").Append(item.ClipId.ToString("N")).Append('|').Append(item.TrackIndex)
                 .Append('|').Append(StableFingerprint(source)).Append('|').Append(item.TimelineRange.Start.Ticks)
                 .Append('|').Append(item.TimelineRange.Duration.Ticks).Append('|').Append(item.SourceIn.Ticks)
+                .Append('|').Append(item.StreamIndex)
                 .Append('|').Append(F(p.Brightness)).Append('|').Append(F(p.Contrast))
                 .Append('|').Append(F(p.Saturation)).Append('|').Append(F(p.Temperature))
                 .Append('|').Append(F(p.PositionX)).Append('|').Append(F(p.PositionY))
@@ -181,6 +182,7 @@ public sealed class RenderGraphCompiler(IProjectValidator? validator = null) : I
             builder.Append("|A|").Append(item.ClipId.ToString("N")).Append('|').Append(item.TrackIndex)
                 .Append('|').Append(StableFingerprint(source)).Append('|').Append(item.TimelineRange.Start.Ticks)
                 .Append('|').Append(item.TimelineRange.Duration.Ticks).Append('|').Append(item.SourceIn.Ticks)
+                .Append('|').Append(item.StreamIndex)
                 .Append('|').Append(F(p.Volume)).Append('|').Append(p.IsMuted).Append('|').Append(F(p.Pan))
                 .Append('|').Append(p.FadeIn.Ticks).Append('|').Append(p.FadeOut.Ticks)
                 .Append('|').Append(F(p.Bass)).Append('|').Append(F(p.Mid)).Append('|').Append(F(p.Treble));

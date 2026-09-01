@@ -9,40 +9,23 @@ public sealed record AgentTaskState(
     Guid? ConversationId,
     string UserRequest,
     AgentTaskPhase Phase,
-    AgentTaskPhase? ResumePhase,
-    AgentPlan? Plan,
-    ImmutableArray<AgentQuestion> Questions,
-    ImmutableArray<AgentJournalEntry> Journal,
     Guid? DraftSequenceId,
     string? CompletionSummary,
     string? FailureMessage,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     long? SourceSequenceRevision = null,
-    AgentTaskBrief? Brief = null,
-    ImmutableArray<AgentEvidenceRecord> EvidenceLedger = default)
+    string RevisionFeedback = "",
+    ImmutableArray<AgentJournalEntry> Journal = default,
+    EditorialTaskCheckpoint? Checkpoint = null,
+    ImmutableArray<Guid> TargetSourceIds = default)
 {
-    public bool IsTerminal =>
-        Phase is AgentTaskPhase.Completed or AgentTaskPhase.Failed or
-            AgentTaskPhase.Stopped or AgentTaskPhase.Interrupted;
+    public bool IsTerminal => Phase is AgentTaskPhase.Accepted or AgentTaskPhase.Discarded or
+        AgentTaskPhase.Failed or AgentTaskPhase.Cancelled;
 
-    public bool HasOpenQuestion =>
-        Questions.Any(question => !question.IsAnswered);
+    public bool IsDraftReadOnlyForUser => DraftSequenceId is not null && Phase == AgentTaskPhase.ReviewingDraft;
 
-    public bool HasApprovedPlan =>
-        Plan?.ApprovedAt is not null;
-
-    public ImmutableArray<AgentEvidenceRecord> Evidence =>
-        EvidenceLedger.IsDefault
-            ? ImmutableArray<AgentEvidenceRecord>.Empty
-            : EvidenceLedger;
-
-    // During agent execution/verification the draft is visible, but user editing is locked.
-    public bool IsDraftReadOnlyForUser =>
-        DraftSequenceId is not null &&
-        (
-            Phase is AgentTaskPhase.Executing or AgentTaskPhase.Verifying ||
-            Phase == AgentTaskPhase.WaitingForUserInput &&
-            ResumePhase is AgentTaskPhase.Executing or AgentTaskPhase.Verifying
-        );
+    public ImmutableArray<AgentJournalEntry> SafeJournal => Journal.IsDefault ? [] : Journal;
+    public ImmutableArray<Guid> SafeTargetSourceIds =>
+        TargetSourceIds.IsDefault ? [] : TargetSourceIds.Distinct().ToImmutableArray();
 }

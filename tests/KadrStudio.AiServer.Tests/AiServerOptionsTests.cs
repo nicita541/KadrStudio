@@ -1,53 +1,50 @@
 using KadrStudio.AiServer.Configuration;
+using KadrStudio.AiServer.Workers;
 
 namespace KadrStudio.AiServer.Tests;
 
 public sealed class AiServerOptionsTests
 {
-    [Theory]
-    [InlineData("http://127.0.0.1:11436/", true)]
-    [InlineData("http://localhost:11436/", true)]
-    [InlineData("https://127.0.0.1:11436/", false)]
-    [InlineData("http://192.168.1.50:11436/", false)]
-    public void AutomaticOllamaManagementIsRestrictedToLocalHttp(
-        string endpoint,
-        bool expected)
+    [Fact]
+    public void Workstation_planner_context_is_bounded_to_32k_by_default()
     {
-        var options = CreateOptions(new Uri(endpoint));
-
-        Assert.Equal(expected, options.CanManageConfiguredBackend());
+        Assert.Equal(32_768, new AiServerOptions().MaxPlannerContextTokens);
     }
 
     [Fact]
-    public void PublicModelAliasesResolveToIsolatedPlannerAndVisionRoles()
+    public void Planner_alias_and_backend_resolve_to_the_same_isolated_worker_role()
     {
-        var options = CreateOptions(new Uri("http://127.0.0.1:11436/"));
+        var options = new AiServerOptions
+        {
+            PlannerBackendModel = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            PlannerPublicModelAlias = "kadr-planner:latest"
+        };
 
-        var planner = options.ResolveModel(AiServerOptions.DefaultPlannerPublicModelAlias);
-        var vision = options.ResolveModel(options.PublicModelAlias);
+        var alias = options.ResolvePlannerModel("kadr-planner:latest");
+        var backend = options.ResolvePlannerModel("Qwen/Qwen3-30B-A3B-Instruct-2507");
 
-        Assert.Equal("planner", planner.Role);
-        Assert.False(planner.RequiresVision);
-        Assert.Equal(AiServerOptions.DefaultPlannerBackendModel, planner.BackendModel);
-        Assert.Equal("vision", vision.Role);
-        Assert.True(vision.RequiresVision);
-        Assert.Throws<InvalidOperationException>(() => options.ResolveModel("unmanaged-model"));
+        Assert.Equal(alias, backend);
+        Assert.Equal("planner", alias.Role);
+        Assert.Equal("Qwen/Qwen3-30B-A3B-Instruct-2507", alias.BackendModel);
     }
 
-    private static AiServerOptions CreateOptions(Uri endpoint)
-        => new()
-        {
-            OllamaEndpoint = endpoint,
-            BackendModel = "server-model",
-            PublicModelAlias = "kadr-vision:latest",
-            ModelsRoot = Path.Combine(Path.GetTempPath(), "kadr-ai-tests"),
-            ManageOllama = true,
-            AutoPull = false,
-            StartupTimeout = TimeSpan.FromSeconds(5),
-            RequestTimeout = TimeSpan.FromMinutes(1),
-            MaxRequestBodyBytes = 32 * 1024 * 1024,
-            MaxImageCount = 8,
-            MaxPromptCharacters = 100_000,
-            ListenUrls = AiServerOptions.DefaultListenUrls
-        };
+    [Fact]
+    public void Unmanaged_reasoning_model_is_rejected()
+    {
+        var options = new AiServerOptions();
+
+        Assert.Throws<InvalidOperationException>(() =>
+            options.ResolvePlannerModel("unmanaged-model"));
+    }
+
+    [Theory]
+    [InlineData("video-understanding", true)]
+    [InlineData("director", true)]
+    [InlineData("critic", true)]
+    [InlineData("embedding", true)]
+    [InlineData("audio-events", false)]
+    public void Worker_accelerator_policy_matches_model_residency(string analyzer, bool expected)
+    {
+        Assert.Equal(expected, LoopbackGrpcWorkerGateway.UsesAccelerator(analyzer));
+    }
 }

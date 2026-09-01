@@ -17,7 +17,7 @@ public sealed class TimelineControl : FrameworkElement
     private readonly ThumbnailRenderer _thumbnailRenderer;
     private readonly TimelineInteractionController _interaction = new();
     public const string MediaAssetDataFormat = "KadrStudio.MediaAssetId";
-    public const double LeftGutterWidth = 96;
+    public const double LeftGutterWidth = 184;
 
     private const double RulerHeight = 32;
     private const double TrackAreaTop = 35;
@@ -29,6 +29,10 @@ public sealed class TimelineControl : FrameworkElement
     private const double MinimumClipDuration = 0.1;
     private const double MinimumPixelsPerSecond = 0.0001;
     private const double MaximumPixelsPerSecond = 4000;
+    private const double TrackToggleLeft = 48;
+    private const double TrackToggleWidth = 128;
+    private const double TrackToggleTop = 9;
+    private const double TrackToggleHeight = 36;
     private readonly Pen _gridPen = CreatePen(Color.FromRgb(48, 49, 57), 1);
     private readonly Pen _minorGridPen = CreatePen(Color.FromRgb(38, 39, 46), 1);
     private readonly Pen _playheadPen = CreatePen(Color.FromRgb(242, 84, 105), 2);
@@ -68,6 +72,7 @@ public sealed class TimelineControl : FrameworkElement
     public event EventHandler<TimelineEditRequestedEventArgs>? EditRequested;
     public event EventHandler<AssetDroppedEventArgs>? AssetDropped;
     public event EventHandler<RazorSplitRequestedEventArgs>? RazorSplitRequested;
+    public event EventHandler<TrackStateToggleRequestedEventArgs>? TrackStateToggleRequested;
 
     public Func<Guid, TimelineTime, CancellationToken, Task<string?>>? ThumbnailRequest
     {
@@ -260,6 +265,15 @@ public sealed class TimelineControl : FrameworkElement
             return;
         }
 
+        if (HitTestTrackToggle(point) is { } trackToggle)
+        {
+            TrackStateToggleRequested?.Invoke(this, new TrackStateToggleRequestedEventArgs(
+                trackToggle.Track.Id,
+                trackToggle.ToggleKind));
+            e.Handled = true;
+            return;
+        }
+
         if (ToolMode == TimelineToolMode.Razor && !IsEditingLocked)
         {
             if (ResolveRazorTarget(point) is { } razorTarget)
@@ -379,6 +393,16 @@ public sealed class TimelineControl : FrameworkElement
             e.Handled = true;
             return;
         }
+
+        if (HitTestTrackToggle(point) is { } trackToggle)
+        {
+            Cursor = IsEditingLocked ? Cursors.No : Cursors.Hand;
+            ToolTip = trackToggle.ToggleKind == TrackStateToggleKind.Mute
+                ? (trackToggle.Track.IsMuted ? "Включить звук этой дорожки" : "Заглушить эту дорожку")
+                : (trackToggle.Track.IsVisible ? "Скрыть эту дорожку" : "Показать эту дорожку");
+            return;
+        }
+        ToolTip = null;
 
         if (IsEditingLocked)
         {
@@ -822,21 +846,83 @@ public sealed class TimelineControl : FrameworkElement
         var visibleTime = Viewport.VisibleTimelineStart;
         context.DrawText(CreateText(FormatRulerTime(visibleTime), 9.5, Color.FromRgb(167, 168, 176), dpi), new Point(left + 8, 1));
         if (HasTextTrack && IsTrackVisible(GetTextTrackTop()))
-            DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254), dpi);
+            DrawStickyTrackHeader(context, left, GetTextTrackTop(), "T1", Color.FromRgb(216, 180, 254),
+                _document?.FindTrack(CoreTrackKind.Text, 0), dpi);
         for (var index = 0; index < GetTrackCount(TrackKind.Visual); index++)
             if (IsTrackVisible(GetTrackTop(TrackKind.Visual, index)))
-                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Visual, index), $"V{index + 1}", Color.FromRgb(89, 145, 245), dpi);
+                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Visual, index), $"V{index + 1}", Color.FromRgb(89, 145, 245),
+                    _document?.FindTrack(CoreTrackKind.Visual, index), dpi);
         for (var index = 0; index < GetTrackCount(TrackKind.Audio); index++)
             if (IsTrackVisible(GetTrackTop(TrackKind.Audio, index)))
-                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Audio, index), $"A{index + 1}", Color.FromRgb(55, 190, 128), dpi);
+                DrawStickyTrackHeader(context, left, GetTrackTop(TrackKind.Audio, index), $"A{index + 1}", Color.FromRgb(55, 190, 128),
+                    _document?.FindTrack(CoreTrackKind.Audio, index), dpi);
     }
 
-    private void DrawStickyTrackHeader(DrawingContext context, double left, double top, string label, Color color, double dpi)
+    private void DrawStickyTrackHeader(
+        DrawingContext context,
+        double left,
+        double top,
+        string label,
+        Color color,
+        TimelineTrackReadModel? track,
+        double dpi)
     {
         context.DrawRectangle(new SolidColorBrush(Color.FromRgb(15, 16, 20)), null,
             new Rect(left, top, LeftGutterWidth, TrackHeight));
-        context.DrawText(CreateText(label, 10, color, dpi, FontWeights.SemiBold), new Point(left + 14, top + 18));
+        context.DrawText(CreateText(label, 10, color, dpi, FontWeights.SemiBold), new Point(left + 10, top + 18));
+        if (track is null)
+        {
+            return;
+        }
+
+        var isAudio = track.Kind == CoreTrackKind.Audio;
+        var disabled = isAudio ? track.IsMuted : !track.IsVisible;
+        var fill = disabled ? Color.FromRgb(82, 32, 43) : Color.FromRgb(30, 34, 43);
+        var border = disabled ? Color.FromRgb(242, 84, 105) : Color.FromRgb(74, 79, 94);
+        var button = GetTrackToggleBounds(left, top);
+        context.DrawRoundedRectangle(new SolidColorBrush(fill), CreatePen(border, 1), button, 5, 5);
+        var text = isAudio
+            ? track.IsMuted ? "Без звука" : "Звук включён"
+            : track.IsVisible ? "Дорожка видна" : "Дорожка скрыта";
+        var textColor = disabled ? Color.FromRgb(255, 193, 202) : Color.FromRgb(221, 224, 234);
+        context.DrawText(CreateText(text, 9.2, textColor, dpi, FontWeights.SemiBold),
+            new Point(button.Left + 10, button.Top + 11));
     }
+
+    private TrackToggleHit? HitTestTrackToggle(Point point)
+    {
+        if (_document is null)
+        {
+            return null;
+        }
+        var left = Math.Clamp(HorizontalViewportOffset, 0, Math.Max(0, RenderSize.Width - LeftGutterWidth));
+        TimelineTrackReadModel? track = null;
+        if (HasTextTrack && point.Y >= GetTextTrackTop() && point.Y <= GetTextTrackTop() + TrackHeight)
+        {
+            track = _document.FindTrack(CoreTrackKind.Text, 0);
+        }
+        else if (GetTrackAt(point.Y) is { } lane)
+        {
+            track = _document.FindTrack(
+                lane.Kind == TrackKind.Visual ? CoreTrackKind.Visual : CoreTrackKind.Audio,
+                lane.Index);
+        }
+        if (track is null || !GetTrackToggleBounds(left, TrackTop(track)).Contains(point))
+        {
+            return null;
+        }
+        return new TrackToggleHit(
+            track,
+            track.Kind == CoreTrackKind.Audio ? TrackStateToggleKind.Mute : TrackStateToggleKind.Visibility);
+    }
+
+    private double TrackTop(TimelineTrackReadModel track)
+        => track.Kind == CoreTrackKind.Text
+            ? GetTextTrackTop()
+            : GetTrackTop(track.Kind == CoreTrackKind.Visual ? TrackKind.Visual : TrackKind.Audio, track.Index);
+
+    private static Rect GetTrackToggleBounds(double left, double top)
+        => new(left + TrackToggleLeft, top + TrackToggleTop, TrackToggleWidth, TrackToggleHeight);
 
     private void DrawClips(DrawingContext context, double dpi)
     {
@@ -1443,6 +1529,7 @@ public sealed class TimelineControl : FrameworkElement
     };
 
     private sealed record RazorTarget(TimelineClip Clip, double Time, bool IsSnapped);
+    private sealed record TrackToggleHit(TimelineTrackReadModel Track, TrackStateToggleKind ToggleKind);
 
 }
 
@@ -1485,4 +1572,16 @@ public sealed class RazorSplitRequestedEventArgs(Guid clipId, double seconds, bo
     public Guid ClipId { get; } = clipId;
     public double Seconds { get; } = seconds;
     public bool IncludeLinked { get; } = includeLinked;
+}
+
+public enum TrackStateToggleKind
+{
+    Mute,
+    Visibility
+}
+
+public sealed class TrackStateToggleRequestedEventArgs(Guid trackId, TrackStateToggleKind toggleKind) : EventArgs
+{
+    public Guid TrackId { get; } = trackId;
+    public TrackStateToggleKind ToggleKind { get; } = toggleKind;
 }

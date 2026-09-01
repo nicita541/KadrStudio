@@ -3,6 +3,8 @@ using KadrStudio.Application.Media;
 using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Infrastructure.Jobs;
 using KadrStudio.Infrastructure.Media;
+using KadrStudio.Application.Upscaling;
+using KadrStudio.Application.Models;
 
 namespace KadrStudio.Services;
 
@@ -23,8 +25,9 @@ public sealed record EditorWorkspaceServices(
     ExportService ExportService,
     ProjectHistoryService ProjectHistoryService,
     AutoSubtitleService AutoSubtitleService,
-    VideoAnalysisService VideoAnalysisService,
-    AiVideoAnalysisService AiVideoAnalysisService,
+    IAiUpscaleService AiUpscaleService,
+    IModelPackInstaller ModelPackInstaller,
+    AiServerConnection AiServer,
     BackgroundJobScheduler AutomationScheduler,
     WorkspaceSettingsService SettingsService);
 
@@ -46,8 +49,9 @@ public static class EditorWorkspaceCompositionRoot
             ffmpeg, processes, artifacts: artifacts);
         var export = new ExportService(ffmpeg, processes, renderCoordinator);
         var subtitles = new AutoSubtitleService(ffmpeg, processes);
-        var analysis = new VideoAnalysisService(ffmpeg, processes);
-        var aiServer = new AiVideoAnalysisService(ffmpeg, processes);
+        var modelPackInstaller = new PowerShellModelPackInstaller();
+        var aiServer = new AiServerConnection();
+        var upscale = new AnimeSrUpscaleService(ffmpeg, probe, processes, aiServer);
         return new EditorWorkspaceServices(
             ffmpeg,
             processes,
@@ -61,7 +65,8 @@ public static class EditorWorkspaceCompositionRoot
             export,
             new ProjectHistoryService(),
             subtitles,
-            analysis,
+            upscale,
+            modelPackInstaller,
             aiServer,
             new BackgroundJobScheduler(),
             settingsService);

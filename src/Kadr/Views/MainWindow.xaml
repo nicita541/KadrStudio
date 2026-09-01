@@ -91,6 +91,7 @@
                             <ContextMenu>
                                 <MenuItem Header="Медиатека" Click="ShowMedia_Click" />
                                 <MenuItem Header="ИИ" Click="ShowAnalysis_Click" />
+                                <MenuItem Header="Апскейл" Click="ShowUpscale_Click" />
                                 <MenuItem Header="История версий" Click="ShowHistory_Click" />
                                 <Separator Margin="4,2" />
                                 <MenuItem Header="Обработка звука…" Click="OpenAudioWorkspace_Click" />
@@ -166,6 +167,21 @@
                         <TextBlock Text="ИИ" FontSize="10" HorizontalAlignment="Center" Margin="0,5,0,0" />
                     </StackPanel>
                 </Button>
+                <Button x:Name="UpscaleNavButton" Style="{StaticResource NavButton}" ToolTip="Апскейл видео через AnimeSR-X" Click="ShowUpscale_Click">
+                    <StackPanel>
+                        <Viewbox Width="22" Height="22" HorizontalAlignment="Center">
+                            <Canvas Width="24" Height="24">
+                                <Path Data="M4,14 L4,20 L10,20 M14,20 L20,20 L20,14 M20,10 L20,4 L14,4 M10,4 L4,4 L4,10"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                      StrokeThickness="1.8" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                <Path Data="M8,16 L16,8 M11,8 L16,8 L16,13"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                      StrokeThickness="1.8" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            </Canvas>
+                        </Viewbox>
+                        <TextBlock Text="Апскейл" FontSize="9" HorizontalAlignment="Center" Margin="0,5,0,0" />
+                    </StackPanel>
+                </Button>
                 <Button x:Name="HistoryNavButton" Style="{StaticResource NavButton}" ToolTip="История версий проекта" Click="ShowHistory_Click">
                     <StackPanel>
                         <Viewbox Width="22" Height="22" HorizontalAlignment="Center"><Canvas Width="24" Height="24"><Path Data="M5,7 A8,8 0 1 1 4,15" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" Fill="Transparent"/><Path Data="M5,3 L5,8 L10,8 M12,7 L12,12 L16,14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" Fill="Transparent" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/></Canvas></Viewbox>
@@ -235,14 +251,10 @@
                              SelectedItem="{Binding SelectedAsset}"
                              PreviewMouseLeftButtonDown="MediaList_PreviewMouseLeftButtonDown"
                              PreviewMouseMove="MediaList_PreviewMouseMove"
-                             PreviewMouseRightButtonDown="MediaList_PreviewMouseRightButtonDown"
                              MouseDoubleClick="MediaList_MouseDoubleClick"
                              Panel.ZIndex="1">
                         <ListBox.ContextMenu>
                             <ContextMenu Background="{StaticResource PanelRaisedBrush}" Foreground="{StaticResource TextBrush}">
-                                <MenuItem Header="Обязательно вставить в ИИ-монтаж" Click="MediaAiRequired_Click"/>
-                                <MenuItem Header="Не использовать в ИИ-монтаже" Click="MediaAiExcluded_Click"/>
-                                <MenuItem Header="Заметка для ИИ…" Click="MediaAiNote_Click"/>
                             </ContextMenu>
                         </ListBox.ContextMenu>
                         <ListBox.ItemsPanel>
@@ -289,7 +301,7 @@
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                 <StackPanel Grid.Row="0" Margin="2,2,0,10">
                     <TextBlock Text="ИИ-агент" FontSize="18" FontWeight="SemiBold" />
-                    <TextBlock Text="Поставьте задачу. Агент изучит материал, при необходимости задаст вопрос, предложит план и выполнит его только после вашего утверждения."
+                    <TextBlock Text="Поставьте монтажную задачу. Kadr проиндексирует материал, соберёт и проверит отдельный Agent Draft; исходный таймлайн останется неизменным."
                                Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,0" />
                 </StackPanel>
 
@@ -338,89 +350,37 @@
                                                        Foreground="{StaticResource MutedTextBrush}" Margin="0,4,0,0"/>
                                         </StackPanel>
 
-                                        <Button Style="{StaticResource ButtonBase}" Content="Безопасно повторить"
-                                                Tag="{Binding Id}" Click="AiChatRetryAgent_Click" Padding="9,7" Margin="0,8,0,0"
-                                                Visibility="{Binding CanRetryFailedPlanning, Converter={StaticResource BoolToVisibility}}"/>
 
-                                        <StackPanel Visibility="{Binding IsPlanVisible, Converter={StaticResource BoolToVisibility}}"
-                                                    Margin="0,9,0,0">
-                                            <TextBlock Text="{Binding PlanDurationLabel}" FontWeight="SemiBold" TextWrapping="Wrap"/>
-                                            <TextBlock Text="{Binding PlanPrimaryLabel}" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
-                                            <ItemsControl ItemsSource="{Binding RetainedItems}">
-                                                <ItemsControl.ItemTemplate><DataTemplate>
-                                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"/>
-                                                </DataTemplate></ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                            <StackPanel Visibility="{Binding HasRemovedItems, Converter={StaticResource BoolToVisibility}}">
-                                                <TextBlock Text="{Binding PlanSecondaryLabel}" FontWeight="SemiBold" FontSize="10" Margin="0,8,0,3"/>
-                                                <ItemsControl ItemsSource="{Binding RemovedItems}">
-                                                    <ItemsControl.ItemTemplate><DataTemplate>
-                                                        <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Margin="0,2"
-                                                                   Foreground="{StaticResource MutedTextBrush}"/>
-                                                    </DataTemplate></ItemsControl.ItemTemplate>
-                                                </ItemsControl>
-                                            </StackPanel>
-                                            <ItemsControl ItemsSource="{Binding Warnings}" Margin="0,6,0,0">
-                                                <ItemsControl.ItemTemplate><DataTemplate>
-                                                    <TextBlock Text="{Binding}" TextWrapping="Wrap" FontSize="9" Foreground="#F0C674" Margin="0,2"/>
-                                                </DataTemplate></ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                            <TextBlock Text="{Binding PlanHint}" TextWrapping="Wrap" FontSize="9"
-                                                       Foreground="{StaticResource MutedTextBrush}" Margin="0,8,0,0"
-                                                       Visibility="{Binding HasPlanHint, Converter={StaticResource BoolToVisibility}}"/>
-                                            <Button Style="{StaticResource AccentButton}" Content="{Binding PlanActionLabel}"
-                                                    Tag="{Binding Id}" Click="AiChatCreateDraft_Click" Padding="10,7" Margin="0,9,0,0"
-                                                    IsEnabled="{Binding CanCreateDraft}"/>
+
+
+                                        <StackPanel Visibility="{Binding IsDraftVisible, Converter={StaticResource BoolToVisibility}}"
+                                                    Margin="0,12,0,0">
+                                            <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,0,0,10"/>
+                                            <TextBlock Text="Проверка результата" FontSize="11" FontWeight="SemiBold"/>
+                                            <TextBlock Text="A — исходная серия без изменений. B — монтажный черновик."
+                                                       Margin="0,3,0,9" FontSize="9" TextWrapping="Wrap"
+                                                       Foreground="{StaticResource MutedTextBrush}"/>
+                                            <Button Style="{StaticResource ButtonBase}"
+                                                    Content="Показать монтажный черновик (B)"
+                                                    ToolTip="Переключить предпросмотр и таймлайн на результат работы ИИ"
+                                                    Tag="{Binding Id}" Click="AiChatOpenDraft_Click"
+                                                    HorizontalContentAlignment="Left" Padding="10,8" Margin="0,0,0,6"/>
+                                            <Button Style="{StaticResource ButtonBase}"
+                                                    Content="Вернуться к исходной серии (A)"
+                                                    ToolTip="Показать неизменённый исходный таймлайн"
+                                                    Tag="{Binding Id}" Click="AiChatOpenSource_Click"
+                                                    HorizontalContentAlignment="Left" Padding="10,8" Margin="0,0,0,10"/>
+                                            <Button Style="{StaticResource AccentButton}"
+                                                    Content="{Binding AcceptDraftLabel}"
+                                                    ToolTip="Сделать этот монтаж основной последовательностью проекта"
+                                                    Tag="{Binding Id}" Click="AiChatAcceptDraft_Click"
+                                                    Padding="10,9" Margin="0,0,0,6"/>
+                                            <Button Style="{StaticResource ButtonBase}"
+                                                    Content="Удалить только черновик"
+                                                    ToolTip="Удалить результат ИИ. Исходная серия останется без изменений."
+                                                    Tag="{Binding Id}" Click="AiChatDeleteDraft_Click"
+                                                    Foreground="#FFBBC2" BorderBrush="#70404A" Padding="10,8"/>
                                         </StackPanel>
-
-                                        <StackPanel Visibility="{Binding IsQuestionVisible, Converter={StaticResource BoolToVisibility}}"
-                                                    Margin="0,9,0,0">
-                                            <ItemsControl ItemsSource="{Binding Options}"
-                                                          Visibility="{Binding IsOptionQuestionVisible, Converter={StaticResource BoolToVisibility}}">
-                                                <ItemsControl.ItemTemplate><DataTemplate>
-                                                    <Button Style="{StaticResource ButtonBase}" Tag="{Binding}"
-                                                            Click="AiChatQuestionOption_Click" Padding="9,7" Margin="0,0,0,5"
-                                                            HorizontalContentAlignment="Left" IsEnabled="{Binding IsEnabled}">
-                                                        <StackPanel>
-                                                            <TextBlock Text="{Binding Label}" FontWeight="SemiBold"/>
-                                                            <TextBlock Text="{Binding Description}" TextWrapping="Wrap" FontSize="9"
-                                                                       Foreground="{StaticResource MutedTextBrush}" Margin="0,2,0,0"/>
-                                                        </StackPanel>
-                                                    </Button>
-                                                </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                            <StackPanel Visibility="{Binding IsBoundaryQuestionVisible, Converter={StaticResource BoolToVisibility}}">
-                                                <Border Height="142" Background="#101117" BorderBrush="{StaticResource BorderBrush}"
-                                                        BorderThickness="1" CornerRadius="5">
-                                                    <Image Source="{Binding BoundaryFrame}" Stretch="Uniform"/>
-                                                </Border>
-                                                <TextBlock Text="{Binding BoundaryTimeLabel}" HorizontalAlignment="Center"
-                                                           FontFamily="Consolas" FontSize="10" Margin="0,6"/>
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                                    <Button Style="{StaticResource ButtonBase}" Content="−1 кадр" Tag="{Binding Id}"
-                                                            Click="AiChatPreviousFrame_Click" Padding="7"/>
-                                                    <Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="+1 кадр" Tag="{Binding Id}"
-                                                            Click="AiChatNextFrame_Click" Padding="7"/>
-                                                </Grid>
-                                                <Button Style="{StaticResource AccentButton}" Content="Подтвердить этот кадр" Tag="{Binding Id}"
-                                                        Click="AiChatConfirmFrame_Click" Padding="9,7" Margin="0,5,0,0"/>
-                                            </StackPanel>
-                                            <TextBlock Text="Ответьте сообщением в поле ниже. Агент продолжит с этого же шага."
-                                                       TextWrapping="Wrap" FontSize="9" Foreground="{StaticResource MutedTextBrush}"
-                                                       Visibility="{Binding IsGenericAgentQuestion, Converter={StaticResource BoolToVisibility}}"/>
-                                            <TextBlock Text="{Binding AnswerLabel}" FontWeight="SemiBold" Foreground="#CBB8FF"
-                                                       Visibility="{Binding HasAnswer, Converter={StaticResource BoolToVisibility}}"/>
-                                        </StackPanel>
-
-                                        <Grid Visibility="{Binding IsDraftVisible, Converter={StaticResource BoolToVisibility}}" Margin="0,9,0,0">
-                                            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                            <Button Style="{StaticResource ButtonBase}" Content="Открыть" Tag="{Binding Id}" Click="AiChatOpenDraft_Click" Padding="7"/>
-                                            <Button Grid.Column="2" Style="{StaticResource AccentButton}" Content="{Binding AcceptDraftLabel}" Tag="{Binding Id}" Click="AiChatAcceptDraft_Click" Padding="7"/>
-                                            <Button Grid.ColumnSpan="3" Style="{StaticResource ButtonBase}" Content="Удалить черновик" Tag="{Binding Id}"
-                                                    Click="AiChatDeleteDraft_Click" Padding="7" Margin="0,38,0,0"/>
-                                        </Grid>
 
                                         <TextBlock Text="{Binding TimeLabel}" FontSize="8" Foreground="{StaticResource MutedTextBrush}"
                                                    HorizontalAlignment="Right" Margin="0,6,0,0"/>
@@ -433,6 +393,25 @@
                     <Border Grid.Row="1" Background="{StaticResource PanelRaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
                             BorderThickness="1" CornerRadius="9" Padding="8">
                         <StackPanel>
+                            <Button x:Name="ModelPackInstallButton" Style="{StaticResource ButtonBase}"
+                                    Content="Проверка моделей…" Click="ModelPackInstall_Click"
+                                    HorizontalAlignment="Stretch" Padding="8,6" Margin="0,0,0,7"/>
+                            <TextBlock x:Name="AiToolStatusText" Margin="0,0,0,7" FontSize="9" TextWrapping="Wrap"
+                                       Foreground="{StaticResource MutedTextBrush}" Visibility="Collapsed"/>
+                            <Grid Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="8"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <TextBlock Text="Профиль" Foreground="{StaticResource MutedTextBrush}" VerticalAlignment="Center" FontSize="9"/>
+                                <ComboBox x:Name="EditorialProfileComboBox" Grid.Column="2" SelectedIndex="0" MinWidth="155">
+                                    <ComboBoxItem Content="Аниме-серия" Tag="AnimeEpisode"/>
+                                </ComboBox>
+                            </Grid>
+                            <Grid Margin="0,0,0,7">
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="8"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                <TextBlock Text="Серии" Foreground="{StaticResource MutedTextBrush}" VerticalAlignment="Center" FontSize="9"/>
+                                <ComboBox x:Name="EditorialTargetComboBox" Grid.Column="2" MinWidth="155"
+                                          DisplayMemberPath="Label"
+                                          ToolTip="ИИ может определить серии из смысла запроса; при необходимости задайте область явно"/>
+                            </Grid>
                             <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
@@ -454,148 +433,58 @@
                     </Border>
                 </Grid>
 
-                <TabControl x:Name="AiMontageTabControl" Grid.Row="1" Background="Transparent" BorderThickness="0" Visibility="Collapsed">
-                    <TabItem Header="Материал">
-                        <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
-                            <TextBlock Text="Область материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <ComboBox x:Name="AiScopeComboBox" SelectedIndex="0" Margin="0,4,0,8">
-                                <ComboBoxItem Content="Вся медиатека" Tag="MediaLibrary"/>
-                                <ComboBoxItem Content="Выбранные файлы" Tag="SelectedSources"/>
-                                <ComboBoxItem Content="Текущий таймлайн" Tag="CurrentSequence"/>
-                                <ComboBoxItem Content="Выбранные клипы" Tag="SelectedClips"/>
-                                <ComboBoxItem Content="Диапазон In/Out" Tag="InOutRange"/>
-                            </ComboBox>
-                            <ListBox x:Name="AiSourceListBox" ItemsSource="{Binding Project.Media}" SelectionMode="Extended" Height="112" Margin="0,0,0,9">
-                                <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" Margin="5,3"/></DataTemplate></ListBox.ItemTemplate>
-                            </ListBox>
-                            <TextBlock Text="Профиль материала" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <ComboBox x:Name="AiGameProfileComboBox" Margin="0,4,0,8">
-                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
-                            </ComboBox>
-                            <Grid Margin="0,0,0,8"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                <StackPanel><TextBlock Text="Формат" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                                    <ComboBox x:Name="AiTargetFormatComboBox" SelectedIndex="0" Margin="0,4,0,0" SelectionChanged="AiTargetFormat_Changed">
-                                        <ComboBoxItem Content="YouTube 16:9" Tag="YouTube"/><ComboBoxItem Content="Shorts 9:16" Tag="Shorts"/>
-                                    </ComboBox></StackPanel>
-                                <StackPanel Grid.Column="2"><TextBlock Text="Цель, сек." Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                                    <TextBox x:Name="AiTargetDurationTextBox" Text="720" Margin="0,4,0,0"/></StackPanel>
-                            </Grid>
-                            <TextBlock Text="Задание режиссёру" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <TextBox x:Name="AnalysisPromptTextBox" Text="Собери понятную историю из лучших фрагментов материала"
-                                     AcceptsReturn="True" TextWrapping="Wrap" Height="72" Margin="0,4,0,8"/>
-                            <TextBlock Text="Точный диапазон выбранного исходника" Foreground="{StaticResource MutedTextBrush}" FontSize="10"/>
-                            <Grid Margin="0,4,0,5"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="7"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                <TextBox x:Name="AnalysisStartTextBox" Text="0:00"/><TextBox x:Name="AnalysisEndTextBox" Grid.Column="2" Text="0:00"/>
-                            </Grid>
-                            <TextBox x:Name="AiAnnotationNoteTextBox" Text="Почему этот момент важен" Margin="0,0,0,5"/>
-                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                <Button Style="{StaticResource ButtonBase}" Content="Обязательно" Click="AiAddRequired_Click" Padding="5"/>
-                                <Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="Не использовать" Click="AiAddExcluded_Click" Padding="5"/>
-                                <Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Заметка" Click="AiAddNote_Click" Padding="5"/>
-                            </Grid>
-                            <ListBox x:Name="AiAnnotationsListBox" Height="82" Margin="0,7,0,0" MouseDoubleClick="AiDeleteAnnotation_DoubleClick"/>
-                        </StackPanel></ScrollViewer>
-                    </TabItem>
 
-                    <TabItem Header="Анализ">
-                        <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="3,10,3,6">
-                            <CheckBox x:Name="UseLocalAiCheckBox" IsChecked="True" Content="Точный смысловой анализ Kadr AI Server" FontWeight="SemiBold"/>
-                            <Grid Margin="0,7,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <ComboBox x:Name="LocalAiModelComboBox" MinWidth="150">
-                                    <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
-                                </ComboBox>
-                                <Button x:Name="RefreshLocalAiModelsButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="RefreshLocalAiModels_Click" Content="Обновить" Padding="8,5"/>
-                            </Grid>
-                            <TextBlock x:Name="LocalAiStatusTextBlock" Text="Проверка локальной модели…" Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,5,0,8"/>
-                            <Button x:Name="AiAnalyzeSourcesButton" Style="{StaticResource AccentButton}" Click="AiAnalyzeSources_Click" Content="Проанализировать материал" Padding="10,8"/>
-                            <Separator Margin="0,10"/>
-                            <TextBlock Text="Технические метки текущего клипа" FontWeight="SemiBold"/>
-                            <ComboBox x:Name="AnalysisAssetComboBox" ItemsSource="{Binding Project.Media}" SelectedItem="{Binding SelectedAsset}" TextSearch.TextPath="Name" Margin="0,6,0,6">
-                                <ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"/></DataTemplate></ComboBox.ItemTemplate>
-                            </ComboBox>
-                            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <Button x:Name="RunAnalysisButton" Style="{StaticResource ButtonBase}" Click="RunAnalysis_Click" Content="Создать метки" Padding="8"/>
-                                <Button x:Name="CancelAnalysisButton" Grid.Column="2" Style="{StaticResource ButtonBase}" Click="CancelAnalysis_Click" Content="Отмена" Padding="8" IsEnabled="False"/>
-                            </Grid>
-                            <Button x:Name="ApplyEditPromptButton" Style="{StaticResource ButtonBase}" Click="ApplyEditPrompt_Click" Content="Быстрая команда текущему таймлайну" Padding="8" Margin="0,6,0,0"/>
-                            <Border x:Name="EditReviewPanel" Background="#202133" BorderBrush="{StaticResource AccentBrush}" BorderThickness="1" CornerRadius="5" Padding="8" Margin="0,7,0,0" Visibility="Collapsed">
-                                <StackPanel><TextBlock Text="Черновик быстрой команды" FontWeight="SemiBold"/><TextBlock x:Name="EditReviewSummaryTextBlock" TextWrapping="Wrap" FontSize="9" Margin="0,4,0,6"/>
-                                    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                        <Button Style="{StaticResource AccentButton}" Click="AcceptEditReview_Click" Content="Принять"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Click="RejectEditReview_Click" Content="Вернуть"/>
-                                    </Grid></StackPanel>
-                            </Border>
-                            <ListBox x:Name="AnalysisMarkersList" ItemsSource="{Binding Project.Markers}" Height="130" Margin="0,8,0,0" MouseDoubleClick="AnalysisMarkersList_MouseDoubleClick" DisplayMemberPath="Title"/>
-                            <Button Style="{StaticResource ButtonBase}" Click="ClearAnalysisMarkers_Click" Content="Очистить технические метки" Padding="7" Margin="0,6,0,0"/>
-                        </StackPanel></ScrollViewer>
-                    </TabItem>
-
-                    <TabItem Header="План">
-                        <Grid Margin="3,10,3,6"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                            <StackPanel Grid.Row="0"><Button x:Name="AiGeneratePlanButton" Style="{StaticResource AccentButton}" Click="AiGeneratePlan_Click" Content="Составить план монтажа" Padding="10,8"/>
-                                <TextBlock x:Name="AiPlanSummaryTextBlock" Text="Сначала проанализируйте материал." Foreground="{StaticResource MutedTextBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,6,0,6"/></StackPanel>
-                            <Grid Grid.Row="1"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                                <ListBox x:Name="AiPlanItemsListBox" MinHeight="120" SelectionChanged="AiPlanSelection_Changed">
-                                    <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
-                                        <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Grid.Column="1" Text="{Binding LockLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
-                                            <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/><TextBlock Text="{Binding Reason}" TextWrapping="Wrap" FontSize="9" MaxHeight="36"/></StackPanel>
-                                    </Border></DataTemplate></ListBox.ItemTemplate>
-                                </ListBox>
-                                <Expander Grid.Row="1" Header="Исключаемые блоки" IsExpanded="False" Margin="0,6,0,0">
-                                    <ListBox x:Name="AiExcludedSegmentsListBox" MaxHeight="120">
-                                        <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="5">
-                                            <StackPanel><Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                                <TextBlock Text="{Binding Title}" FontWeight="SemiBold"/><TextBlock Grid.Column="1" Text="{Binding ConfidenceLabel}" Foreground="#CBB8FF" FontSize="9"/></Grid>
-                                                <TextBlock Text="{Binding TimeLabel}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/>
-                                                <TextBlock Text="{Binding Evidence}" TextWrapping="Wrap" FontSize="9" MaxHeight="34"/>
-                                            </StackPanel>
-                                        </Border></DataTemplate></ListBox.ItemTemplate>
-                                    </ListBox>
-                                </Expander>
-                                <TextBlock x:Name="AiDecisionsTitle" Grid.Row="2" Text="Требуется уточнение" FontWeight="SemiBold" Margin="0,7,0,4" Visibility="Collapsed"/>
-                                <Grid x:Name="AiDecisionsPanel" Grid.Row="3" Visibility="Collapsed"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                                    <ListBox x:Name="AiDecisionsListBox" MaxHeight="100">
-                                        <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Prompt}" TextWrapping="Wrap" FontSize="9" Margin="5,4"/></DataTemplate></ListBox.ItemTemplate>
-                                    </ListBox>
-                                    <Button Grid.Row="1" Style="{StaticResource ButtonBase}" Click="AiResolveDecision_Click" Content="Уточнить выбранное" Padding="7" Margin="0,5,0,0"/>
-                                </Grid>
-                            </Grid>
-                            <StackPanel Grid.Row="2" Margin="0,7,0,0">
-                                <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/><ColumnDefinition Width="4"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                    <Button Style="{StaticResource ButtonBase}" Content="↑" Click="AiPlanMoveUp_Click"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Content="↓" Click="AiPlanMoveDown_Click"/><Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Замок" Click="AiPlanToggleLock_Click"/><Button Grid.Column="6" Style="{StaticResource ButtonBase}" Content="Убрать" Click="AiPlanRemove_Click"/>
-                                </Grid>
-                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                    <TextBox x:Name="AiPlanItemStartTextBox"/><TextBox x:Name="AiPlanItemEndTextBox" Grid.Column="2"/><Button Grid.Column="4" Style="{StaticResource ButtonBase}" Content="Обрезать" Click="AiPlanTrim_Click" Padding="7,4"/>
-                                </Grid>
-                                <TextBox x:Name="AiRevisionTextBox" Text="Сделай начало динамичнее" Margin="0,6,0,0"/>
-                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                    <Button x:Name="AiRevisePlanButton" Style="{StaticResource ButtonBase}" Click="AiRevisePlan_Click" Content="Исправить план" Padding="7" IsEnabled="False"/>
-                                    <Button x:Name="AiCreateDraftButton" Grid.Column="2" Style="{StaticResource AccentButton}" Click="AiCreateDraft_Click" Content="Создать черновик" Padding="7" IsEnabled="False"/>
-                                </Grid>
-                            </StackPanel>
-                        </Grid>
-                    </TabItem>
-
-                    <TabItem Header="Версии">
-                        <Grid Margin="3,10,3,6"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                            <ListBox x:Name="AiSequencesListBox" MinHeight="230">
-                                <ListBox.ItemTemplate><DataTemplate><Border BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1" Padding="7">
-                                    <StackPanel><TextBlock Text="{Binding Name}" FontWeight="SemiBold"/><TextBlock Text="{Binding Details}" Foreground="{StaticResource MutedTextBrush}" FontSize="9"/></StackPanel>
-                                </Border></DataTemplate></ListBox.ItemTemplate>
-                            </ListBox>
-                            <StackPanel Grid.Row="1"><Button Style="{StaticResource ButtonBase}" Click="AiOpenSequence_Click" Content="Открыть выбранную версию" Padding="8"/>
-                                <Grid Margin="0,5,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="5"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                                    <Button Style="{StaticResource AccentButton}" Click="AiAcceptDraft_Click" Content="Принять активный черновик" Padding="7"/><Button Grid.Column="2" Style="{StaticResource ButtonBase}" Click="AiDeleteDraft_Click" Content="Удалить активный черновик" Padding="7"/>
-                                </Grid></StackPanel>
-                        </Grid>
-                    </TabItem>
-                </TabControl>
-
-                <StackPanel Grid.Row="2" Margin="0,8,0,0" Visibility="Collapsed">
-                    <ProgressBar x:Name="AnalysisProgressBar" Height="5" Minimum="0" Maximum="100" Foreground="{StaticResource AccentBrush}" Visibility="Collapsed"/>
-                    <TextBlock x:Name="AnalysisSummaryTextBlock" Text="Выберите материал и профиль игры." Foreground="{StaticResource MutedTextBrush}" FontSize="10" TextWrapping="Wrap" Margin="0,5,0,0"/>
-                </StackPanel>
             </Grid>
+        </Border>
+
+        <!-- Отдельное рабочее пространство апскейла -->
+        <Border x:Name="UpscalePanel"
+                Grid.Row="1"
+                Grid.Column="1"
+                Background="{StaticResource PanelBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,1,0"
+                Visibility="Collapsed">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="14">
+                    <TextBlock Text="Апскейл" FontSize="18" FontWeight="SemiBold" Margin="2,2,0,0"/>
+                    <TextBlock Text="Увеличение разрешения выбранных видеодорожек через AnimeSR-X. Монтаж, позиции клипов и исходное аудио сохраняются."
+                               Foreground="{StaticResource MutedTextBrush}" FontSize="10"
+                               TextWrapping="Wrap" Margin="2,5,0,14"/>
+
+                    <Border Background="{StaticResource PanelRaisedBrush}" BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1" CornerRadius="9" Padding="12" Margin="0,0,0,12">
+                        <StackPanel>
+                            <TextBlock Text="AnimeSR-X" FontSize="13" FontWeight="SemiBold"/>
+                            <TextBlock Text="Экспериментальная модель · FP16 CUDA · адаптивные тайлы"
+                                       Foreground="{StaticResource AccentBrush}" FontSize="9" Margin="0,3,0,8"
+                                       TextWrapping="Wrap"/>
+                            <TextBlock Text="Сначала выберите одну или несколько визуальных дорожек активного оригинала или монтажа. В окне запуска можно выбрать Auto → 2160p, x2 или x4."
+                                       Foreground="{StaticResource MutedTextBrush}" FontSize="10"
+                                       TextWrapping="Wrap" Margin="0,0,0,12"/>
+                            <Button x:Name="AiUpscaleButton" Style="{StaticResource AccentButton}"
+                                    Content="Запустить апскейл дорожек" Click="AiUpscale_Click"
+                                    ToolTip="Настроить масштаб и запустить AnimeSR-X для выбранных видеодорожек"
+                                    HorizontalAlignment="Stretch" Padding="10,9" Margin="0,0,0,7"/>
+                            <Button x:Name="UpscaleCompareButton" Style="{StaticResource ButtonBase}"
+                                    Content="Сравнить текущий кадр" Click="UpscaleCompare_Click"
+                                    ToolTip="Открыть сравнение оригинала и готового апскейла с перетаскиваемым разделителем"
+                                    HorizontalAlignment="Stretch" Padding="10,8"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Background="#18191E" BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1" CornerRadius="8" Padding="10">
+                        <StackPanel>
+                            <TextBlock Text="Состояние задания" FontSize="10" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                            <TextBlock x:Name="UpscaleStatusText"
+                                       Text="Апскейл ещё не запускался."
+                                       Foreground="{StaticResource MutedTextBrush}" FontSize="10"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
         </Border>
 
         <!-- Встроенная история версий -->
@@ -962,7 +851,31 @@
                         <Button Style="{StaticResource IconButton}" FontFamily="Segoe UI" FontWeight="Bold" Click="SetOutPoint_Click" ToolTip="Поставить точку выхода (O)" Content="O" Margin="0,0,5,0" />
                         <Button Style="{StaticResource IconButton}" FontFamily="Segoe UI" FontSize="20" Click="ClearInOut_Click" ToolTip="Очистить точки In/Out" Content="×" />
                     </StackPanel>
-                    <TextBlock Grid.Column="1" Text="Таймлайн" FontWeight="SemiBold" HorizontalAlignment="Center" />
+                    <Grid Grid.Column="1">
+                        <TextBlock Text="Таймлайн" FontWeight="SemiBold" HorizontalAlignment="Center"
+                                   VerticalAlignment="Top" Margin="0,3,0,0" FontSize="10"
+                                   Foreground="{StaticResource MutedTextBrush}" />
+                        <ItemsControl x:Name="TimelineVariantTabs"
+                                      HorizontalAlignment="Center"
+                                      VerticalAlignment="Bottom">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <ToggleButton Style="{StaticResource TimelineVariantTabButton}"
+                                                  Content="{Binding Label}"
+                                                  IsChecked="{Binding IsSelected, Mode=OneWay}"
+                                                  IsEnabled="{Binding IsEnabled, Mode=OneWay}"
+                                                  ToolTip="{Binding ToolTip}"
+                                                  Tag="{Binding}"
+                                                  Click="TimelineVariantTab_Click" />
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Grid>
                     <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,14,0">
                         <TextBlock Text="Масштаб" Foreground="{StaticResource MutedTextBrush}" FontSize="11" Margin="0,0,10,0" />
                         <Button Style="{StaticResource IconButton}" Click="ZoomOut_Click" ToolTip="Уменьшить" Content="&#xE738;" Margin="0,0,5,0" />
@@ -997,9 +910,6 @@
                                 <MenuItem Header="Поставить точку выхода (O)" Click="SetOutPoint_Click" Padding="12,8" />
                                 <MenuItem Header="Очистить In/Out" Click="ClearInOut_Click" Padding="12,8" />
                                 <Separator Background="{StaticResource BorderBrush}" Margin="4,2" />
-                                <MenuItem Header="Обязательно вставить в ИИ-монтаж" Click="TimelineAiRequired_Click" Padding="12,8" />
-                                <MenuItem Header="Не использовать в ИИ-монтаже" Click="TimelineAiExcluded_Click" Padding="12,8" />
-                                <MenuItem Header="Заметка для ИИ…" Click="TimelineAiNote_Click" Padding="12,8" />
                             </ContextMenu>
                         </controls:TimelineControl.ContextMenu>
                     </controls:TimelineControl>

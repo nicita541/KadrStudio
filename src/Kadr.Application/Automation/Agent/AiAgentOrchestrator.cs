@@ -1,49 +1,31 @@
 using System.Collections.Immutable;
-using System.Text.Json;
-using KadrStudio.Application.Automation.Agent.Tools;
 
 namespace KadrStudio.Application.Automation.Agent;
 
 /// <summary>
-/// Owns the lifecycle of a single active AI editing task.
-/// This state machine deliberately calls neither models nor tools; workflow
-/// services perform those phase-specific operations around it.
+/// Small deterministic state machine for the v2.1 editorial pipeline. Model
+/// reasoning and worker calls live in stage-specific services, never here.
 /// </summary>
 public sealed class AiAgentOrchestrator
 {
     private readonly object _sync = new();
     private readonly Func<DateTimeOffset> _utcNow;
-
     private AgentTaskState? _currentTask;
-    private ImmutableArray<AgentTaskState> _history = ImmutableArray<AgentTaskState>.Empty;
+    private ImmutableArray<AgentTaskState> _history = [];
 
     public AiAgentOrchestrator(Func<DateTimeOffset>? utcNow = null)
-    {
-        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
-    }
+        => _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
 
     public event EventHandler<AgentTaskChangedEventArgs>? TaskChanged;
 
     public AgentTaskState? CurrentTask
     {
-        get
-        {
-            lock (_sync)
-            {
-                return _currentTask;
-            }
-        }
+        get { lock (_sync) return _currentTask; }
     }
 
     public ImmutableArray<AgentTaskState> History
     {
-        get
-        {
-            lock (_sync)
-            {
-                return _history;
-            }
-        }
+        get { lock (_sync) return _history; }
     }
 
     public AgentTaskState StartTask(
@@ -51,931 +33,212 @@ public sealed class AiAgentOrchestrator
         Guid sourceSequenceId,
         string userRequest,
         Guid? conversationId = null,
-        long? sourceSequenceRevision = null)
+        long? sourceSequenceRevision = null,
+        ImmutableArray<Guid> targetSourceIds = default)
     {
-        if (projectId == Guid.Empty)
-        {
-            throw new ArgumentException("Project id cannot be empty.", nameof(projectId));
-        }
-
-        if (sourceSequenceId == Guid.Empty)
-        {
-            throw new ArgumentException("Source sequence id cannot be empty.", nameof(sourceSequenceId));
-        }
-
-        if (string.IsNullOrWhiteSpace(userRequest))
-        {
-            throw new ArgumentException("User request cannot be empty.", nameof(userRequest));
-        }
+        if (projectId == Guid.Empty) throw new ArgumentException("Project id cannot be empty.", nameof(projectId));
+        if (sourceSequenceId == Guid.Empty) throw new ArgumentException("Sequence id cannot be empty.", nameof(sourceSequenceId));
+        if (string.IsNullOrWhiteSpace(userRequest)) throw new ArgumentException("Request cannot be empty.", nameof(userRequest));
 
         AgentTaskState created;
-
         lock (_sync)
         {
             if (_currentTask is { IsTerminal: false })
-            {
-                throw new AgentTaskTransitionException(
-                    "Only one AI agent task can be active at a time.");
-            }
-
-            ArchiveTerminalTaskLocked();
-
+                throw new AgentTaskTransitionException("Only one Kadr AI Editor task can be active.");
+            ArchiveTerminalLocked();
             var now = _utcNow();
-            created = new AgentTaskState(
-                Guid.NewGuid(),
-                projectId,
-                sourceSequenceId,
-                conversationId,
-                userRequest.Trim(),
-                AgentTaskPhase.Understanding,
-                null,
-                null,
-                ImmutableArray<AgentQuestion>.Empty,
-                ImmutableArray<AgentJournalEntry>.Empty,
-                null,
-                null,
-                null,
-                now,
-                now,
-                sourceSequenceRevision);
-
-            created = AppendJournal(
-                created,
-                AgentJournalKind.TaskStarted,
-                "Agent task started.",
-                now);
-
+            created = Append(new AgentTaskState(
+                Guid.NewGuid(), projectId, sourceSequenceId, conversationId,
+                userRequest.Trim(), AgentTaskPhase.Indexing, null, null, null,
+                now, now, sourceSequenceRevision,
+                TargetSourceIds: targetSourceIds.IsDefault ? [] : targetSourceIds.Distinct().ToImmutableArray()),
+                AgentJournalKind.TaskStarted, "Kadr AI Editor task started.", now);
             _currentTask = created;
         }
-
         Publish(created);
         return created;
-    }
-
-    public AgentTaskState BeginInvestigation(
-        string? note = null,
-        long? sourceSequenceRevision = null)
-    {
-        return Mutate(current =>
-        {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Planning,
-                AgentTaskPhase.WaitingForApproval,
-                AgentTaskPhase.Approved);
-
-            var now = _utcNow();
-            var plan = current.Plan;
-
-            // If an already approved task needs more investigation, approval is no longer valid.
-            if (plan?.ApprovedAt is not null)
-            {
-                plan = plan with
-                {
-                    ApprovedAt = null,
-                    UpdatedAt = now
-                };
-            }
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Investigating,
-                ResumePhase = null,
-                Plan = plan,
-                SourceSequenceRevision = sourceSequenceRevision ?? current.SourceSequenceRevision,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.PhaseChanged,
-                string.IsNullOrWhiteSpace(note)
-                    ? "Agent started investigating the task."
-                    : note.Trim(),
-                now);
-        });
     }
 
     public AgentTaskState RestoreTask(AgentTaskState state)
     {
         ArgumentNullException.ThrowIfNull(state);
-        if (state.Id == Guid.Empty || state.ProjectId == Guid.Empty ||
-            state.SourceSequenceId == Guid.Empty || string.IsNullOrWhiteSpace(state.UserRequest))
-        {
-            throw new ArgumentException("Persisted agent task is invalid.", nameof(state));
-        }
-
-        AgentTaskState restored;
+        if (state.Id == Guid.Empty || state.ProjectId == Guid.Empty || state.SourceSequenceId == Guid.Empty ||
+            string.IsNullOrWhiteSpace(state.UserRequest))
+            throw new ArgumentException("Persisted task is invalid.", nameof(state));
         lock (_sync)
         {
             if (_currentTask is { IsTerminal: false })
+                throw new AgentTaskTransitionException("Stop the active task before recovery.");
+            ArchiveTerminalLocked();
+            _currentTask = state with
             {
-                throw new AgentTaskTransitionException(
-                    "An active agent task must be stopped before restoring another task.");
-            }
-
-            ArchiveTerminalTaskLocked();
-            restored = state with
-            {
-                Questions = state.Questions.IsDefault ? [] : state.Questions,
-                Journal = state.Journal.IsDefault ? [] : state.Journal,
-                EvidenceLedger = state.Evidence
+                Journal = state.SafeJournal,
+                Checkpoint = state.Checkpoint?.Normalize(),
+                TargetSourceIds = state.SafeTargetSourceIds
             };
-            _currentTask = restored;
         }
-
-        Publish(restored);
-        return restored;
+        Publish(CurrentTask!);
+        return CurrentTask!;
     }
 
-    public AgentTaskState SetTaskBrief(AgentTaskBrief brief)
+    public AgentTaskState BeginEditorialStage(AgentTaskPhase stage, string? note = null)
     {
-        ArgumentNullException.ThrowIfNull(brief);
-        if (string.IsNullOrWhiteSpace(brief.Goal) || string.IsNullOrWhiteSpace(brief.Scope))
-        {
-            throw new ArgumentException(
-                "Task brief must contain a goal and scope.",
-                nameof(brief));
-        }
-
+        if (stage is not (AgentTaskPhase.Indexing or AgentTaskPhase.Directing or AgentTaskPhase.Retrieving or
+            AgentTaskPhase.RoughCut or AgentTaskPhase.BoundaryRefining or AgentTaskPhase.Compiling or
+            AgentTaskPhase.Verifying))
+            throw new ArgumentOutOfRangeException(nameof(stage));
         return Mutate(current =>
         {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Investigating,
-                AgentTaskPhase.Planning,
-                AgentTaskPhase.WaitingForUserInput);
-
+            EnsureActive(current);
             var now = _utcNow();
-            return AppendJournal(
-                current with { Brief = brief, UpdatedAt = now },
-                AgentJournalKind.Progress,
-                "Agent updated its structured understanding of the task.",
-                now);
-        });
-    }
-
-    public AgentTaskState ReplaceEvidenceLedger(
-        IEnumerable<AgentEvidenceRecord> evidence)
-    {
-        ArgumentNullException.ThrowIfNull(evidence);
-        var normalized = evidence
-            .OrderBy(item => item.Sequence)
-            .ToImmutableArray();
-
-        return Mutate(current => current with
-        {
-            EvidenceLedger = normalized,
-            UpdatedAt = _utcNow()
-        });
-    }
-
-    public AgentTaskState BeginPlanning(string? note = null)
-    {
-        return Mutate(current =>
-        {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Investigating);
-
-            EnsureNoOpenQuestion(current);
-
-            var now = _utcNow();
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Planning,
-                ResumePhase = null,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
+            return Append(current with { Phase = stage, UpdatedAt = now },
                 AgentJournalKind.PhaseChanged,
-                string.IsNullOrWhiteSpace(note)
-                    ? "Agent started preparing a plan."
-                    : note.Trim(),
-                now);
+                string.IsNullOrWhiteSpace(note) ? $"Entered {stage}." : note.Trim(), now);
         });
     }
 
-    public AgentTaskState AskQuestion(string prompt, string? context = null)
-        => AskQuestions([
-            new AgentQuestion(
-                Guid.NewGuid(),
-                prompt,
-                context,
-                _utcNow())
-        ]);
-
-    public AgentTaskState AskQuestions(IEnumerable<AgentQuestion> questions)
+    public AgentTaskState SaveCheckpoint(EditorialTaskCheckpoint checkpoint)
     {
-        ArgumentNullException.ThrowIfNull(questions);
-        var requested = questions.ToArray();
-        if (requested.Length is < 1 or > 3)
-        {
-            throw new ArgumentException(
-                "A clarification batch must contain between one and three questions.",
-                nameof(questions));
-        }
-
-        if (requested.Any(question => string.IsNullOrWhiteSpace(question.Prompt)))
-        {
-            throw new ArgumentException("Question cannot be empty.", nameof(questions));
-        }
-
+        ArgumentNullException.ThrowIfNull(checkpoint);
         return Mutate(current =>
         {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Investigating,
-                AgentTaskPhase.Planning,
-                AgentTaskPhase.WaitingForApproval,
-                AgentTaskPhase.Approved,
-                AgentTaskPhase.Executing,
-                AgentTaskPhase.Verifying);
-
-            EnsureNoOpenQuestion(current);
-
+            EnsureActive(current);
+            var normalized = checkpoint.Normalize();
             var now = _utcNow();
-            var batch = requested.Select(question => question with
-            {
-                Id = question.Id == Guid.Empty ? Guid.NewGuid() : question.Id,
-                Prompt = question.Prompt.Trim(),
-                Context = string.IsNullOrWhiteSpace(question.Context)
-                    ? null
-                    : question.Context.Trim(),
-                AskedAt = now,
-                AnsweredAt = null,
-                Answer = null,
-                Options = question.AvailableOptions
-            }).ToImmutableArray();
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.WaitingForUserInput,
-                ResumePhase = current.Phase,
-                Questions = current.Questions.AddRange(batch),
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.QuestionAsked,
-                batch.Length == 1
-                    ? batch[0].Prompt
-                    : $"Agent asked {batch.Length} blocking clarification questions.",
-                now);
-        });
-    }
-
-    public AgentTaskState AnswerQuestion(Guid questionId, string answer)
-    {
-        if (questionId == Guid.Empty)
-        {
-            throw new ArgumentException("Question id cannot be empty.", nameof(questionId));
-        }
-
-        if (string.IsNullOrWhiteSpace(answer))
-        {
-            throw new ArgumentException("Answer cannot be empty.", nameof(answer));
-        }
-
-        return Mutate(current =>
-        {
-            RequirePhase(current, AgentTaskPhase.WaitingForUserInput);
-
-            var index = FindQuestionIndex(current.Questions, questionId);
-            if (index < 0)
-            {
-                throw new AgentTaskTransitionException(
-                    $"Question '{questionId}' does not belong to the active task.");
-            }
-
-            var question = current.Questions[index];
-            if (question.IsAnswered)
-            {
-                throw new AgentTaskTransitionException(
-                    $"Question '{questionId}' has already been answered.");
-            }
-
-            var now = _utcNow();
-            var answered = question with
-            {
-                Answer = answer.Trim(),
-                AnsweredAt = now
-            };
-
-            var questions = current.Questions.SetItem(index, answered);
-            var hasOpenQuestions = questions.Any(item => !item.IsAnswered);
-            var resumePhase = current.ResumePhase ?? AgentTaskPhase.Investigating;
-
-            var updated = current with
-            {
-                Phase = hasOpenQuestions
-                    ? AgentTaskPhase.WaitingForUserInput
-                    : resumePhase,
-                ResumePhase = hasOpenQuestions ? current.ResumePhase : null,
-                Questions = questions,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.QuestionAnswered,
-                $"Question answered: {question.Prompt}",
-                now);
-        });
-    }
-
-    public AgentTaskState PublishPlan(AgentPlanDraft draft)
-    {
-        ArgumentNullException.ThrowIfNull(draft);
-        ValidatePlanDraft(draft);
-
-        return Mutate(current =>
-        {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Investigating,
-                AgentTaskPhase.Planning);
-
-            EnsureNoOpenQuestion(current);
-
-            var now = _utcNow();
-            var plan = CreatePlan(draft, now);
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.WaitingForApproval,
-                ResumePhase = null,
-                Plan = plan,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.PlanPublished,
-                $"Plan v{plan.Version} is ready for approval.",
-                now);
-        });
-    }
-
-    public AgentTaskState RevisePlan(
-        AgentPlanDraft draft,
-        AgentPlanRevisionSource source,
-        string? revisionNote = null)
-    {
-        ArgumentNullException.ThrowIfNull(draft);
-        ValidatePlanDraft(draft);
-
-        return Mutate(current =>
-        {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Planning,
-                AgentTaskPhase.WaitingForApproval,
-                AgentTaskPhase.Approved);
-
-            if (current.Plan is null)
-            {
-                throw new AgentTaskTransitionException(
-                    "A plan must exist before it can be revised.");
-            }
-
-            EnsureNoOpenQuestion(current);
-
-            var now = _utcNow();
-            var plan = ReviseExistingPlan(current.Plan, draft, source, now);
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.WaitingForApproval,
-                ResumePhase = null,
-                Plan = plan,
-                UpdatedAt = now
-            };
-
-            var message = string.IsNullOrWhiteSpace(revisionNote)
-                ? $"Plan revised to v{plan.Version} by {source}."
-                : $"Plan revised to v{plan.Version} by {source}: {revisionNote.Trim()}";
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.PlanRevised,
-                message,
-                now);
-        });
-    }
-
-    public AgentTaskState ApprovePlan()
-    {
-        return Mutate(current =>
-        {
-            RequirePhase(current, AgentTaskPhase.WaitingForApproval);
-            EnsureNoOpenQuestion(current);
-
-            if (current.Plan is null)
-            {
-                throw new AgentTaskTransitionException(
-                    "There is no plan to approve.");
-            }
-
-            var now = _utcNow();
-            var plan = current.Plan with
-            {
-                ApprovedAt = now,
-                UpdatedAt = now
-            };
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Approved,
-                Plan = plan,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.PlanApproved,
-                $"Plan v{plan.Version} approved.",
-                now);
-        });
-    }
-
-    public AgentTaskState BeginExecution(Guid draftSequenceId)
-    {
-        if (draftSequenceId == Guid.Empty)
-        {
-            throw new ArgumentException(
-                "Draft sequence id cannot be empty.",
-                nameof(draftSequenceId));
-        }
-
-        return Mutate(current =>
-        {
-            RequirePhase(current, AgentTaskPhase.Approved);
-            EnsureNoOpenQuestion(current);
-
-            if (current.Plan?.ApprovedAt is null)
-            {
-                throw new AgentTaskTransitionException(
-                    "Execution requires an approved plan.");
-            }
-
-            if (draftSequenceId == current.SourceSequenceId)
-            {
-                throw new AgentTaskTransitionException(
-                    "The agent must execute on a draft sequence, not on the source sequence.");
-            }
-
-            var now = _utcNow();
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Executing,
-                DraftSequenceId = draftSequenceId,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.ExecutionStarted,
-                "Agent execution started on a separate draft sequence.",
-                now);
+            return Append(current with { Checkpoint = normalized, UpdatedAt = now },
+                AgentJournalKind.CheckpointSaved, $"Checkpoint saved for {normalized.Stage}.", now);
         });
     }
 
     public AgentTaskState RecordProgress(string message)
     {
-        if (string.IsNullOrWhiteSpace(message))
-        {
-            throw new ArgumentException(
-                "Progress message cannot be empty.",
-                nameof(message));
-        }
-
+        if (string.IsNullOrWhiteSpace(message)) throw new ArgumentException("Progress cannot be empty.", nameof(message));
         return Mutate(current =>
         {
-            if (current.IsTerminal)
-            {
-                throw new AgentTaskTransitionException(
-                    "A terminal agent task cannot record progress.");
-            }
-
+            EnsureActive(current);
             var now = _utcNow();
-            var updated = current with { UpdatedAt = now };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.Progress,
-                message.Trim(),
-                now);
+            return Append(current with { UpdatedAt = now }, AgentJournalKind.Progress, message.Trim(), now);
         });
     }
 
-    public AgentTaskState BeginVerification(string? note = null)
+    public AgentTaskState ReadyForCompiledDraftReview(Guid draftSequenceId, string summary)
     {
+        if (draftSequenceId == Guid.Empty) throw new ArgumentException("Draft id cannot be empty.", nameof(draftSequenceId));
+        if (string.IsNullOrWhiteSpace(summary)) throw new ArgumentException("Summary cannot be empty.", nameof(summary));
         return Mutate(current =>
         {
-            RequirePhase(current, AgentTaskPhase.Executing);
-            EnsureNoOpenQuestion(current);
-
+            EnsureActive(current);
+            if (draftSequenceId == current.SourceSequenceId)
+                throw new AgentTaskTransitionException("Agent Draft cannot replace the source sequence.");
             var now = _utcNow();
-            var updated = current with
+            return Append(current with
             {
-                Phase = AgentTaskPhase.Verifying,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.VerificationStarted,
-                string.IsNullOrWhiteSpace(note)
-                    ? "Agent started verifying the draft."
-                    : note.Trim(),
-                now);
-        });
-    }
-
-    public AgentTaskState Complete(string summary)
-    {
-        if (string.IsNullOrWhiteSpace(summary))
-        {
-            throw new ArgumentException(
-                "Completion summary cannot be empty.",
-                nameof(summary));
-        }
-
-        return Mutate(current =>
-        {
-            RequirePhase(current, AgentTaskPhase.Verifying);
-            EnsureNoOpenQuestion(current);
-
-            var now = _utcNow();
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Completed,
+                Phase = AgentTaskPhase.ReviewingDraft,
+                DraftSequenceId = draftSequenceId,
                 CompletionSummary = summary.Trim(),
+                RevisionFeedback = string.Empty,
                 UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.TaskCompleted,
-                summary.Trim(),
-                now);
+            }, AgentJournalKind.DraftReviewReady, summary.Trim(), now);
         });
     }
 
-    public AgentTaskState CompleteReadOnly(string summary)
+    public AgentTaskState AcceptDraft() => Mutate(current =>
     {
-        if (string.IsNullOrWhiteSpace(summary))
-        {
-            throw new ArgumentException("Completion summary cannot be empty.", nameof(summary));
-        }
+        Require(current, AgentTaskPhase.ReviewingDraft);
+        var now = _utcNow();
+        return Append(current with { Phase = AgentTaskPhase.Accepted, UpdatedAt = now },
+            AgentJournalKind.DraftAccepted, "User accepted the Agent Draft.", now);
+    });
 
+    public AgentTaskState DiscardDraft() => Mutate(current =>
+    {
+        Require(current, AgentTaskPhase.ReviewingDraft);
+        var now = _utcNow();
+        return Append(current with { Phase = AgentTaskPhase.Discarded, UpdatedAt = now },
+            AgentJournalKind.DraftDiscarded, "User discarded the Agent Draft.", now);
+    });
+
+    public AgentTaskState ReviseDraft(string feedback)
+    {
+        if (string.IsNullOrWhiteSpace(feedback)) throw new ArgumentException("Feedback cannot be empty.", nameof(feedback));
         return Mutate(current =>
         {
-            RequirePhase(
-                current,
-                AgentTaskPhase.Understanding,
-                AgentTaskPhase.Investigating,
-                AgentTaskPhase.Planning);
-            EnsureNoOpenQuestion(current);
-            if (current.Brief?.Kind != AgentTaskKind.ReadOnly ||
-                current.DraftSequenceId is not null)
-            {
-                throw new AgentTaskTransitionException(
-                    "Only a read-only task without an Agent Draft can complete without an approved plan.");
-            }
-
+            Require(current, AgentTaskPhase.ReviewingDraft);
             var now = _utcNow();
-            return AppendJournal(
-                current with
-                {
-                    Phase = AgentTaskPhase.Completed,
-                    CompletionSummary = summary.Trim(),
-                    UpdatedAt = now
-                },
-                AgentJournalKind.TaskCompleted,
-                summary.Trim(),
-                now);
+            return Append(current with
+            {
+                Phase = AgentTaskPhase.Directing,
+                DraftSequenceId = null,
+                CompletionSummary = null,
+                RevisionFeedback = feedback.Trim(),
+                UpdatedAt = now
+            }, AgentJournalKind.PhaseChanged, "A revised Draft was requested.", now);
         });
     }
 
     public AgentTaskState Fail(string error)
     {
-        if (string.IsNullOrWhiteSpace(error))
-        {
-            throw new ArgumentException(
-                "Failure message cannot be empty.",
-                nameof(error));
-        }
-
+        if (string.IsNullOrWhiteSpace(error)) throw new ArgumentException("Error cannot be empty.", nameof(error));
         return Mutate(current =>
         {
-            if (current.IsTerminal)
-            {
-                throw new AgentTaskTransitionException(
-                    "The active task is already terminal.");
-            }
-
+            EnsureActive(current);
             var now = _utcNow();
-            var updated = current with
+            return Append(current with
             {
                 Phase = AgentTaskPhase.Failed,
-                ResumePhase = null,
                 FailureMessage = error.Trim(),
                 UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.TaskFailed,
-                error.Trim(),
-                now);
+            }, AgentJournalKind.TaskFailed, error.Trim(), now);
         });
     }
 
-    public AgentTaskState RetryFailedPlanning()
+    public AgentTaskState Cancel(string? reason = null) => Mutate(current =>
     {
-        return Mutate(current =>
-        {
-            RequirePhase(current, AgentTaskPhase.Failed);
-            if (current.DraftSequenceId is not null)
-            {
-                throw new AgentTaskTransitionException(
-                    "A failed task with an Agent Draft cannot be retried automatically. Review or delete the preserved draft first.");
-            }
-
-            var now = _utcNow();
-            var phase = current.Brief is null
-                ? AgentTaskPhase.Understanding
-                : AgentTaskPhase.Investigating;
-            return AppendJournal(
-                current with
-                {
-                    Phase = phase,
-                    ResumePhase = null,
-                    FailureMessage = null,
-                    UpdatedAt = now
-                },
-                AgentJournalKind.Progress,
-                "Failed planning inference is being retried without creating an Agent Draft.",
-                now);
-        });
-    }
-
-    public AgentTaskState Stop(string? reason = null)
-    {
-        return Mutate(current =>
-        {
-            if (current.IsTerminal)
-            {
-                throw new AgentTaskTransitionException(
-                    "The active task is already terminal.");
-            }
-
-            var now = _utcNow();
-            var message = string.IsNullOrWhiteSpace(reason)
-                ? "Agent task stopped by user."
-                : reason.Trim();
-
-            var updated = current with
-            {
-                Phase = AgentTaskPhase.Stopped,
-                ResumePhase = null,
-                UpdatedAt = now
-            };
-
-            return AppendJournal(
-                updated,
-                AgentJournalKind.TaskStopped,
-                message,
-                now);
-        });
-    }
+        EnsureActive(current);
+        var now = _utcNow();
+        var message = string.IsNullOrWhiteSpace(reason) ? "Task cancelled by user." : reason.Trim();
+        return Append(current with { Phase = AgentTaskPhase.Cancelled, UpdatedAt = now },
+            AgentJournalKind.TaskCancelled, message, now);
+    });
 
     private AgentTaskState Mutate(Func<AgentTaskState, AgentTaskState> mutation)
     {
-        ArgumentNullException.ThrowIfNull(mutation);
-
         AgentTaskState updated;
-
         lock (_sync)
         {
-            var current = _currentTask
-                ?? throw new AgentTaskTransitionException(
-                    "There is no active AI agent task.");
-
+            var current = _currentTask ?? throw new AgentTaskTransitionException("There is no active task.");
             updated = mutation(current);
             _currentTask = updated;
         }
-
         Publish(updated);
         return updated;
     }
 
-    private void ArchiveTerminalTaskLocked()
+    private void ArchiveTerminalLocked()
     {
-        if (_currentTask is null)
-        {
-            return;
-        }
-
-        if (!_currentTask.IsTerminal)
-        {
-            throw new AgentTaskTransitionException(
-                "Only a terminal task can be archived.");
-        }
-
+        if (_currentTask is null) return;
+        if (!_currentTask.IsTerminal) throw new AgentTaskTransitionException("Only a terminal task can be archived.");
         _history = _history.Add(_currentTask);
         _currentTask = null;
     }
 
-    private void Publish(AgentTaskState state)
+    private static void EnsureActive(AgentTaskState state)
     {
-        TaskChanged?.Invoke(this, new AgentTaskChangedEventArgs(state));
+        if (state.IsTerminal) throw new AgentTaskTransitionException("The task is already terminal.");
     }
 
-    private static AgentTaskState AppendJournal(
-        AgentTaskState state,
-        AgentJournalKind kind,
-        string message,
-        DateTimeOffset now)
+    private static void Require(AgentTaskState state, AgentTaskPhase phase)
     {
-        var entry = new AgentJournalEntry(
-            Guid.NewGuid(),
-            now,
-            kind,
-            message);
+        if (state.Phase != phase)
+            throw new AgentTaskTransitionException($"Operation is not allowed in phase '{state.Phase}'.");
+    }
 
-        return state with
+    private static AgentTaskState Append(AgentTaskState state, AgentJournalKind kind, string message, DateTimeOffset now)
+        => state with
         {
-            Journal = state.Journal.Add(entry),
+            Journal = state.SafeJournal.Add(new AgentJournalEntry(Guid.NewGuid(), now, kind, message)),
             UpdatedAt = now
         };
-    }
 
-    private static void RequirePhase(
-        AgentTaskState state,
-        params AgentTaskPhase[] allowed)
-    {
-        if (allowed.Contains(state.Phase))
-        {
-            return;
-        }
-
-        throw new AgentTaskTransitionException(
-            $"Operation is not allowed while agent task is in phase '{state.Phase}'.");
-    }
-
-    private static void EnsureNoOpenQuestion(AgentTaskState state)
-    {
-        if (state.HasOpenQuestion)
-        {
-            throw new AgentTaskTransitionException(
-                "The active user question must be answered before continuing.");
-        }
-    }
-
-    private static int FindQuestionIndex(
-        ImmutableArray<AgentQuestion> questions,
-        Guid questionId)
-    {
-        for (var index = 0; index < questions.Length; index++)
-        {
-            if (questions[index].Id == questionId)
-            {
-                return index;
-            }
-        }
-
-        return -1;
-    }
-
-    private static void ValidatePlanDraft(AgentPlanDraft draft)
-    {
-        if (string.IsNullOrWhiteSpace(draft.Objective))
-        {
-            throw new ArgumentException(
-                "Plan objective cannot be empty.",
-                nameof(draft));
-        }
-
-        if (string.IsNullOrWhiteSpace(draft.Summary))
-        {
-            throw new ArgumentException(
-                "Plan summary cannot be empty.",
-                nameof(draft));
-        }
-
-        if (draft.Steps.IsDefaultOrEmpty)
-        {
-            throw new ArgumentException(
-                "Plan must contain at least one step.",
-                nameof(draft));
-        }
-
-        if (draft.Steps.Any(step =>
-                string.IsNullOrWhiteSpace(step.Title) ||
-                string.IsNullOrWhiteSpace(step.Description)))
-        {
-            throw new ArgumentException(
-                "Every plan step must have a title and description.",
-                nameof(draft));
-        }
-
-        if (!draft.Constraints.IsDefault &&
-            draft.Constraints.Any(string.IsNullOrWhiteSpace))
-        {
-            throw new ArgumentException(
-                "Plan constraints cannot contain empty values.",
-                nameof(draft));
-        }
-    }
-
-    private static AgentPlan CreatePlan(
-        AgentPlanDraft draft,
-        DateTimeOffset now)
-    {
-        return new AgentPlan(
-            Guid.NewGuid(),
-            1,
-            draft.Objective.Trim(),
-            draft.Summary.Trim(),
-            NormalizeConstraints(draft.Constraints),
-            BuildSteps(draft.Steps),
-            now,
-            now,
-            null,
-            AgentPlanRevisionSource.Agent);
-    }
-
-    private static AgentPlan ReviseExistingPlan(
-        AgentPlan existing,
-        AgentPlanDraft draft,
-        AgentPlanRevisionSource source,
-        DateTimeOffset now)
-    {
-        return existing with
-        {
-            Version = checked(existing.Version + 1),
-            Objective = draft.Objective.Trim(),
-            Summary = draft.Summary.Trim(),
-            Constraints = NormalizeConstraints(draft.Constraints),
-            Steps = BuildSteps(draft.Steps),
-            UpdatedAt = now,
-            ApprovedAt = null,
-            LastRevisionSource = source
-        };
-    }
-
-    private static ImmutableArray<string> NormalizeConstraints(
-        ImmutableArray<string> constraints)
-    {
-        if (constraints.IsDefaultOrEmpty)
-        {
-            return ImmutableArray<string>.Empty;
-        }
-
-        return constraints
-            .Select(value => value.Trim())
-            .ToImmutableArray();
-    }
-
-    private static ImmutableArray<AgentPlanStep> BuildSteps(
-        ImmutableArray<AgentPlanStepDraft> drafts)
-    {
-        var builder = ImmutableArray.CreateBuilder<AgentPlanStep>(drafts.Length);
-
-        for (var index = 0; index < drafts.Length; index++)
-        {
-            var draft = drafts[index];
-            builder.Add(new AgentPlanStep(
-                Guid.NewGuid(),
-                index + 1,
-                draft.Title.Trim(),
-                draft.Description.Trim(),
-                string.IsNullOrWhiteSpace(draft.ExpectedEditingTool)
-                    ? null
-                    : draft.ExpectedEditingTool.Trim(),
-                draft.EvidenceObservationSequences.IsDefault
-                    ? ImmutableArray<int>.Empty
-                    : draft.EvidenceObservationSequences.Distinct().ToImmutableArray(),
-                draft.ExpectedEditingArguments is { ValueKind: JsonValueKind.Object } arguments
-                    ? AgentActionApproval.NormalizeArguments(arguments)
-                    : null,
-                draft.EvidenceRequirement,
-                draft.ExpectedEffect.Trim(),
-                NormalizeConstraints(draft.ProtectedInvariants),
-                NormalizeConstraints(draft.VerificationChecks)));
-        }
-
-        return builder.MoveToImmutable();
-    }
+    private void Publish(AgentTaskState state) => TaskChanged?.Invoke(this, new AgentTaskChangedEventArgs(state));
 }

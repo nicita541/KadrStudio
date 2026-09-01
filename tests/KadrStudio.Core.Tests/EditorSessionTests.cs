@@ -188,6 +188,43 @@ public sealed class EditorSessionTests
     }
 
     [Fact]
+    public void Ripple_delete_preserves_transition_attached_to_the_right_half_of_a_split_clip()
+    {
+        var project = ProjectState.CreateNew("transition ripple", FrameRate.Fps24);
+        var track = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var source = new MediaSource(
+            Guid.NewGuid(), "C:\\media\\transition.mp4", "transition", MediaKind.Video,
+            TimelineTime.FromSeconds(30), false, 1920, 1080, FrameRate.Fps24);
+        var spanning = new MediaClip(
+            Guid.NewGuid(), source.Id, track.Id, TimelineTime.Zero, TimelineTime.Zero,
+            TimelineTime.FromSeconds(20), Video: new VideoParameters(), StreamIndex: 0);
+        var following = new MediaClip(
+            Guid.NewGuid(), source.Id, track.Id, TimelineTime.FromSeconds(20),
+            TimelineTime.FromSeconds(20), TimelineTime.FromSeconds(10),
+            Video: new VideoParameters(), StreamIndex: 0);
+        var transition = new TimelineTransition(
+            Guid.NewGuid(), TransitionKind.CrossDissolve, track.Id,
+            spanning.Id, following.Id, TimelineTime.FromSeconds(19), TimelineTime.FromSeconds(2));
+        var session = new EditorSession(project with
+        {
+            Sources = project.Sources.Add(source.Id, source),
+            MediaClips = [spanning, following],
+            Transitions = [transition]
+        });
+
+        session.Execute(new EditTransaction("ripple inside first clip",
+            new RippleDeleteRangeCommand(new TimeRange(
+                TimelineTime.FromSeconds(5), TimelineTime.FromSeconds(5)))));
+
+        var preserved = Assert.Single(session.State.Transitions);
+        var rightHalf = session.State.MediaClips.Single(item =>
+            item.SourceIn == TimelineTime.FromSeconds(10) && item.End == TimelineTime.FromSeconds(15));
+        Assert.Equal(rightHalf.Id, preserved.FromClipId);
+        Assert.Equal(following.Id, preserved.ToClipId);
+        Assert.Equal(TimelineTime.FromSeconds(14), preserved.Start);
+    }
+
+    [Fact]
     public void Overlapping_clips_are_rejected_by_shared_validator()
     {
         var fixture = CreateLinkedProject();
@@ -375,6 +412,93 @@ public sealed class EditorSessionTests
         Assert.Equal(fixture.Project, session.State);
         Assert.False(session.CanUndo);
         Assert.False(session.CanRedo);
+    }
+
+    [Fact]
+    public void Editing_original_track_marks_upscale_stale_and_excludes_it_from_active_rendition()
+    {
+        var fixture = CreateLinkedProject();
+        var project = fixture.Project.EnsureSequenceContainer();
+        var sequence = project.ActiveSequence!;
+        var enhancedIndex = sequence.Tracks.Where(item => item.Kind == TrackKind.Visual).Max(item => item.Index) + 1;
+        var enhancedTrack = new TimelineTrack(Guid.NewGuid(), TrackKind.Visual, enhancedIndex, "V1 · AnimeSR-X", IsVisible: false);
+        var enhancedSource = fixture.Source with { Id = Guid.NewGuid(), Path = "F:\\media\\episode-animesr.mp4", HasAudio = false };
+        var enhancedClip = fixture.VideoClip with
+        {
+            Id = Guid.NewGuid(), SourceId = enhancedSource.Id, TrackId = enhancedTrack.Id, LinkGroupId = null
+        };
+        var now = DateTimeOffset.UtcNow;
+        var group = new TrackRenditionGroup(
+            Guid.NewGuid(), sequence.Id, fixture.VideoTrack.Id, enhancedTrack.Id, TrackRenditionKind.Original,
+            sequence.Revision, new string('a', 64), "AnimeSR-X", new string('b', 64), UpscaleScaleMode.X2, false, now, now);
+        var session = new EditorSession(project);
+        session.Execute(new EditTransaction("publish", new PublishUpscaleRenditionCommand(
+            [enhancedSource], enhancedTrack, [enhancedClip], group)));
+        session.Execute(new EditTransaction("show enhanced", new SetTrackRenditionCommand(group.Id, TrackRenditionKind.Upscaled)));
+
+        session.Execute(new EditTransaction("move original",
+            new MoveMediaClipCommand(fixture.VideoClip.Id, fixture.VideoTrack.Id, TimelineTime.FromSeconds(3))));
+
+        var stale = Assert.Single(session.State.RenditionGroups);
+        Assert.True(stale.IsStale);
+        Assert.Equal(TrackRenditionKind.Original, stale.ActiveRendition);
+        Assert.True(session.State.FindTrack(fixture.VideoTrack.Id)!.IsVisible);
+        Assert.False(session.State.FindTrack(enhancedTrack.Id)!.IsVisible);
+        Assert.Throws<EditRejectedException>(() => session.Execute(new EditTransaction(
+            "show stale", new SetTrackRenditionCommand(group.Id, TrackRenditionKind.Upscaled))));
+    }
+
+    [Fact]
+    public void Upscale_completion_and_cancellation_update_the_launch_timeline_without_switching_the_open_timeline()
+    {
+        var fixture = CreateLinkedProject();
+        var workspace = fixture.Project.EnsureSequenceContainer();
+        var original = workspace.ActiveSequence!;
+        var montage = original with
+        {
+            Id = Guid.NewGuid(),
+            Name = "Монтаж",
+            Status = SequenceStatus.Draft,
+            ParentSequenceId = original.Id
+        };
+        var project = (workspace with { Sequences = workspace.Sequences.Add(montage) })
+            .ActivateSequence(montage.Id);
+        var session = new EditorSession(project);
+        var now = DateTimeOffset.UtcNow;
+        var cancelledJob = new UpscaleJob(
+            Guid.NewGuid(), original.Id, [fixture.VideoTrack.Id], UpscaleScaleMode.X2,
+            UpscaleJobState.Cancelled, 0, "AnimeSR-X отменён", new string('b', 64), now, now);
+        var enhancedTrack = new TimelineTrack(
+            Guid.NewGuid(), TrackKind.Visual, 2, "V1 · AnimeSR-X", IsVisible: false);
+        var enhancedSource = fixture.Source with
+        {
+            Id = Guid.NewGuid(),
+            Path = "F:\\media\\episode-animesr.mp4",
+            HasAudio = false
+        };
+        var enhancedClip = fixture.VideoClip with
+        {
+            Id = Guid.NewGuid(),
+            SourceId = enhancedSource.Id,
+            TrackId = enhancedTrack.Id,
+            LinkGroupId = null
+        };
+        var group = new TrackRenditionGroup(
+            Guid.NewGuid(), original.Id, fixture.VideoTrack.Id, enhancedTrack.Id,
+            TrackRenditionKind.Original, original.Revision, new string('a', 64),
+            "AnimeSR-X", new string('b', 64), UpscaleScaleMode.X2, false, now, now);
+
+        session.Execute(new EditTransaction("cancel upscale", new UpsertUpscaleJobCommand(cancelledJob)));
+        session.Execute(new EditTransaction("publish upscale", new PublishUpscaleRenditionCommand(
+            [enhancedSource], enhancedTrack, [enhancedClip], group)));
+
+        Assert.Equal(montage.Id, session.State.ActiveSequenceId);
+        Assert.Empty(session.State.UpscaleJobs);
+        Assert.Empty(session.State.RenditionGroups);
+        var updatedOriginal = session.State.FindSequence(original.Id)!;
+        Assert.Equal(cancelledJob, Assert.Single(updatedOriginal.UpscaleJobs));
+        Assert.Equal(group.Id, Assert.Single(updatedOriginal.RenditionGroups).Id);
+        Assert.Contains(updatedOriginal.Tracks, item => item.Id == enhancedTrack.Id);
     }
 
     [Fact]

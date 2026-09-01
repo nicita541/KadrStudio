@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kadr montage-eval case result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "caseId", "profile", "model", "modelHash", "sourcePreserved",
+    "technicalCompleted", "humanUsable", "repeatedGraphWithoutEvidence",
+    "contextOverflow"
+  ],
+  "properties": {
+    "caseId": { "type": "string", "minLength": 1 },
+    "profile": {
+      "enum": [
+        "generic", "film-series", "anime-episode",
+        "talking-head", "podcast", "short-form-highlights"
+      ]
+    },
+    "model": { "type": "string", "minLength": 1 },
+    "modelHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sourcePreserved": { "type": "boolean" },
+    "technicalCompleted": { "type": "boolean" },
+    "humanUsable": { "type": "boolean" },
+    "repeatedGraphWithoutEvidence": { "type": "boolean" },
+    "contextOverflow": { "type": "boolean" },
+    "notes": { "type": "string" },
+    "completedAt": { "type": "string", "format": "date-time" }
+  }
+}

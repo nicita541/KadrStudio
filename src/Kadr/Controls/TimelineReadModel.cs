@@ -1,5 +1,6 @@
 using KadrStudio.Models;
 using KadrStudio.Core.Domain;
+using CoreTrackKind = KadrStudio.Core.Domain.TrackKind;
 
 namespace KadrStudio.Controls;
 
@@ -14,6 +15,14 @@ public sealed class TimelineReadModel
         FrameRateValue = source.FrameRateValue;
         InPoint = source.InPoint;
         OutPoint = source.OutPoint;
+        Tracks = source.Tracks.Select(item => new TimelineTrackReadModel(
+            item.Id,
+            item.Kind,
+            item.Index,
+            item.Name,
+            item.IsMuted,
+            item.IsLocked,
+            item.IsVisible)).ToArray();
         Clips = source.Clips.Select(item => item.Clone()).ToArray();
         TextOverlays = source.TextOverlays.Select(item => item.Clone()).ToArray();
         Markers = source.Markers.Select(item => new Models.TimelineMarker
@@ -52,6 +61,7 @@ public sealed class TimelineReadModel
     public FrameRate FrameRateValue { get; }
     public double? InPoint { get; }
     public double? OutPoint { get; }
+    public IReadOnlyList<TimelineTrackReadModel> Tracks { get; }
     public IReadOnlyList<TimelineClip> Clips { get; }
     public IReadOnlyList<TextOverlay> TextOverlays { get; }
     public IReadOnlyList<Models.TimelineMarker> Markers { get; }
@@ -65,6 +75,9 @@ public sealed class TimelineReadModel
     public int AudioTrackCount => RequiredTrackCount(Models.TrackKind.Audio);
 
     public MediaAsset? FindAsset(Guid id) => Media.FirstOrDefault(item => item.Id == id);
+
+    public TimelineTrackReadModel? FindTrack(CoreTrackKind kind, int index)
+        => Tracks.FirstOrDefault(item => item.Kind == kind && item.Index == index);
 
     public IReadOnlyList<TimelineClip> GetTrackClips(Models.TrackKind kind, int index)
         => Clips.Where(item => item.Track == kind && item.TrackIndex == index)
@@ -84,3 +97,12 @@ public sealed class TimelineReadModel
         return Math.Max(2, highest + 2);
     }
 }
+
+public sealed record TimelineTrackReadModel(
+    Guid Id,
+    CoreTrackKind Kind,
+    int Index,
+    string Name,
+    bool IsMuted,
+    bool IsLocked,
+    bool IsVisible);

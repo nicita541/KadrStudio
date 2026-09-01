@@ -1,0 +1,32 @@
+syntax = "proto3";
+package kadr.worker.v2;
+
+service Worker {
+  rpc RunJob (RunJobRequest) returns (RunJobReply);
+  rpc CountTokens (CountTokensRequest) returns (CountTokensReply);
+}
+
+message RunJobRequest {
+  string job_id = 1;
+  string analyzer = 2;
+  string analyzer_version = 3;
+  repeated string asset_ids = 4;
+  bytes parameters_json = 5;
+  string protocol_version = 6;
+}
+
+message RunJobReply {
+  bool success = 1;
+  string error_code = 2;
+  string error = 3;
+  bytes result_json = 4;
+  repeated string artifact_ids = 5;
+}
+
+message CountTokensRequest {
+  string model = 1;
+  string text = 2;
+  string protocol_version = 3;
+}
+
+message CountTokensReply { int32 token_count = 1; }

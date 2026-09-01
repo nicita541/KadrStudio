@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Runtime.InteropServices;
 using KadrStudio.Application.Preview;
 using KadrStudio.Core.Domain;
 using KadrStudio.Services;
@@ -173,7 +174,12 @@ public sealed class PreviewPresenter : IAsyncDisposable
         {
             if (_bitmap is null || _bitmap.PixelWidth != frame.Width || _bitmap.PixelHeight != frame.Height)
                 _bitmap = new WriteableBitmap(frame.Width, frame.Height, 96, 96, PixelFormats.Bgra32, null);
-            _bitmap.WritePixels(new Int32Rect(0, 0, frame.Width, frame.Height), frame.Bgra.ToArray(), frame.Stride, 0);
+            if (MemoryMarshal.TryGetArray(frame.Bgra, out ArraySegment<byte> pixels) && pixels.Array is not null)
+                _bitmap.WritePixels(
+                    new Int32Rect(0, 0, frame.Width, frame.Height), pixels.Array, frame.Stride, pixels.Offset);
+            else
+                _bitmap.WritePixels(
+                    new Int32Rect(0, 0, frame.Width, frame.Height), frame.Bgra.ToArray(), frame.Stride, 0);
             _image.Source = _bitmap;
             _image.Visibility = Visibility.Visible;
             _emptyState.Visibility = Visibility.Collapsed;

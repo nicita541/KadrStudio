@@ -24,6 +24,16 @@ public sealed class VideoWorkerSupervisor(
     public int ActiveWorkerCount => _workers.Count;
     public int PeakWorkerCount { get; private set; }
     public long StartedWorkerCount { get; private set; }
+    public long FrameSizeBytes { get; private set; }
+    public long FramesProduced { get; private set; }
+    public long FramesDecoded { get; private set; }
+    public long AllocatedBytes { get; private set; }
+    public long CopiedBytes { get; private set; }
+    public TimeSpan DecoderReadTime { get; private set; }
+    public string Decoder { get; private set; } = "ffmpeg-cuda";
+    public string HardwareAcceleration { get; private set; } = "cuda-requested";
+    public string Device { get; private set; } = "CUDA";
+    public string Fallback { get; private set; } = "available-on-decoder-failure";
 
     public async Task RunAsync(
         RenderPlan plan,
@@ -43,6 +53,8 @@ public sealed class VideoWorkerSupervisor(
             var position = start + TimelineTime.FromFrames(frameIndex++, request.FrameRate);
             if (position >= plan.Range.End) break;
             var pixels = await ComposeAsync(plan, request, position, cancellationToken).ConfigureAwait(false);
+            FramesProduced++;
+            FrameSizeBytes = pixels.LongLength;
             await present(new VideoFrame(
                 position, request.Width, request.Height, request.Width * 4,
                 pixels, request.Generation.Video)).ConfigureAwait(false);
@@ -65,11 +77,6 @@ public sealed class VideoWorkerSupervisor(
         TimelineTime position,
         CancellationToken cancellationToken)
     {
-        var frameSize = checked(request.Width * request.Height * 4);
-        var whiteBackground = plan.VideoTransitions.Any(item =>
-            item.Kind == TransitionKind.DipToWhite && item.TimelineRange.Contains(position));
-        var destination = GC.AllocateUninitializedArray<byte>(frameSize);
-        FillBackground(destination, whiteBackground ? (byte)255 : (byte)0);
         var active = plan.VisualLayers
             .Where(layer => IsActive(plan, layer, position))
             .OrderBy(layer => layer.TrackIndex)
@@ -79,6 +86,34 @@ public sealed class VideoWorkerSupervisor(
         var activeIds = active.Select(item => item.ClipId).ToHashSet();
         await RetireInactiveAsync(plan, position, activeIds).ConfigureAwait(false);
 
+        // A single isolated layer is already a complete FFmpeg-composited canvas.
+        // Ask FFmpeg for an opaque background and forward that buffer instead of
+        // allocating and alpha-blending a second full-resolution frame in managed code.
+        if (active.Length == 1 && plan.VisualLayers.Length == 1 && plan.VideoTransitions.Length == 0)
+        {
+            try
+            {
+                var worker = await GetOrCreateAsync(
+                    plan, request, active[0], position, cancellationToken, opaqueOutput: true).ConfigureAwait(false);
+                var decoded = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+                RecordDecodedFrame(worker, decoded);
+                return decoded.Pixels;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                reportFailure?.Invoke(new VideoWorkerException(active[0].ClipId, exception));
+                if (_workers.Remove(active[0].ClipId, out var failed))
+                    await failed.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        var frameSize = checked(request.Width * request.Height * 4);
+        var whiteBackground = plan.VideoTransitions.Any(item =>
+            item.Kind == TransitionKind.DipToWhite && item.TimelineRange.Contains(position));
+        var destination = GC.AllocateUninitializedArray<byte>(frameSize);
+        AllocatedBytes += frameSize;
+        FillBackground(destination, whiteBackground ? (byte)255 : (byte)0);
+
         foreach (var layer in active)
         {
             byte[]? source = null;
@@ -86,7 +121,9 @@ public sealed class VideoWorkerSupervisor(
             {
                 var worker = await GetOrCreateAsync(plan, request, layer, position, cancellationToken)
                     .ConfigureAwait(false);
-                source = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+                var decoded = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+                source = decoded.Pixels;
+                RecordDecodedFrame(worker, decoded);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -94,9 +131,26 @@ public sealed class VideoWorkerSupervisor(
                 if (_workers.Remove(layer.ClipId, out var failed))
                     await failed.DisposeAsync().ConfigureAwait(false);
             }
-            if (source is not null) AlphaComposite(destination, source);
+            if (source is not null)
+            {
+                AlphaComposite(destination, source);
+                CopiedBytes += source.LongLength;
+            }
         }
         return destination;
+    }
+
+    private void RecordDecodedFrame(VideoLayerWorker worker, DecodedFrame decoded)
+    {
+        FramesDecoded++;
+        AllocatedBytes += decoded.Pixels.LongLength;
+        CopiedBytes += decoded.Pixels.LongLength;
+        DecoderReadTime += decoded.ReadTime;
+        if (!worker.FellBackToSoftware) return;
+        Decoder = "ffmpeg-software";
+        HardwareAcceleration = "none";
+        Device = "CPU";
+        Fallback = "cuda-failed-software-active";
     }
 
     private async Task<VideoLayerWorker> GetOrCreateAsync(
@@ -104,7 +158,8 @@ public sealed class VideoWorkerSupervisor(
         PreviewRequest request,
         RenderVisualLayer layer,
         TimelineTime position,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool opaqueOutput = false)
     {
         if (_workers.TryGetValue(layer.ClipId, out var existing)) return existing;
         var range = ActiveRange(plan, layer);
@@ -112,7 +167,7 @@ public sealed class VideoWorkerSupervisor(
         if (end <= position) throw new InvalidOperationException("Visual layer has no remaining decode range.");
         var workerPlan = CreateWorkerPlan(plan, layer, new TimeRange(position, end - position));
         var worker = await VideoLayerWorker.StartAsync(
-            _ffmpegPath, _commands, workerPlan, request, cancellationToken).ConfigureAwait(false);
+            _ffmpegPath, _commands, workerPlan, request, opaqueOutput, cancellationToken).ConfigureAwait(false);
         _workers.Add(layer.ClipId, worker);
         StartedWorkerCount++;
         PeakWorkerCount = Math.Max(PeakWorkerCount, _workers.Count);
@@ -205,30 +260,51 @@ public sealed class VideoWorkerSupervisor(
 
     private sealed class VideoLayerWorker : IAsyncDisposable
     {
-        private readonly Process _process;
+        private Process _process;
         private readonly int _frameSize;
-        private readonly Task<string> _errorOutput;
+        private Task<string> _errorOutput;
+        private readonly string _ffmpegPath;
+        private readonly ExternalRenderCommand _softwareCommand;
+        private bool _usingHardware = true;
         private bool _disposed;
 
-        private VideoLayerWorker(Process process, int frameSize)
+        private VideoLayerWorker(
+            string ffmpegPath,
+            Process process,
+            ExternalRenderCommand softwareCommand,
+            int frameSize)
         {
+            _ffmpegPath = ffmpegPath;
             _process = process;
+            _softwareCommand = softwareCommand;
             _frameSize = frameSize;
             _errorOutput = process.StandardError.ReadToEndAsync();
         }
+
+        public bool FellBackToSoftware { get; private set; }
 
         public static Task<VideoLayerWorker> StartAsync(
             string ffmpegPath,
             FfmpegRenderCommandBuilder commands,
             RenderPlan plan,
             PreviewRequest request,
+            bool opaqueOutput,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var command = commands.Build(plan, new RenderOutputOptions(
+            var options = new RenderOutputOptions(
                 RenderPurpose.FrameServer, "pipe:1", request.Width, request.Height,
                 IncludeVideo: true, IncludeAudio: false, IncludeOverlays: false,
-                TransparentBackground: true));
+                TransparentBackground: !opaqueOutput, UseHardwareDecoding: true);
+            var command = commands.Build(plan, options);
+            var softwareCommand = commands.Build(plan, options with { UseHardwareDecoding = false });
+            var process = StartProcess(ffmpegPath, command);
+            return Task.FromResult(new VideoLayerWorker(
+                ffmpegPath, process, softwareCommand, checked(request.Width * request.Height * 4)));
+        }
+
+        private static Process StartProcess(string ffmpegPath, ExternalRenderCommand command)
+        {
             var info = new ProcessStartInfo
             {
                 FileName = ffmpegPath,
@@ -240,14 +316,29 @@ public sealed class VideoWorkerSupervisor(
             foreach (var argument in command.Arguments) info.ArgumentList.Add(argument);
             var process = new Process { StartInfo = info };
             if (!process.Start()) throw new InvalidOperationException("Visual source decoder did not start.");
-            return Task.FromResult(new VideoLayerWorker(process, checked(request.Width * request.Height * 4)));
+            return process;
         }
 
-        public async Task<byte[]> ReadFrameAsync(CancellationToken cancellationToken)
+        public async Task<DecodedFrame> ReadFrameAsync(CancellationToken cancellationToken)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            try { return await ReadFrameCoreAsync(cancellationToken).ConfigureAwait(false); }
+            catch (EndOfStreamException) when (_usingHardware)
+            {
+                await StopProcessAsync().ConfigureAwait(false);
+                _process = StartProcess(_ffmpegPath, _softwareCommand);
+                _errorOutput = _process.StandardError.ReadToEndAsync();
+                _usingHardware = false;
+                FellBackToSoftware = true;
+                return await ReadFrameCoreAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private async Task<DecodedFrame> ReadFrameCoreAsync(CancellationToken cancellationToken)
+        {
             var bytes = GC.AllocateUninitializedArray<byte>(_frameSize);
             var offset = 0;
+            var started = Stopwatch.GetTimestamp();
             while (offset < bytes.Length)
             {
                 var read = await _process.StandardOutput.BaseStream
@@ -260,18 +351,25 @@ public sealed class VideoWorkerSupervisor(
                 }
                 offset += read;
             }
-            return bytes;
+            return new DecodedFrame(bytes, Stopwatch.GetElapsedTime(started));
+        }
+
+        private async Task StopProcessAsync()
+        {
+            try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); } catch { }
+            try { await _process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
+            _process.Dispose();
         }
 
         public async ValueTask DisposeAsync()
         {
             if (_disposed) return;
             _disposed = true;
-            try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); } catch { }
-            try { await _process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { }
-            _process.Dispose();
+            await StopProcessAsync().ConfigureAwait(false);
         }
     }
+
+    private sealed record DecodedFrame(byte[] Pixels, TimeSpan ReadTime);
 }
 
 public sealed class VideoWorkerException(Guid clipId, Exception innerException)

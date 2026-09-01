@@ -97,7 +97,27 @@ public sealed record MediaHostDiagnostics(
     int PeakVideoWorkers,
     int PeakAudioWorkers,
     long StartedVideoWorkers,
-    long StartedAudioWorkers);
+    long StartedAudioWorkers,
+    long FrameSizeBytes = 0,
+    long FramesProduced = 0,
+    long FramesPresented = 0,
+    long FramesDropped = 0,
+    long CopiedBytes = 0,
+    double CopiedBytesPerSecond = 0,
+    long AllocatedBytes = 0,
+    double PipeWriteTimeMs = 0,
+    double PipeReadTimeMs = 0,
+    int QueueDepth = 0,
+    double ProducerWaitTimeMs = 0,
+    double DecoderReadTimeMs = 0,
+    double DecodeFramesPerSecond = 0,
+    int Gen0Collections = 0,
+    int Gen1Collections = 0,
+    int Gen2Collections = 0,
+    string Decoder = "ffmpeg-software",
+    string HardwareAcceleration = "none",
+    string Device = "CPU",
+    string Fallback = "not-attempted");
 
 public static class MediaHostPacketIO
 {

@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using KadrStudio.Application.Automation.Editorial;
 
 namespace KadrStudio.Services.Editorial;
@@ -30,11 +31,17 @@ public sealed class AiServerV2Client(
         CancellationToken cancellationToken)
     {
         if (!File.Exists(path)) throw new FileNotFoundException("Analysis proxy was not found.", path);
+        var uploadStarted = Stopwatch.GetTimestamp();
+        var requestCount = 1L;
+        var transferredBytes = 0L;
         var info = new FileInfo(path);
         string hash;
+        var hashStarted = Stopwatch.GetTimestamp();
         await using (var hashInput = File.OpenRead(path))
             hash = Convert.ToHexString(await SHA256.HashDataAsync(hashInput, cancellationToken).ConfigureAwait(false))
                 .ToLowerInvariant();
+        RecordTransport("asset_hash_duration_ms", Stopwatch.GetElapsedTime(hashStarted).TotalMilliseconds,
+            ("media_type", mediaType));
         const int chunkBytes = 8 * 1024 * 1024;
         await using var input = new FileStream(
             path, FileMode.Open, FileAccess.Read, FileShare.Read,
@@ -54,6 +61,7 @@ public sealed class AiServerV2Client(
                     if (status.ReceivedBytes != info.Length)
                         throw new InvalidDataException("AI server asset length differs from the local content hash input.");
                     progress?.Report(1);
+                    RecordUploadMetrics(info.Length, transferredBytes, requestCount, uploadStarted, cacheHit: true, mediaType);
                     return hash;
                 }
                 offset = status.ReceivedBytes;
@@ -77,10 +85,13 @@ public sealed class AiServerV2Client(
             content.Headers.Add("X-Kadr-Total-Length", info.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
             content.Headers.Add("X-Kadr-Offset", offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
             using var response = await _client.PostAsync("v2/assets", content, cancellationToken).ConfigureAwait(false);
+            requestCount++;
             await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
             offset += count;
+            transferredBytes += count;
             progress?.Report(offset / (double)info.Length);
         }
+        RecordUploadMetrics(info.Length, transferredBytes, requestCount, uploadStarted, cacheHit: false, mediaType);
         return hash;
     }
 
@@ -114,14 +125,23 @@ public sealed class AiServerV2Client(
         IProgress<double>? progress,
         CancellationToken cancellationToken)
     {
+        var started = Stopwatch.GetTimestamp();
+        var requests = 0L;
         while (true)
         {
             using var response = await _client.GetAsync($"v2/jobs/{id:D}", cancellationToken).ConfigureAwait(false);
+            requests++;
             await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
             var job = await response.Content.ReadFromJsonAsync<AiServerJob>(Json, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidDataException("AI server returned an empty job response.");
             progress?.Report(job.Progress);
-            if (job.State.Equals("succeeded", StringComparison.OrdinalIgnoreCase)) return job;
+            if (job.State.Equals("succeeded", StringComparison.OrdinalIgnoreCase))
+            {
+                RecordTransport("job_wait_duration_ms", Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                    ("analyzer", job.Analyzer));
+                RecordTransport("job_poll_request_count", requests, ("analyzer", job.Analyzer));
+                return job;
+            }
             if (job.State.Equals("failed", StringComparison.OrdinalIgnoreCase) ||
                 job.State.Equals("cancelled", StringComparison.OrdinalIgnoreCase))
                 throw new AiServerV2Exception(job.ErrorCode ?? "analyzer_failed", job.Error ?? job.Message);
@@ -143,6 +163,7 @@ public sealed class AiServerV2Client(
         IProgress<double>? progress,
         CancellationToken cancellationToken)
     {
+        var started = Stopwatch.GetTimestamp();
         using var response = await _client.GetAsync(
             $"v2/artifacts/{id}", HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
@@ -170,6 +191,9 @@ public sealed class AiServerV2Client(
             await output.FlushAsync(cancellationToken).ConfigureAwait(false);
             File.Move(temporary, destinationPath, overwrite: true);
             progress?.Report(1);
+            RecordTransport("artifact_download_duration_ms", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            RecordTransport("artifact_download_bytes", received);
+            RecordTransport("artifact_download_http_requests", 1);
         }
         finally
         {
@@ -247,6 +271,46 @@ public sealed class AiServerV2Client(
                 return id.GetString() ?? string.Empty;
         }
         return "profile-selection";
+    }
+
+    private void RecordUploadMetrics(
+        long assetBytes,
+        long transferredBytes,
+        long requestCount,
+        long started,
+        bool cacheHit,
+        string mediaType)
+    {
+        var dimensions = new[]
+        {
+            ("media_type", mediaType),
+            ("cache_hit", cacheHit ? "true" : "false")
+        };
+        RecordTransport("asset_upload_duration_ms", Stopwatch.GetElapsedTime(started).TotalMilliseconds, dimensions);
+        RecordTransport("asset_logical_bytes", assetBytes, dimensions);
+        RecordTransport("asset_transferred_bytes", transferredBytes, dimensions);
+        RecordTransport("asset_upload_http_requests", requestCount, dimensions);
+        RecordTransport("asset_duplicate_transferred_bytes", 0, dimensions);
+    }
+
+    private void RecordTransport(
+        string metric,
+        double value,
+        params (string Key, string Value)[] dimensions)
+    {
+        try
+        {
+            _telemetry.Record(new EditorialTelemetryEvent(
+                DateTimeOffset.UtcNow,
+                Guid.Empty,
+                metric,
+                value,
+                dimensions.ToImmutableDictionary(item => item.Key, item => item.Value)));
+        }
+        catch
+        {
+            // Performance telemetry must never fail an HTTP operation.
+        }
     }
 
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)

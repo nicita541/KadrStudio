@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Diagnostics;
 using System.Threading.Channels;
 using KadrStudio.Application.Preview;
 
@@ -18,6 +19,11 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
     private NamedPipeServerStream? _pipe;
     private Task? _eventWriter;
     private bool _disposed;
+    private readonly Stopwatch _diagnosticClock = Stopwatch.StartNew();
+    private long _framesDropped;
+    private long _queueDepth;
+    private long _pipeWriteTicks;
+    private long _pipeFrameBytes;
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
@@ -106,8 +112,18 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
                         .ConfigureAwait(false);
                     break;
                 case MediaHostPacketType.Diagnostics:
+                    var diagnostics = _playback.Diagnostics;
+                    var copiedBytes = diagnostics.CopiedBytes + Interlocked.Read(ref _pipeFrameBytes);
                     await WriteAsync(MediaHostPacket.Create(
-                        MediaHostPacketType.DiagnosticsResult, _playback.Diagnostics, packet.CorrelationId),
+                        MediaHostPacketType.DiagnosticsResult, diagnostics with
+                        {
+                            FramesDropped = diagnostics.FramesDropped + Interlocked.Read(ref _framesDropped),
+                            CopiedBytes = copiedBytes,
+                            CopiedBytesPerSecond = copiedBytes / Math.Max(0.001, _diagnosticClock.Elapsed.TotalSeconds),
+                            PipeWriteTimeMs = Stopwatch.GetElapsedTime(
+                                0, Interlocked.Read(ref _pipeWriteTicks)).TotalMilliseconds,
+                            QueueDepth = checked((int)Interlocked.Read(ref _queueDepth))
+                        }, packet.CorrelationId),
                         cancellationToken).ConfigureAwait(false);
                     break;
                 case MediaHostPacketType.Shutdown:
@@ -155,7 +171,15 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
             new MediaHostFailure("pipeline", exception.Message, Recoverable: true)));
 
     private void Queue(MediaHostPacket packet)
-        => _events.Writer.TryWrite(packet);
+    {
+        if (packet.Type == MediaHostPacketType.VideoFrame)
+        {
+            var depth = Interlocked.Read(ref _queueDepth);
+            if (depth >= 8) Interlocked.Increment(ref _framesDropped);
+            else Interlocked.Increment(ref _queueDepth);
+        }
+        _events.Writer.TryWrite(packet);
+    }
 
     private void QueueCritical(MediaHostPacket packet)
         => _ = WriteCriticalAsync(packet);
@@ -173,7 +197,11 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
         try
         {
             await foreach (var packet in events.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (packet.Type == MediaHostPacketType.VideoFrame)
+                    Interlocked.Decrement(ref _queueDepth);
                 await WriteAsync(packet, cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception) when (exception is IOException or ObjectDisposedException or OperationCanceledException) { }
     }
@@ -183,7 +211,16 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
         var pipe = _pipe;
         if (pipe is null || !pipe.IsConnected) return;
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try { await MediaHostPacketIO.WriteAsync(pipe, packet, cancellationToken).ConfigureAwait(false); }
+        try
+        {
+            var started = Stopwatch.GetTimestamp();
+            await MediaHostPacketIO.WriteAsync(pipe, packet, cancellationToken).ConfigureAwait(false);
+            if (packet.Type == MediaHostPacketType.VideoFrame)
+            {
+                Interlocked.Add(ref _pipeWriteTicks, Stopwatch.GetTimestamp() - started);
+                Interlocked.Add(ref _pipeFrameBytes, packet.Payload.Length);
+            }
+        }
         finally { _writeGate.Release(); }
     }
 }

@@ -91,7 +91,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         var aiServerV2 = new AiServerV2Client(AiServer, editorialTelemetry);
         var editorialIndexer = new AiServerMediaUnderstandingIndexer(
             aiServerV2,
-            new AnalysisProxyBuilder(services.FfmpegLocator, services.ProcessRunner));
+            new AnalysisProxyBuilder(services.FfmpegLocator, services.ProcessRunner, editorialTelemetry));
         var editorialReasoner = new AiServerEditorialReasoner(aiServerV2);
         EditorialPipeline = new EditorialPipeline(
             editorialIndexer,

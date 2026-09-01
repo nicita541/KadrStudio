@@ -19,6 +19,13 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly StereoPcmMeter _meter = new();
     private readonly Stopwatch _fallbackClock = new();
+    private readonly Stopwatch _diagnosticClock = Stopwatch.StartNew();
+    private readonly int _gen0Start = GC.CollectionCount(0);
+    private readonly int _gen1Start = GC.CollectionCount(1);
+    private readonly int _gen2Start = GC.CollectionCount(2);
+    private long _framesPresented;
+    private long _framesDropped;
+    private long _producerWaitTicks;
     private RenderPlan? _plan;
     private PreviewRequest _request;
     private CancellationTokenSource? _videoCancellation;
@@ -41,14 +48,40 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     public TimelineTime Position => State == PreviewState.Playing ? GetClockPosition() : _position;
     public VideoFrame? LastFrame => _lastFrame;
     public long AudioGeneration => _request.Generation.Audio;
-    public MediaHostDiagnostics Diagnostics => new(
-        Environment.ProcessId,
-        _videoWorkers?.ActiveWorkerCount ?? 0,
-        _audioWorkers?.ActiveWorkerCount ?? 0,
-        _videoWorkers?.PeakWorkerCount ?? 0,
-        _audioWorkers?.PeakWorkerCount ?? 0,
-        _videoWorkers?.StartedWorkerCount ?? 0,
-        _audioWorkers?.StartedWorkerCount ?? 0);
+    public MediaHostDiagnostics Diagnostics
+    {
+        get
+        {
+            var video = _videoWorkers;
+            var elapsed = Math.Max(0.001, _diagnosticClock.Elapsed.TotalSeconds);
+            var decodeSeconds = video?.DecoderReadTime.TotalSeconds ?? 0;
+            return new MediaHostDiagnostics(
+                Environment.ProcessId,
+                video?.ActiveWorkerCount ?? 0,
+                _audioWorkers?.ActiveWorkerCount ?? 0,
+                video?.PeakWorkerCount ?? 0,
+                _audioWorkers?.PeakWorkerCount ?? 0,
+                video?.StartedWorkerCount ?? 0,
+                _audioWorkers?.StartedWorkerCount ?? 0,
+                video?.FrameSizeBytes ?? 0,
+                video?.FramesProduced ?? 0,
+                _framesPresented,
+                FramesDropped: Interlocked.Read(ref _framesDropped),
+                CopiedBytes: video?.CopiedBytes ?? 0,
+                CopiedBytesPerSecond: (video?.CopiedBytes ?? 0) / elapsed,
+                AllocatedBytes: video?.AllocatedBytes ?? 0,
+                ProducerWaitTimeMs: Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _producerWaitTicks)).TotalMilliseconds,
+                DecoderReadTimeMs: video?.DecoderReadTime.TotalMilliseconds ?? 0,
+                DecodeFramesPerSecond: decodeSeconds > 0 ? (video?.FramesDecoded ?? 0) / decodeSeconds : 0,
+                Gen0Collections: GC.CollectionCount(0) - _gen0Start,
+                Gen1Collections: GC.CollectionCount(1) - _gen1Start,
+                Gen2Collections: GC.CollectionCount(2) - _gen2Start,
+                Decoder: video?.Decoder ?? "ffmpeg-software",
+                HardwareAcceleration: video?.HardwareAcceleration ?? "none",
+                Device: video?.Device ?? "CPU",
+                Fallback: video?.Fallback ?? "not-attempted");
+        }
+    }
     public event EventHandler<PreviewState>? StateChanged;
     public event EventHandler<VideoFrame>? FramePresented;
     public event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
@@ -263,7 +296,12 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         {
             await workers.RunAsync(plan, request, start, continuous, async frame =>
             {
-                if (continuous) await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+                if (continuous)
+                {
+                    var waitStarted = Stopwatch.GetTimestamp();
+                    await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+                    Interlocked.Add(ref _producerWaitTicks, Stopwatch.GetTimestamp() - waitStarted);
+                }
                 else Present(frame);
             }, cancellationToken).ConfigureAwait(false);
             writer?.TryComplete();
@@ -286,11 +324,20 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         {
             await foreach (var frame in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                var delta = frame.Position - GetClockPosition();
-                if (delta < -frameDuration) continue;
+                // If decoding briefly ran ahead, discard only frames for which a newer
+                // decoded replacement is already waiting. When decoding is slower than
+                // real time, the current late frame is still the freshest available one
+                // and must be displayed instead of turning playback into a black screen.
+                var latest = frame;
+                while (latest.Position < GetClockPosition() - frameDuration && reader.TryRead(out var newer))
+                {
+                    latest = newer;
+                    Interlocked.Increment(ref _framesDropped);
+                }
+                var delta = latest.Position - GetClockPosition();
                 if (delta > TimelineTime.Zero)
                     await Task.Delay(TimeSpan.FromSeconds(delta.TotalSeconds), cancellationToken).ConfigureAwait(false);
-                Present(frame);
+                Present(latest);
             }
         }
         catch (OperationCanceledException) { }
@@ -379,6 +426,7 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     private void Present(VideoFrame frame)
     {
         if (frame.Generation != _request.Generation.Video) return;
+        Interlocked.Increment(ref _framesPresented);
         _lastFrame = frame;
         _position = frame.Position;
         FramePresented?.Invoke(this, frame);

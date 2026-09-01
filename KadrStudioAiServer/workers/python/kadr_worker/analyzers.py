@@ -275,6 +275,7 @@ def empty_index(parameters: dict[str, Any], analyzer: str, channels: list[int]) 
 
 
 def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+    total_started = time.perf_counter()
     try:
         import cv2
         import numpy as np
@@ -283,7 +284,9 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     visual = next((asset for asset in assets if asset.kind == "visual-proxy"), None)
     if visual is None:
         raise ValueError("video-understanding needs a visual proxy")
+    open_started = time.perf_counter()
     capture = cv2.VideoCapture(str(visual.path))
+    source_open_seconds = time.perf_counter() - open_started
     if not capture.isOpened():
         raise ValueError("visual proxy cannot be decoded")
     fps = float(capture.get(cv2.CAP_PROP_FPS) or 24.0)
@@ -301,6 +304,10 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     previous_gray = None
     shot_starts = [0]
     sampled = 0
+    decoded_frames = 0
+    decode_seconds = 0.0
+    analysis_seconds = 0.0
+    ocr_seconds = 0.0
     frame_index = 0
     previous_timestamp = -1
     sample_stride = max(1, int(round(fps * 0.5)))
@@ -317,9 +324,12 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
         except ImportError:
             ocr = None
     while True:
+        decode_started = time.perf_counter()
         ok, frame = capture.read()
+        decode_seconds += time.perf_counter() - decode_started
         if not ok:
             break
+        decoded_frames += 1
         position_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
         pts_timestamp = int(position_ms / 1000.0 * TICKS_PER_SECOND)
         fallback_timestamp = int(frame_index / fps * TICKS_PER_SECOND)
@@ -330,6 +340,7 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
         if not dense and frame_index % sample_stride:
             frame_index += 1
             continue
+        analysis_started = time.perf_counter()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         histogram = cv2.calcHist([frame], [0, 1], None, [24, 24], [0, 256, 0, 256])
         cv2.normalize(histogram, histogram)
@@ -341,7 +352,9 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
             vlm_timestamps.append(timestamp)
             last_vlm_timestamp = timestamp
             if ocr is not None:
+                ocr_started = time.perf_counter()
                 data = ocr.image_to_data(frame, output_type=ocr.Output.DICT)
+                ocr_seconds += time.perf_counter() - ocr_started
                 tokens = [str(value).strip() for value in data.get("text", []) if str(value).strip()]
                 confidences = [float(value) for value in data.get("conf", []) if str(value) not in {"", "-1"}]
                 if tokens:
@@ -368,6 +381,7 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
         previous_hist, previous_gray = histogram, gray
         sampled += 1
         frame_index += 1
+        analysis_seconds += time.perf_counter() - analysis_started
     capture.release()
     intervals[CHANNEL_FRAMES].append(_interval(0, source_duration, sampled, False, "video-understanding"))
     intervals[CHANNEL_MOTION].append(_interval(0, source_duration, sampled, False, "video-understanding"))
@@ -386,11 +400,41 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
         "momentIds": [], "factIds": [fact["id"] for fact in facts if fact["kind"] == 3 and fact["sourceRange"]["start"]["ticks"] == start],
         "summary": "Measured shot", "camera": "", "composition": "", "embeddingReference": "",
     } for index, start in enumerate(shot_starts) if start < source_duration]
+    vision_seconds = 0.0
     if parameters.get("profile") == "anime-episode" and vlm_frames:
+        vision_started = time.perf_counter()
         role_facts, hypotheses = classify_anime_segments(
             vlm_frames, vlm_timestamps, shot_starts, parameters, assets)
+        vision_seconds = time.perf_counter() - vision_started
         result["facts"].extend(role_facts)
         result["segmentRoleHypotheses"] = hypotheses
+    decoded_duration = decoded_frames / fps if fps > 0 else None
+    result["performance"] = {
+        "stageDurationsMs": {
+            "sourceOpen": source_open_seconds * 1000.0,
+            "videoDecode": decode_seconds * 1000.0,
+            "sceneMotionSampling": analysis_seconds * 1000.0,
+            "ocr": ocr_seconds * 1000.0,
+            "visionInferenceAndBoundaryRefinement": vision_seconds * 1000.0,
+            "total": (time.perf_counter() - total_started) * 1000.0,
+        },
+        "decoder": {
+            "decoderInstances": 1,
+            "sourceOpenCount": 1,
+            "fullSequentialDecodeCount": 1,
+            "partialDecodeCount": 0,
+            "seekCount": 0,
+            "totalDecodedFrames": decoded_frames,
+            "uniqueFramesNeeded": sampled,
+            "totalDecodedDurationSeconds": decoded_duration,
+            "decodeFps": decoded_frames / decode_seconds if decode_seconds > 0 else None,
+            "bytesRead": None,
+            "bytesReadReason": "OpenCV does not expose decoder process I/O counters; sourceBytes is file size, not measured bytes read.",
+            "sourceBytes": visual.path.stat().st_size,
+            "denseGapCount": len(dense_ranges),
+            "denseGapImplementation": "full sequential reopen" if dense_ranges else "not requested",
+        },
+    }
     return result
 
 
@@ -675,6 +719,7 @@ def classify_anime_segments(frames: list[Any], timestamps: list[int], shot_start
 
 
 def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+    total_started = time.perf_counter()
     try:
         import numpy as np
         import soundfile as sf
@@ -684,8 +729,13 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     facts: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     intervals: list[dict[str, Any]] = []
+    source_open_count = 0
+    decoded_samples = 0
+    decode_analysis_seconds = 0.0
     for asset in sorted((item for item in assets if item.kind == "audio-chunk"), key=lambda item: (item.stream_index or -1, item.order)):
+        asset_started = time.perf_counter()
         audio_info = sf.info(str(asset.path))
+        source_open_count += 1
         sample_rate = audio_info.samplerate
         state_window = max(1, int(sample_rate * 2.0))
         sample_count = 0
@@ -697,6 +747,7 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
                 continue
             block_start = sample_count
             sample_count += len(block)
+            decoded_samples += len(block)
             square_sum += float(np.sum(np.square(block, dtype=np.float64)))
             block_rms = float(np.sqrt(np.mean(np.square(block)) + 1e-12))
             block_db = 20 * math.log10(max(block_rms, 1e-8))
@@ -726,9 +777,24 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
             "streamIndex": asset.stream_index,
         })
         intervals.append(_interval(asset.start_ticks, max(1, duration), max(1, sample_count), True, "audio-events"))
+        decode_analysis_seconds += time.perf_counter() - asset_started
     result["facts"], result["audioEvents"] = facts, events
     result["coverage"] = _coverage(str(parameters["sourceId"]), str(parameters["sourceFingerprint"]),
                                     int(parameters["sourceDurationTicks"]), {CHANNEL_AUDIO: intervals})
+    result["performance"] = {
+        "stageDurationsMs": {
+            "audioDecodeAndAnalysis": decode_analysis_seconds * 1000.0,
+            "total": (time.perf_counter() - total_started) * 1000.0,
+        },
+        "decoder": {
+            "decoderInstances": source_open_count,
+            "sourceOpenCount": source_open_count,
+            "fullSequentialDecodeCount": source_open_count,
+            "partialDecodeCount": 0,
+            "seekCount": 0,
+            "totalDecodedSamples": decoded_samples,
+        },
+    }
     return result
 
 

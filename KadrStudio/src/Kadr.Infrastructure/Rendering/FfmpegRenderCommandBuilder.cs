@@ -65,6 +65,10 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             }
             else
             {
+                if (options.UseHardwareDecoding)
+                {
+                    arguments.Add("-hwaccel"); arguments.Add("cuda");
+                }
                 arguments.Add("-ss"); arguments.Add(Format(window.SourceOffset.TotalSeconds));
             }
             arguments.Add("-t"); arguments.Add(Format(window.Duration.TotalSeconds));

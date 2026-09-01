@@ -31,6 +31,9 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
     private bool _disposed;
     private int _recoveryScheduled;
     private TimelineTime _position;
+    private long _pipeReadTicks;
+    private long _framesReceived;
+    private long _pipePayloadBytes;
 
     public PreviewState State { get; private set; } = PreviewState.Idle;
     public TimelineTime Position => _position;
@@ -114,7 +117,14 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
             .ConfigureAwait(false);
         if (response.Type != MediaHostPacketType.DiagnosticsResult)
             throw new InvalidDataException($"Unexpected diagnostics response {response.Type}.");
-        return response.ReadHeader<MediaHostDiagnostics>();
+        var remote = response.ReadHeader<MediaHostDiagnostics>();
+        return remote with
+        {
+            FramesPresented = Interlocked.Read(ref _framesReceived),
+            PipeReadTimeMs = Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _pipeReadTicks)).TotalMilliseconds,
+            CopiedBytes = remote.CopiedBytes + Interlocked.Read(ref _pipePayloadBytes),
+            AllocatedBytes = remote.AllocatedBytes + Interlocked.Read(ref _pipePayloadBytes)
+        };
     }
 
     public void TerminateHostForTest()
@@ -278,8 +288,15 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
         {
             while (!cancellationToken.IsCancellationRequested && pipe.IsConnected)
             {
+                var readStarted = Stopwatch.GetTimestamp();
                 var packet = await MediaHostPacketIO.ReadAsync(pipe, cancellationToken).ConfigureAwait(false);
+                Interlocked.Add(ref _pipeReadTicks, Stopwatch.GetTimestamp() - readStarted);
                 if (packet is null) break;
+                if (packet.Type == MediaHostPacketType.VideoFrame)
+                {
+                    Interlocked.Increment(ref _framesReceived);
+                    Interlocked.Add(ref _pipePayloadBytes, packet.Payload.Length);
+                }
                 Dispatch(packet);
             }
         }

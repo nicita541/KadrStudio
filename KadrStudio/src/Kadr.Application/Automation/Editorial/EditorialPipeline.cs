@@ -175,18 +175,30 @@ public sealed class EditorialPipeline(
         else
         {
             Report(progress, EditorialPipelineStage.BoundaryRefining, 1, "Готовлю независимый контекст критика.");
+            stageStarted = Stopwatch.GetTimestamp();
             var criticSet = await _retriever.RetrieveAsync(
                 indexes, brief, cancellationToken: cancellationToken).ConfigureAwait(false);
+            Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(stageStarted).TotalMilliseconds,
+                ("stage", "CriticRetrieval"));
             RecordWorkingSet(taskId, criticSet, "critic");
+            stageStarted = Stopwatch.GetTimestamp();
             criticIssues = await _critic.ReviewGraphAsync(
                 brief, graph, criticSet, cancellationToken).ConfigureAwait(false);
+            Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(stageStarted).TotalMilliseconds,
+                ("stage", "Critic"));
         }
 
         Report(progress, EditorialPipelineStage.Compiling, 0, "Компилирую семантический граф в типизированные команды.");
+        stageStarted = Stopwatch.GetTimestamp();
         var compilation = _compiler.Compile(project, indexes, graph, patches.ToImmutable());
+        Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(stageStarted).TotalMilliseconds,
+            ("stage", EditorialPipelineStage.Compiling.ToString()));
         Report(progress, EditorialPipelineStage.Verifying, 0, "Проверяю Agent Draft детерминированно.");
+        stageStarted = Stopwatch.GetTimestamp();
         var quality = _qualityAnalyzer.Analyze(
             project, taskId, compilation.Draft.Sequence, graph, criticIssues);
+        Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(stageStarted).TotalMilliseconds,
+            ("stage", "DraftQualityReport"));
         Record(taskId, "quality_blocking_issue_count",
             quality.Issues.Count(item => item.IsBlocking));
         Record(taskId, "pipeline_duration_ms",
@@ -256,12 +268,17 @@ public sealed class EditorialPipeline(
             cancellationToken.ThrowIfCancellationRequested();
             Report(progress, EditorialPipelineStage.Retrieving, (attempt - 1) / 5d,
                 "Извлекаю релевантные сцены и локальные факты.");
+            var retrievalStarted = Stopwatch.GetTimestamp();
             var workingSet = await _retriever.RetrieveAsync(
                 indexes, brief, gaps, cancellationToken).ConfigureAwait(false);
+            Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(retrievalStarted).TotalMilliseconds,
+                ("stage", EditorialPipelineStage.Retrieving.ToString()),
+                ("attempt", attempt.ToString(System.Globalization.CultureInfo.InvariantCulture)));
             RecordWorkingSet(taskId, workingSet, "rough_cut");
             Record(taskId, "rough_cut_attempt", attempt);
             Report(progress, EditorialPipelineStage.RoughCut, (attempt - 1) / 5d,
                 "Собираю семантический rough cut.");
+            var plannerStarted = Stopwatch.GetTimestamp();
             var graph = await _director.CreateRoughCutAsync(
                 brief,
                 workingSet,
@@ -270,6 +287,9 @@ public sealed class EditorialPipeline(
                 sourceSequence.Revision,
                 previousRejected,
                 cancellationToken).ConfigureAwait(false);
+            Record(taskId, "stage_duration_ms", Stopwatch.GetElapsedTime(plannerStarted).TotalMilliseconds,
+                ("stage", "Planner"),
+                ("attempt", attempt.ToString(System.Globalization.CultureInfo.InvariantCulture)));
             graph = _targetResolver.Resolve(project, graph);
             if (graph.TaskId != taskId || graph.SourceSequenceId != sourceSequence.Id ||
                 graph.SourceSequenceRevision != sourceSequence.Revision)

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.Json;
 using KadrStudio.Application.Preview;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
@@ -10,6 +11,71 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class MediaHostIntegrationTests
 {
+    [Fact(Timeout = 180_000)]
+    public async Task Performance_benchmark_writes_diagnostics_when_requested()
+    {
+        var sourcePath = Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_SOURCE");
+        var outputPath = Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_OUTPUT");
+        if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(outputPath)) return;
+        var width = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_WIDTH") ?? "1920");
+        var height = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_HEIGHT") ?? "1080");
+        var fps = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_FPS") ?? "60");
+        var seconds = double.Parse(
+            Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_SECONDS") ?? "5",
+            System.Globalization.CultureInfo.InvariantCulture);
+        var project = CreatePerformanceProject(sourcePath, width, height, fps, seconds);
+        var plan = new RenderPlanBuilder().Build(project);
+        var locator = new FfmpegLocator();
+        locator.EnsureAvailable();
+        await using var client = new MediaHostClient(ResolveMediaHost(), locator.FfmpegPath);
+        var timestamps = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        client.FramePresented += (_, _) => timestamps.Enqueue(System.Diagnostics.Stopwatch.GetTimestamp());
+        var first = NextFrame(client);
+        var request = new PreviewRequest(
+            TimelineTime.Zero, new FrameRate(fps), width, height, false,
+            new PreviewGeneration(9001, 0, 0));
+        await client.PrepareAsync(plan, request);
+        await first.WaitAsync(TimeSpan.FromSeconds(30));
+        timestamps.Clear();
+        var wall = System.Diagnostics.Stopwatch.StartNew();
+        await client.StartAsync();
+        await Task.Delay(TimeSpan.FromSeconds(seconds + 0.5));
+        var diagnostics = await client.GetDiagnosticsAsync();
+        wall.Stop();
+        await client.PauseAsync();
+        var values = timestamps.ToArray();
+        var intervals = values.Zip(values.Skip(1), (left, right) =>
+                System.Diagnostics.Stopwatch.GetElapsedTime(left, right).TotalMilliseconds)
+            .OrderBy(value => value)
+            .ToArray();
+        var p95 = intervals.Length == 0
+            ? 0
+            : intervals[Math.Min(intervals.Length - 1, (int)Math.Ceiling(intervals.Length * 0.95) - 1)];
+        var expected = (long)Math.Round(seconds * fps, MidpointRounding.AwayFromZero);
+        var payload = new
+        {
+            width,
+            height,
+            fps,
+            seconds,
+            frameSizeBytes = checked((long)width * height * 4),
+            theoreticalRawBytesPerSecond = checked((long)width * height * 4 * fps),
+            framesReceived = values.LongLength,
+            expectedFrames = expected,
+            observedDroppedFrames = Math.Max(0, expected - values.LongLength),
+            frameInterarrivalP95Ms = p95,
+            wallTimeMs = wall.Elapsed.TotalMilliseconds,
+            diagnostics
+        };
+        var directory = Path.GetDirectoryName(outputPath)
+            ?? throw new InvalidOperationException("Benchmark output needs a parent directory.");
+        Directory.CreateDirectory(directory);
+        await File.WriteAllTextAsync(outputPath, JsonSerializer.Serialize(payload, new JsonSerializerOptions
+        {
+            WriteIndented = true
+        }));
+    }
+
     [Fact(Timeout = 90_000)]
     public async Task Out_of_process_host_seeks_and_recovers_after_forced_termination()
     {
@@ -444,6 +510,34 @@ public sealed class MediaHostIntegrationTests
         return candidates.FirstOrDefault(File.Exists)
                ?? throw new FileNotFoundException(
                    "Kadr.MediaHost test binary was not found. Checked: " + string.Join(", ", candidates));
+    }
+
+    private static ProjectState CreatePerformanceProject(
+        string sourcePath,
+        int width,
+        int height,
+        int fps,
+        double seconds)
+    {
+        var rate = new FrameRate(fps);
+        var duration = TimelineTime.FromSeconds(seconds);
+        var project = ProjectState.CreateNew("Preview performance", rate) with
+        {
+            Sequence = new SequenceSettings(width, height, rate, 48_000)
+        };
+        var source = new MediaSource(
+            Guid.NewGuid(), sourcePath, Path.GetFileName(sourcePath), MediaKind.Video,
+            duration, false, width, height, rate, "benchmark",
+            FileSize: new FileInfo(sourcePath).Length, Fingerprint: "preview-performance");
+        var track = project.Tracks.Single(item => item.Kind == TrackKind.Visual && item.Index == 0);
+        var clip = new MediaClip(
+            Guid.NewGuid(), source.Id, track.Id, TimelineTime.Zero,
+            TimelineTime.Zero, duration, Video: new VideoParameters());
+        return project with
+        {
+            Sources = ImmutableDictionary<Guid, MediaSource>.Empty.Add(source.Id, source),
+            MediaClips = [clip]
+        };
     }
 
     private static string CreateRoot()

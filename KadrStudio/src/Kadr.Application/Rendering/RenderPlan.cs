@@ -183,7 +183,8 @@ public sealed record RenderOutputOptions(
     bool IncludeVideo = true,
     bool IncludeAudio = true,
     bool IncludeOverlays = true,
-    bool TransparentBackground = false);
+    bool TransparentBackground = false,
+    bool UseHardwareDecoding = false);
 
 public sealed record ExternalRenderCommand(
     string ExecutableRole,

@@ -23,3 +23,13 @@ TestResults/
 *.autosave
 *.proxy.*
 AI
+Logs/
+LocalData/
+.kadr-ai/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.key
+*.pem
+secrets.json

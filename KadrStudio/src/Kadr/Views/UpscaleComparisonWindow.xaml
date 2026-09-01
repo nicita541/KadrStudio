@@ -1,0 +1,29 @@
+<Window x:Class="KadrStudio.Views.UpscaleComparisonWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Оригинал / AnimeSR-X" Width="1100" Height="720"
+        WindowStartupLocation="CenterOwner" Background="#111318">
+    <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid Margin="14,10">
+            <TextBlock Text="ОРИГИНАЛ" Foreground="White" FontWeight="SemiBold"/>
+            <TextBlock Text="ANIMESR-X" Foreground="White" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+        </Grid>
+        <Border Grid.Row="1" Margin="14,0" Background="Black" ClipToBounds="True">
+            <Grid x:Name="CompareViewport" SizeChanged="CompareViewport_SizeChanged"
+                  MouseWheel="CompareViewport_MouseWheel" MouseLeftButtonDown="CompareViewport_MouseLeftButtonDown"
+                  MouseLeftButtonUp="CompareViewport_MouseLeftButtonUp" MouseMove="CompareViewport_MouseMove">
+                <Grid x:Name="ImageLayer" RenderTransformOrigin="0.5,0.5">
+                    <Grid.RenderTransform>
+                        <TransformGroup><ScaleTransform x:Name="SharedScale" ScaleX="1" ScaleY="1"/><TranslateTransform x:Name="SharedTranslate"/></TransformGroup>
+                    </Grid.RenderTransform>
+                    <Image x:Name="OriginalImage" Stretch="Uniform"/>
+                    <Image x:Name="UpscaledImage" Stretch="Uniform"/>
+                </Grid>
+                <Border x:Name="Divider" Width="3" Background="#FFF2A900" HorizontalAlignment="Left" Cursor="SizeWE"/>
+            </Grid>
+        </Border>
+        <TextBlock Grid.Row="2" Margin="14,8" Text="Тяните жёлтую границу. Колесо — масштаб; перетаскивание с зажатым Shift — синхронное перемещение."
+                   Foreground="#AAB3BF" FontSize="11"/>
+    </Grid>
+</Window>

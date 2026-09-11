@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # KadrStudio TimelineTime is a rational 240 kHz clock (divisible by common
@@ -29,6 +29,57 @@ CHANNEL_OCR = 4
 
 class CapabilityUnavailable(RuntimeError):
     pass
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+CancelCheck = Callable[[], bool] | None
+
+
+def _raise_if_cancelled(cancel: CancelCheck) -> None:
+    if cancel is not None and cancel():
+        raise JobCancelled("job cancelled")
+
+
+def _terminate_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _run_process_cancellable(
+        command: list[str], *, cancel: CancelCheck,
+        cwd: str | None = None, creationflags: int = 0) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags)
+    try:
+        while True:
+            _raise_if_cancelled(cancel)
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    except JobCancelled:
+        _terminate_process(process)
+        raise
+    finally:
+        if process.poll() is None:
+            _terminate_process(process)
 
 
 _LLAMA_PROCESS: subprocess.Popen[Any] | None = None
@@ -63,7 +114,7 @@ def _reasoning_backend() -> str:
     return os.environ.get("KADR_REASONING_BACKEND", "llama.cpp").strip().lower()
 
 
-def _llama_endpoint() -> str:
+def _llama_endpoint(cancel: CancelCheck = None) -> str:
     global _LLAMA_PROCESS, _LLAMA_LOG, _LLAMA_ENDPOINT
     import requests
 
@@ -136,6 +187,7 @@ def _llama_endpoint() -> str:
         timeout_at = time.monotonic() + max(60, int(os.environ.get("KADR_LLAMA_STARTUP_TIMEOUT", "600")))
         last_error: Exception | None = None
         while time.monotonic() < timeout_at:
+            _raise_if_cancelled(cancel)
             if _LLAMA_PROCESS.poll() is not None:
                 _LLAMA_ENDPOINT = None
                 raise CapabilityUnavailable(
@@ -253,6 +305,21 @@ def _interval(start: int, duration: int, samples: int, continuous: bool, analyze
     }
 
 
+def _append_video_coverage(values: list[dict[str, Any]], start: int, duration: int,
+                           continuous: bool) -> None:
+    if duration <= 0:
+        return
+    if continuous and values and values[-1]["isContinuous"]:
+        previous = values[-1]
+        previous_start = previous["range"]["start"]["ticks"]
+        previous_end = previous_start + previous["range"]["duration"]["ticks"]
+        if abs(start - previous_end) <= 1:
+            values[-1] = _interval(previous_start, start + duration - previous_start,
+                                   previous["sampleCount"] + 1, True, "video-understanding")
+            return
+    values.append(_interval(start, duration, 1, continuous, "video-understanding"))
+
+
 def empty_index(parameters: dict[str, Any], analyzer: str, channels: list[int]) -> dict[str, Any]:
     now = time.strftime("%Y-%m-%dT%H:%M:%S.0000000+00:00", time.gmtime())
     source_id = str(parameters["sourceId"])
@@ -274,7 +341,10 @@ def empty_index(parameters: dict[str, Any], analyzer: str, channels: list[int]) 
     }
 
 
-def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+def analyze_video(
+        assets: list[Asset], parameters: dict[str, Any],
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     total_started = time.perf_counter()
     try:
         import cv2
@@ -302,7 +372,9 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     ]
     previous_hist = None
     previous_gray = None
-    shot_starts = [0]
+    shot_starts: list[int] = []
+    decoded_end = 0
+    nominal_frame_duration = max(1, int(TICKS_PER_SECOND / fps))
     sampled = 0
     decoded_frames = 0
     decode_seconds = 0.0
@@ -323,88 +395,96 @@ def analyze_video(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
             ocr = pytesseract
         except ImportError:
             ocr = None
-    while True:
-        decode_started = time.perf_counter()
-        ok, frame = capture.read()
-        decode_seconds += time.perf_counter() - decode_started
-        if not ok:
-            break
-        decoded_frames += 1
-        position_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
-        pts_timestamp = int(position_ms / 1000.0 * TICKS_PER_SECOND)
-        fallback_timestamp = int(frame_index / fps * TICKS_PER_SECOND)
-        timestamp = pts_timestamp if frame_index == 0 or pts_timestamp > previous_timestamp else fallback_timestamp
-        timestamp = max(0, min(source_duration, timestamp))
-        previous_timestamp = timestamp
-        dense = any(start <= timestamp <= end for start, end in dense_ranges)
-        if not dense and frame_index % sample_stride:
-            frame_index += 1
-            continue
-        analysis_started = time.perf_counter()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        histogram = cv2.calcHist([frame], [0, 1], None, [24, 24], [0, 256, 0, 256])
-        cv2.normalize(histogram, histogram)
-        edge = timestamp <= 360 * TICKS_PER_SECOND or timestamp >= source_duration - 360 * TICKS_PER_SECOND
-        vlm_interval = (15 if edge else 45) * TICKS_PER_SECOND
-        if (parameters.get("profile") == "anime-episode" and
-                timestamp - last_vlm_timestamp >= vlm_interval):
-            vlm_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            vlm_timestamps.append(timestamp)
-            last_vlm_timestamp = timestamp
-            if ocr is not None:
-                ocr_started = time.perf_counter()
-                data = ocr.image_to_data(frame, output_type=ocr.Output.DICT)
-                ocr_seconds += time.perf_counter() - ocr_started
-                tokens = [str(value).strip() for value in data.get("text", []) if str(value).strip()]
-                confidences = [float(value) for value in data.get("conf", []) if str(value) not in {"", "-1"}]
-                if tokens:
-                    frame_duration = max(1, int(TICKS_PER_SECOND / fps))
-                    confidence = min(0.99, max(0.5, (sum(confidences) / max(1, len(confidences))) / 100))
-                    facts.append(_fact(
-                        str(parameters["sourceId"]), timestamp, frame_duration,
-                        CHANNEL_OCR, 2, "Measured OCR text: " + " ".join(tokens)[:240],
-                        confidence, "video-understanding",
-                        measurements={"token_count": str(len(tokens))}))
-                    intervals[CHANNEL_OCR].append(
-                        _interval(timestamp, frame_duration, 1, False, "video-understanding"))
-        if previous_hist is not None:
-            distance = float(cv2.compareHist(previous_hist, histogram, cv2.HISTCMP_BHATTACHARYYA))
-            motion = float(np.mean(cv2.absdiff(previous_gray, gray))) / 255.0
-            if distance >= 0.48:
+    try:
+        while True:
+            _raise_if_cancelled(cancel)
+            decode_started = time.perf_counter()
+            ok, frame = capture.read()
+            decode_seconds += time.perf_counter() - decode_started
+            if not ok:
+                break
+            decoded_frames += 1
+            position_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+            pts_timestamp = int(position_ms / 1000.0 * TICKS_PER_SECOND) if math.isfinite(position_ms) else -1
+            fallback_timestamp = int(frame_index / fps * TICKS_PER_SECOND)
+            pts_verified = pts_timestamp >= 0 and (frame_index == 0 or pts_timestamp > previous_timestamp)
+            timestamp = pts_timestamp if pts_verified else max(previous_timestamp + nominal_frame_duration, fallback_timestamp)
+            timestamp = max(0, min(source_duration, timestamp))
+            if timestamp >= source_duration:
+                break
+            frame_duration = min(nominal_frame_duration, source_duration - timestamp)
+            if pts_verified:
+                decoded_end = max(decoded_end, timestamp + frame_duration)
+            if pts_verified and not shot_starts:
                 shot_starts.append(timestamp)
-                facts.append(_fact(str(parameters["sourceId"]), timestamp, max(1, int(TICKS_PER_SECOND / fps)),
-                                   CHANNEL_FRAMES, 3, "Measured shot boundary", min(0.99, 0.6 + distance / 2),
-                                   "video-understanding", measurements={"histogram_distance": f"{distance:.6f}"}))
-            facts.append(_fact(str(parameters["sourceId"]), timestamp, max(1, int(0.5 * TICKS_PER_SECOND)),
-                               CHANNEL_MOTION, 1, "Measured frame motion", 0.95,
-                               "video-understanding", measurements={"motion": f"{motion:.6f}"}))
-        previous_hist, previous_gray = histogram, gray
-        sampled += 1
-        frame_index += 1
-        analysis_seconds += time.perf_counter() - analysis_started
-    capture.release()
-    intervals[CHANNEL_FRAMES].append(_interval(0, source_duration, sampled, False, "video-understanding"))
-    intervals[CHANNEL_MOTION].append(_interval(0, source_duration, sampled, False, "video-understanding"))
-    for start, end in dense_ranges:
-        duration = max(1, min(source_duration, end) - max(0, start))
-        dense_samples = max(1, int(duration / TICKS_PER_SECOND * fps))
-        intervals[CHANNEL_FRAMES].append(_interval(max(0, start), duration, dense_samples, True, "video-understanding"))
-        intervals[CHANNEL_MOTION].append(_interval(max(0, start), duration, dense_samples, True, "video-understanding"))
+            previous_timestamp = timestamp
+            dense = any(start <= timestamp <= end for start, end in dense_ranges)
+            if not dense and frame_index % sample_stride:
+                frame_index += 1
+                continue
+            analysis_started = time.perf_counter()
+            if pts_verified:
+                _append_video_coverage(intervals[CHANNEL_FRAMES], timestamp, frame_duration, dense)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            histogram = cv2.calcHist([frame], [0, 1], None, [24, 24], [0, 256, 0, 256])
+            cv2.normalize(histogram, histogram)
+            edge = timestamp <= 360 * TICKS_PER_SECOND or timestamp >= source_duration - 360 * TICKS_PER_SECOND
+            vlm_interval = (15 if edge else 45) * TICKS_PER_SECOND
+            if (parameters.get("profile") == "anime-episode" and
+                    timestamp - last_vlm_timestamp >= vlm_interval):
+                vlm_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                vlm_timestamps.append(timestamp)
+                last_vlm_timestamp = timestamp
+                if ocr is not None:
+                    ocr_started = time.perf_counter()
+                    data = ocr.image_to_data(frame, output_type=ocr.Output.DICT)
+                    ocr_seconds += time.perf_counter() - ocr_started
+                    tokens = [str(value).strip() for value in data.get("text", []) if str(value).strip()]
+                    confidences = [float(value) for value in data.get("conf", []) if str(value) not in {"", "-1"}]
+                    if tokens:
+                        frame_duration = max(1, int(TICKS_PER_SECOND / fps))
+                        confidence = min(0.99, max(0.5, (sum(confidences) / max(1, len(confidences))) / 100))
+                        facts.append(_fact(
+                            str(parameters["sourceId"]), timestamp, frame_duration,
+                            CHANNEL_OCR, 2, "Measured OCR text: " + " ".join(tokens)[:240],
+                            confidence, "video-understanding",
+                            measurements={"token_count": str(len(tokens))}))
+                        intervals[CHANNEL_OCR].append(
+                            _interval(timestamp, frame_duration, 1, False, "video-understanding"))
+            if previous_hist is not None:
+                if pts_verified:
+                    _append_video_coverage(intervals[CHANNEL_MOTION], timestamp, frame_duration, dense)
+                distance = float(cv2.compareHist(previous_hist, histogram, cv2.HISTCMP_BHATTACHARYYA))
+                motion = float(np.mean(cv2.absdiff(previous_gray, gray))) / 255.0
+                if distance >= 0.48:
+                    shot_starts.append(timestamp)
+                    facts.append(_fact(str(parameters["sourceId"]), timestamp, max(1, int(TICKS_PER_SECOND / fps)),
+                                       CHANNEL_FRAMES, 3, "Measured shot boundary", min(0.99, 0.6 + distance / 2),
+                                       "video-understanding", measurements={"histogram_distance": f"{distance:.6f}"}))
+                facts.append(_fact(str(parameters["sourceId"]), timestamp, frame_duration,
+                                   CHANNEL_MOTION, 1, "Measured frame motion", 0.95,
+                                   "video-understanding", measurements={"motion": f"{motion:.6f}"}))
+            previous_hist, previous_gray = histogram, gray
+            sampled += 1
+            frame_index += 1
+            analysis_seconds += time.perf_counter() - analysis_started
+    finally:
+        capture.release()
     channels = [CHANNEL_FRAMES, CHANNEL_MOTION] + ([CHANNEL_OCR] if intervals[CHANNEL_OCR] else [])
     result = empty_index(parameters, "video-understanding", channels)
     result["facts"] = facts
     result["coverage"] = _coverage(str(parameters["sourceId"]), str(parameters["sourceFingerprint"]), source_duration, intervals)
     result["shots"] = [{
         "id": str(uuid.uuid4()), "sourceId": str(parameters["sourceId"]),
-        "sourceRange": _range(start, max(1, (shot_starts[index + 1] if index + 1 < len(shot_starts) else source_duration) - start)),
+        "sourceRange": _range(start, max(1, (shot_starts[index + 1] if index + 1 < len(shot_starts) else decoded_end) - start)),
         "momentIds": [], "factIds": [fact["id"] for fact in facts if fact["kind"] == 3 and fact["sourceRange"]["start"]["ticks"] == start],
         "summary": "Measured shot", "camera": "", "composition": "", "embeddingReference": "",
-    } for index, start in enumerate(shot_starts) if start < source_duration]
+    } for index, start in enumerate(shot_starts) if start < decoded_end]
     vision_seconds = 0.0
     if parameters.get("profile") == "anime-episode" and vlm_frames:
         vision_started = time.perf_counter()
         role_facts, hypotheses = classify_anime_segments(
-            vlm_frames, vlm_timestamps, shot_starts, parameters, assets)
+            vlm_frames, vlm_timestamps, shot_starts, parameters, assets, cancel)
         vision_seconds = time.perf_counter() - vision_started
         result["facts"].extend(role_facts)
         result["segmentRoleHypotheses"] = hypotheses
@@ -552,7 +632,9 @@ def _refine_music_segments(segments: list[dict[str, Any]], assets: list[Asset],
 
 def _classify_anime_segments_gguf(
         frames: list[Any], timestamps: list[int], shot_starts: list[int],
-        parameters: dict[str, Any], assets: list[Asset]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        parameters: dict[str, Any], assets: list[Asset],
+        cancel: CancelCheck = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    _raise_if_cancelled(cancel)
     try:
         import cv2
         import requests
@@ -588,6 +670,7 @@ def _classify_anime_segments_gguf(
     session.trust_env = False
     for batch_frames, batch_timestamps, batch_hint in _anime_frame_batches(
             frames, timestamps, source_duration):
+        _raise_if_cancelled(cancel)
         timestamp_list = ", ".join(f"image {index + 1}={ticks / TICKS_PER_SECOND:.3f}s"
                                    for index, ticks in enumerate(batch_timestamps))
         prompt = (
@@ -605,6 +688,7 @@ def _classify_anime_segments_gguf(
         )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for frame in batch_frames:
+            _raise_if_cancelled(cancel)
             height, width = frame.shape[:2]
             maximum = max(height, width)
             if maximum > 768:
@@ -633,9 +717,11 @@ def _classify_anime_segments_gguf(
             },
         }
         with _LLAMA_INFERENCE_LOCK:
+            _raise_if_cancelled(cancel)
             response = session.post(
-                _llama_endpoint() + "/v1/chat/completions", json=request,
+                _llama_endpoint(cancel) + "/v1/chat/completions", json=request,
                 timeout=(30, max(120, int(os.environ.get("KADR_LLAMA_INFERENCE_TIMEOUT", "1800")))))
+        _raise_if_cancelled(cancel)
         if response.status_code != 200:
             raise RuntimeError(f"Qwen3-VL GGUF failed with HTTP {response.status_code}: {response.text[:500]}")
         raw = str(response.json()["choices"][0]["message"]["content"]).strip()
@@ -657,6 +743,7 @@ def _classify_anime_segments_gguf(
     facts: list[dict[str, Any]] = []
     hypotheses: list[dict[str, Any]] = []
     for item in payload_segments:
+        _raise_if_cancelled(cancel)
         role_name = str(item.get("role", ""))
         if role_name not in role_values:
             continue
@@ -712,13 +799,18 @@ def _classify_anime_segments_gguf(
 
 
 def classify_anime_segments(frames: list[Any], timestamps: list[int], shot_starts: list[int],
-                            parameters: dict[str, Any], assets: list[Asset]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                            parameters: dict[str, Any], assets: list[Asset],
+                            cancel: CancelCheck = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    _raise_if_cancelled(cancel)
     if _reasoning_backend() not in {"llama.cpp", "llama-cpp", "gguf"}:
         raise CapabilityUnavailable("Only pre-quantized GGUF vision inference is allowed")
-    return _classify_anime_segments_gguf(frames, timestamps, shot_starts, parameters, assets)
+    return _classify_anime_segments_gguf(frames, timestamps, shot_starts, parameters, assets, cancel)
 
 
-def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+def analyze_audio(
+        assets: list[Asset], parameters: dict[str, Any],
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     total_started = time.perf_counter()
     try:
         import numpy as np
@@ -733,6 +825,7 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     decoded_samples = 0
     decode_analysis_seconds = 0.0
     for asset in sorted((item for item in assets if item.kind == "audio-chunk"), key=lambda item: (item.stream_index or -1, item.order)):
+        _raise_if_cancelled(cancel)
         asset_started = time.perf_counter()
         audio_info = sf.info(str(asset.path))
         source_open_count += 1
@@ -741,6 +834,7 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
         sample_count = 0
         square_sum = 0.0
         for block in sf.blocks(str(asset.path), blocksize=state_window, dtype="float32", always_2d=False):
+            _raise_if_cancelled(cancel)
             if getattr(block, "ndim", 1) > 1:
                 block = np.mean(block, axis=1)
             if len(block) == 0:
@@ -798,7 +892,10 @@ def analyze_audio(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, 
     return result
 
 
-def analyze_asr(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+def analyze_asr(
+        assets: list[Asset], parameters: dict[str, Any],
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     try:
         from faster_whisper import WhisperModel
     except ImportError as exception:
@@ -815,13 +912,16 @@ def analyze_asr(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, An
     facts: list[dict[str, Any]] = []
     intervals: list[dict[str, Any]] = []
     for asset in sorted(selected, key=lambda item: item.order):
+        _raise_if_cancelled(cancel)
         segments, _ = model.transcribe(
             str(asset.path), language=language, beam_size=5,
             word_timestamps=True, vad_filter=True)
         count = 0
         max_end = 0
         for segment in segments:
+            _raise_if_cancelled(cancel)
             for word in segment.words or []:
+                _raise_if_cancelled(cancel)
                 if word.start is None or word.end is None:
                     continue
                 start_seconds = float(word.start)
@@ -849,7 +949,10 @@ def analyze_asr(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, An
     return result
 
 
-def analyze_diarization(assets: list[Asset], parameters: dict[str, Any]) -> dict[str, Any]:
+def analyze_diarization(
+        assets: list[Asset], parameters: dict[str, Any],
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     try:
         import torch
         from pyannote.audio import Pipeline
@@ -870,9 +973,11 @@ def analyze_diarization(assets: list[Asset], parameters: dict[str, Any]) -> dict
     facts: list[dict[str, Any]] = []
     intervals: list[dict[str, Any]] = []
     for asset in sorted(selected, key=lambda item: item.order):
+        _raise_if_cancelled(cancel)
         annotation = pipeline(str(asset.path))
         max_end = 0.0
         for turn, _, speaker in annotation.itertracks(yield_label=True):
+            _raise_if_cancelled(cancel)
             start = asset.start_ticks + int(float(turn.start) * TICKS_PER_SECOND)
             duration = max(1, int(float(turn.end - turn.start) * TICKS_PER_SECOND))
             speaker_id = str(speaker)
@@ -896,7 +1001,10 @@ def analyze_diarization(assets: list[Asset], parameters: dict[str, Any]) -> dict
     return result
 
 
-def analyze_embedding(assets: list[Asset], parameters: dict[str, Any], data_root: Path) -> dict[str, Any]:
+def analyze_embedding(
+        assets: list[Asset], parameters: dict[str, Any], data_root: Path,
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     try:
         import numpy as np
         import onnxruntime as ort
@@ -927,6 +1035,7 @@ def analyze_embedding(assets: list[Asset], parameters: dict[str, Any], data_root
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
     def encode(values: list[str]) -> Any:
+        _raise_if_cancelled(cancel)
         encoded = tokenizer.encode_batch(values)
         input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
         attention = np.asarray([item.attention_mask for item in encoded], dtype=np.int64)
@@ -935,6 +1044,7 @@ def analyze_embedding(assets: list[Asset], parameters: dict[str, Any], data_root
         if "token_type_ids" in available:
             inputs["token_type_ids"] = np.asarray([item.type_ids for item in encoded], dtype=np.int64)
         token_embeddings = session.run(None, inputs)[0]
+        _raise_if_cancelled(cancel)
         mask = attention[:, :, None].astype(np.float32)
         vectors = (token_embeddings * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1e-9)
         return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
@@ -964,7 +1074,10 @@ def analyze_embedding(assets: list[Asset], parameters: dict[str, Any], data_root
     }
 
 
-def _analyze_llama_reasoning(parameters: dict[str, Any], analyzer: str) -> dict[str, Any]:
+def _analyze_llama_reasoning(
+        parameters: dict[str, Any], analyzer: str,
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     try:
         import requests
         from jsonschema import validate as validate_json
@@ -995,11 +1108,13 @@ def _analyze_llama_reasoning(parameters: dict[str, Any], analyzer: str) -> dict[
     session = requests.Session()
     session.trust_env = False
     with _LLAMA_INFERENCE_LOCK:
+        _raise_if_cancelled(cancel)
         response = session.post(
-            _llama_endpoint() + "/v1/chat/completions",
+            _llama_endpoint(cancel) + "/v1/chat/completions",
             json=payload,
             timeout=(30, max(120, int(os.environ.get("KADR_LLAMA_INFERENCE_TIMEOUT", "1800")))),
         )
+    _raise_if_cancelled(cancel)
     if response.status_code != 200:
         raise RuntimeError(f"llama.cpp reasoning failed with HTTP {response.status_code}: {response.text[:500]}")
     answer = response.json()
@@ -1014,32 +1129,43 @@ def _analyze_llama_reasoning(parameters: dict[str, Any], analyzer: str) -> dict[
     }
 
 
-def analyze_reasoning(parameters: dict[str, Any], analyzer: str) -> dict[str, Any]:
+def analyze_reasoning(
+        parameters: dict[str, Any], analyzer: str,
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     if _reasoning_backend() not in {"llama.cpp", "llama-cpp", "gguf"}:
         raise CapabilityUnavailable("Only pre-quantized GGUF reasoning is allowed")
-    return _analyze_llama_reasoning(parameters, analyzer)
+    return _analyze_llama_reasoning(parameters, analyzer, cancel)
 
 
-def run_analyzer(analyzer: str, assets: list[Asset], parameters: dict[str, Any], data_root: Path) -> dict[str, Any]:
+def run_analyzer(
+        analyzer: str, assets: list[Asset], parameters: dict[str, Any], data_root: Path,
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     if analyzer == "video-understanding":
-        return analyze_video(assets, parameters)
-    if analyzer == "audio-events":
-        return analyze_audio(assets, parameters)
-    if analyzer == "asr-align":
-        return analyze_asr(assets, parameters)
-    if analyzer == "embedding":
-        return analyze_embedding(assets, parameters, data_root)
-    if analyzer == "anime-upscale":
-        return analyze_anime_upscale(assets, parameters, data_root)
-    if analyzer == "diarization":
-        return analyze_diarization(assets, parameters)
-    if analyzer in {"director", "critic"}:
-        return analyze_reasoning(parameters, analyzer)
-    raise ValueError(f"unknown analyzer {analyzer}")
+        result = analyze_video(assets, parameters, cancel)
+    elif analyzer == "audio-events":
+        result = analyze_audio(assets, parameters, cancel)
+    elif analyzer == "asr-align":
+        result = analyze_asr(assets, parameters, cancel)
+    elif analyzer == "embedding":
+        result = analyze_embedding(assets, parameters, data_root, cancel)
+    elif analyzer == "anime-upscale":
+        result = analyze_anime_upscale(assets, parameters, data_root, cancel)
+    elif analyzer == "diarization":
+        result = analyze_diarization(assets, parameters, cancel)
+    elif analyzer in {"director", "critic"}:
+        result = analyze_reasoning(parameters, analyzer, cancel)
+    else:
+        raise ValueError(f"unknown analyzer {analyzer}")
+    _raise_if_cancelled(cancel)
+    return result
 
 
 def analyze_anime_upscale(
-        assets: list[Asset], parameters: dict[str, Any], data_root: Path) -> dict[str, Any]:
+        assets: list[Asset], parameters: dict[str, Any], data_root: Path,
+        cancel: CancelCheck = None) -> dict[str, Any]:
+    _raise_if_cancelled(cancel)
     if len(assets) != 1:
         raise ValueError("anime-upscale requires exactly one bounded video asset")
     duration_ticks = int(parameters.get("durationTicks", 0))
@@ -1066,9 +1192,8 @@ def analyze_anime_upscale(
         "--outscale", scale, "--crf", str(max(0, min(51, int(parameters.get("crf", 14))))),
     ]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    result = subprocess.run(
-        command, cwd=str(data_root), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", creationflags=creation_flags)
+    result = _run_process_cancellable(
+        command, cwd=str(data_root), cancel=cancel, creationflags=creation_flags)
     try:
         if result.returncode != 0 or not output.is_file():
             diagnostic = next(

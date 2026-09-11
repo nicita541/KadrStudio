@@ -38,7 +38,9 @@ public sealed record AnalyzerJobRequest(
     string AnalyzerVersion,
     string[] AssetIds,
     JsonElement Parameters,
-    bool RequireProduction = true);
+    bool RequireProduction = true,
+    string? OwnerId = null,
+    string? RequestId = null);
 
 public sealed record AnalyzerJobResponse(
     Guid Id,
@@ -51,7 +53,12 @@ public sealed record AnalyzerJobResponse(
     string? ErrorCode,
     string? Error,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt)
+{
+    public string? StorageError { get; init; }
+    public string? OwnerId { get; init; }
+    public int OwnershipProtocolVersion { get; init; } = 1;
+}
 
 public sealed record RoleStructuredReasoningRequest(
     ReasoningRole Role,

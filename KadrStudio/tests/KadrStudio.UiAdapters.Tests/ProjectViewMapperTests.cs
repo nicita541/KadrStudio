@@ -272,13 +272,15 @@ public sealed class ProjectViewMapperTests
         {
             var path = Path.Combine(root, "settings.json");
             var cacheRoot = Path.Combine(root, "cache");
+            var ownerId = Guid.NewGuid();
             var service = new WorkspaceSettingsService(path);
-            await service.SaveAsync(new WorkspaceSettings(cacheRoot, 2L * 1024 * 1024 * 1024));
+            await service.SaveAsync(new WorkspaceSettings(cacheRoot, 2L * 1024 * 1024 * 1024, ownerId));
 
             var restored = new WorkspaceSettingsService(path).Load();
 
             Assert.Equal(Path.GetFullPath(cacheRoot), restored.ArtifactRoot);
             Assert.Equal(2L * 1024 * 1024 * 1024, restored.ArtifactDiskBudgetBytes);
+            Assert.Equal(ownerId, restored.ArtifactCacheOwnerId);
             await File.WriteAllTextAsync(path, "{not-json");
             Assert.Equal(WorkspaceSettings.Default, new WorkspaceSettingsService(path).Load());
         }

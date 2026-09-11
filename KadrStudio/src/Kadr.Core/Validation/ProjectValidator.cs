@@ -138,7 +138,7 @@ public sealed class ProjectValidator : IProjectValidator
         foreach (var linkGroup in project.MediaClips.Where(item => item.LinkGroupId.HasValue).GroupBy(item => item.LinkGroupId!.Value))
         {
             var clips = linkGroup.ToArray();
-            if (clips.Length < 2)
+            if (clips.Length + project.SubtitleClips.Count(item => item.LinkGroupId == linkGroup.Key) < 2)
             {
                 errors.Add(new("link.orphan", "A link group must contain at least two clips.", linkGroup.Key));
                 continue;

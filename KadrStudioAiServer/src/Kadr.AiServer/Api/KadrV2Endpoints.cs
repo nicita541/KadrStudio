@@ -34,6 +34,10 @@ public static class KadrV2Endpoints
             {
                 return Error(exception.ErrorCode, exception.Message, StatusCodes.Status400BadRequest);
             }
+            catch (StorageQuotaException exception)
+            {
+                return Error(exception.ErrorCode, exception.Message, StatusCodes.Status507InsufficientStorage);
+            }
             catch (BadHttpRequestException exception)
             {
                 return Error("invalid_upload", exception.Message, StatusCodes.Status400BadRequest);
@@ -78,9 +82,20 @@ public static class KadrV2Endpoints
             }
             catch (AnalyzerJobException exception)
             {
-                return Error(exception.ErrorCode, exception.Message, StatusCodes.Status400BadRequest);
+                return Error(
+                    exception.ErrorCode,
+                    exception.Message,
+                    exception.ErrorCode == "queue_full"
+                        ? StatusCodes.Status429TooManyRequests
+                        : StatusCodes.Status400BadRequest);
+            }
+            catch (StorageQuotaException exception)
+            {
+                return Error(exception.ErrorCode, exception.Message, StatusCodes.Status507InsufficientStorage);
             }
         });
+
+        app.MapGet("/v2/metrics", (AnalyzerJobService jobs) => Results.Json(jobs.GetMetrics()));
 
         app.MapGet("/v2/jobs/{id:guid}", (Guid id, AnalyzerJobService jobs) =>
             jobs.Find(id) is { } job
@@ -89,13 +104,21 @@ public static class KadrV2Endpoints
 
         app.MapDelete("/v2/jobs/{id:guid}", async (
             Guid id,
+            string? ownerId,
             AnalyzerJobService jobs,
             CancellationToken cancellationToken) =>
         {
-            var job = await jobs.CancelAsync(id, cancellationToken).ConfigureAwait(false);
-            return job is null
-                ? Error("job_not_found", "Analyzer job was not found.", StatusCodes.Status404NotFound)
-                : Results.Json(job);
+            try
+            {
+                var job = await jobs.CancelAsync(id, cancellationToken, ownerId).ConfigureAwait(false);
+                return job is null
+                    ? Error("job_not_found", "Analyzer job was not found.", StatusCodes.Status404NotFound)
+                    : Results.Json(job);
+            }
+            catch (AnalyzerJobException exception) when (exception.ErrorCode == "job_owner_mismatch")
+            {
+                return Error(exception.ErrorCode, exception.Message, StatusCodes.Status403Forbidden);
+            }
         });
 
         app.MapPost("/v2/accelerator/release", async (

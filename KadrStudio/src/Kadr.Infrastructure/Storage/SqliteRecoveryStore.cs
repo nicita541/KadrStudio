@@ -38,24 +38,27 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
                 : [];
             var snapshot = ProjectDocumentSerializer.Serialize(project);
             var normalizedReason = string.IsNullOrWhiteSpace(reason) ? "Изменение проекта" : reason.Trim();
-            var latest = previous.OrderByDescending(item => item.UpdatedAt).FirstOrDefault();
+            var latest = previous.MaxBy(item => item.SaveOrdinal);
+            var ordinal = checked((latest?.SaveOrdinal ?? 0) + 1);
+            var savedAt = DateTimeOffset.UtcNow;
             var entry = latest is not null && latest.Revision == project.Revision && latest.Snapshot == snapshot
-                ? latest with { UpdatedAt = project.UpdatedAt, Reason = normalizedReason }
+                ? latest with { SavedAt = savedAt, SaveOrdinal = ordinal, Reason = normalizedReason }
                 : new RecoveryEntry(
                     Guid.NewGuid(), project.Id, project.Name, project.Revision, project.UpdatedAt,
-                    normalizedReason, snapshot, Checksum(snapshot));
+                    normalizedReason, snapshot, Checksum(snapshot), savedAt, ordinal);
             var entries = previous
                 .Where(item => item.Id != entry.Id)
                 .Append(entry)
-                .OrderByDescending(item => item.UpdatedAt)
+                .OrderByDescending(item => item.SaveOrdinal)
                 .Take(MaximumVersionsPerProject)
-                .OrderBy(item => item.UpdatedAt)
+                .OrderBy(item => item.SaveOrdinal)
                 .ToArray();
             await using var connection = await OpenAsync(temporaryPath, readOnly: false, cancellationToken).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.CommandText = """
                 PRAGMA journal_mode=DELETE;
                 PRAGMA synchronous=FULL;
+                PRAGMA user_version=2;
                 CREATE TABLE recovery_entries(
                     id TEXT PRIMARY KEY CHECK(length(id)=32),
                     project_id TEXT NOT NULL CHECK(length(project_id)=32),
@@ -64,7 +67,9 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
                     updated_at TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     snapshot_json TEXT NOT NULL CHECK(length(snapshot_json)>2),
-                    snapshot_checksum TEXT NOT NULL CHECK(length(snapshot_checksum)=64)
+                    snapshot_checksum TEXT NOT NULL CHECK(length(snapshot_checksum)=64),
+                    saved_at TEXT NOT NULL,
+                    save_ordinal INTEGER NOT NULL UNIQUE CHECK(save_ordinal>0)
                 ) STRICT;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -79,6 +84,12 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         }
     }
 
+    public async Task<bool> IsLatestSnapshotAsync(ProjectState project, CancellationToken cancellationToken = default)
+    {
+        var latest = await LoadAsync(project.Id, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return latest is not null && ProjectDocumentSerializer.Serialize(latest) == ProjectDocumentSerializer.Serialize(project);
+    }
+
     public async Task<ProjectState?> LoadAsync(
         Guid projectId,
         Guid? recoveryId = null,
@@ -89,7 +100,7 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         var entries = await ReadEntriesAsync(path, cancellationToken).ConfigureAwait(false);
         var entry = recoveryId is Guid id
             ? entries.SingleOrDefault(item => item.Id == id && item.ProjectId == projectId)
-            : entries.Where(item => item.ProjectId == projectId).MaxBy(item => item.UpdatedAt);
+            : entries.Where(item => item.ProjectId == projectId).MaxBy(item => item.SaveOrdinal);
         if (entry is null) return null;
         VerifyChecksum(entry);
         var project = ProjectDocumentSerializer.Deserialize(entry.Snapshot);
@@ -99,22 +110,27 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
 
     public async Task<IReadOnlyList<RecoveryProjectInfo>> ListAsync(CancellationToken cancellationToken = default)
     {
-        var results = new List<RecoveryProjectInfo>();
+        var results = new List<RecoveryEntry>();
         foreach (var path in Directory.EnumerateFiles(_root, "*.recovery.kadr", SearchOption.TopDirectoryOnly))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                foreach (var entry in await ReadEntriesAsync(path, cancellationToken).ConfigureAwait(false))
-                    results.Add(new RecoveryProjectInfo(
-                        entry.Id, entry.ProjectId, entry.Name, entry.Revision, entry.UpdatedAt, entry.Reason));
+                results.AddRange(await ReadEntriesAsync(path, cancellationToken).ConfigureAwait(false));
             }
             catch (SqliteException)
             {
                 // One damaged recovery file cannot hide all other recoverable projects.
             }
         }
-        return results.OrderByDescending(item => item.UpdatedAt).ToArray();
+        // Ordinals order saves within a document even after a clock rollback or
+        // migration from legacy entries whose only timestamp belonged to the document.
+        return results.GroupBy(item => item.ProjectId)
+            .OrderByDescending(group => group.MaxBy(item => item.SaveOrdinal)!.SavedAt)
+            .SelectMany(group => group.OrderByDescending(item => item.SaveOrdinal))
+            .Select(entry => new RecoveryProjectInfo(
+                entry.Id, entry.ProjectId, entry.Name, entry.Revision, entry.SavedAt, entry.Reason))
+            .ToArray();
     }
 
     public async Task DeleteAsync(
@@ -163,8 +179,8 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         await using var command = connection.CreateCommand();
         command.CommandText = """
             INSERT INTO recovery_entries(
-                id, project_id, project_name, revision, updated_at, reason, snapshot_json, snapshot_checksum)
-            VALUES($id, $projectId, $name, $revision, $updatedAt, $reason, $snapshot, $checksum);
+                id, project_id, project_name, revision, updated_at, reason, snapshot_json, snapshot_checksum, saved_at, save_ordinal)
+            VALUES($id, $projectId, $name, $revision, $updatedAt, $reason, $snapshot, $checksum, $savedAt, $ordinal);
             """;
         command.Parameters.AddWithValue("$id", entry.Id.ToString("N"));
         command.Parameters.AddWithValue("$projectId", entry.ProjectId.ToString("N"));
@@ -174,6 +190,8 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         command.Parameters.AddWithValue("$reason", entry.Reason);
         command.Parameters.AddWithValue("$snapshot", entry.Snapshot);
         command.Parameters.AddWithValue("$checksum", entry.Checksum);
+        command.Parameters.AddWithValue("$savedAt", entry.SavedAt.ToString("O", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$ordinal", entry.SaveOrdinal);
         await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
     }
 
@@ -184,8 +202,16 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         schema.CommandText = "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='recovery_entries';";
         var hasVersionedSchema = Convert.ToInt64(
             await schema.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture) > 0;
+        schema.CommandText = "SELECT COUNT(*) FROM pragma_table_info('recovery_entries') WHERE name='save_ordinal';";
+        var hasSaveOrdinal = Convert.ToInt64(await schema.ExecuteScalarAsync(token).ConfigureAwait(false),
+            CultureInfo.InvariantCulture) > 0;
         await using var command = connection.CreateCommand();
-        command.CommandText = hasVersionedSchema
+        command.CommandText = hasSaveOrdinal
+            ? """
+                SELECT id, project_id, project_name, revision, updated_at, reason, snapshot_json, snapshot_checksum, saved_at, save_ordinal
+                FROM recovery_entries ORDER BY save_ordinal;
+                """
+            : hasVersionedSchema
             ? """
                 SELECT id, project_id, project_name, revision, updated_at, reason, snapshot_json, snapshot_checksum
                 FROM recovery_entries ORDER BY updated_at;
@@ -205,7 +231,9 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
                     Guid.ParseExact(reader.GetString(1), "N"),
                     reader.GetString(2), reader.GetInt64(3),
                     DateTimeOffset.Parse(reader.GetString(4), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    reader.GetString(5), reader.GetString(6), reader.GetString(7)));
+                    reader.GetString(5), reader.GetString(6), reader.GetString(7),
+                    DateTimeOffset.Parse(reader.GetString(hasSaveOrdinal ? 8 : 4), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+                    hasSaveOrdinal ? reader.GetInt64(9) : entries.Count + 1));
             }
             else
             {
@@ -213,7 +241,8 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
                 entries.Add(new RecoveryEntry(
                     RecoveryId(snapshot), Guid.ParseExact(reader.GetString(0), "N"), reader.GetString(1), reader.GetInt64(2),
                     DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-                    reader.GetString(4), snapshot, Checksum(snapshot)));
+                    reader.GetString(4), snapshot, Checksum(snapshot),
+                    DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind), 1));
             }
         }
         return entries;
@@ -258,5 +287,7 @@ public sealed class SqliteRecoveryStore : IRecoveryStore
         DateTimeOffset UpdatedAt,
         string Reason,
         string Snapshot,
-        string Checksum);
+        string Checksum,
+        DateTimeOffset SavedAt,
+        long SaveOrdinal);
 }

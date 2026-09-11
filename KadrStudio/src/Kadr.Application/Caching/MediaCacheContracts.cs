@@ -41,14 +41,19 @@ public sealed record MediaCacheSnapshot(long MemoryBytes, long DiskBytes, int Me
 public sealed record ArtifactStoreOptions(
     string Root,
     long DiskBudgetBytes = 8L * 1024 * 1024 * 1024,
-    long MemoryBudgetBytes = 128L * 1024 * 1024)
+    long MemoryBudgetBytes = 128L * 1024 * 1024,
+    Guid OwnershipId = default)
 {
     public ArtifactStoreOptions Normalize()
     {
         if (string.IsNullOrWhiteSpace(Root)) throw new ArgumentException("An artifact root is required.", nameof(Root));
         if (DiskBudgetBytes < 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(DiskBudgetBytes));
         if (MemoryBudgetBytes < 1024 * 1024) throw new ArgumentOutOfRangeException(nameof(MemoryBudgetBytes));
-        return this with { Root = Path.GetFullPath(Root) };
+        return this with
+        {
+            Root = Path.GetFullPath(Root),
+            OwnershipId = OwnershipId == Guid.Empty ? Guid.NewGuid() : OwnershipId
+        };
     }
 }
 
@@ -64,6 +69,10 @@ public interface IMediaArtifactCache : IAsyncDisposable
 public interface IArtifactStore : IMediaArtifactCache
 {
     ArtifactStoreOptions Options { get; }
+    /// <summary>Prevents maintenance from removing a raw payload until all callers release it.
+    /// May be acquired before publication; does not validate payload integrity.</summary>
+    Task<IDisposable> PinAsync(MediaCacheKey key, string extension, CancellationToken cancellationToken = default);
+    void SetProtectedPaths(IReadOnlyCollection<string> paths);
     string GetPayloadPath(MediaCacheKey key, string extension);
     Task<string?> TryGetPayloadPathAsync(
         MediaCacheKey key,
@@ -74,7 +83,12 @@ public interface IArtifactStore : IMediaArtifactCache
         string sourcePath,
         string extension,
         CancellationToken cancellationToken = default);
-    Task MoveAsync(string newRoot, CancellationToken cancellationToken = default);
+    Task MoveAsync(
+        string selectedParent,
+        IReadOnlyCollection<string>? protectedPaths = null,
+        CancellationToken cancellationToken = default);
     Task SetDiskBudgetAsync(long diskBudgetBytes, CancellationToken cancellationToken = default);
-    Task ClearAsync(CancellationToken cancellationToken = default);
+    Task ClearAsync(
+        IReadOnlyCollection<string>? protectedPaths = null,
+        CancellationToken cancellationToken = default);
 }

@@ -5,6 +5,30 @@ namespace KadrStudio.AiServer.Tests;
 public sealed class ContentAddressedArtifactStoreTests
 {
     [Fact]
+    public async Task Corrupted_payload_is_a_miss_and_repeated_put_repairs_payload_and_metadata()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kadr-artifact-repair-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var store = new ContentAddressedArtifactStore(root);
+            var payload = System.Text.Encoding.UTF8.GetBytes("{\"verified\":true}");
+            var id = await store.PutJsonAsync(payload, CancellationToken.None);
+            var original = store.Find(id)!;
+            await File.WriteAllTextAsync(original.Path, "{");
+            Assert.Null(store.Find(id));
+            var metadata = Path.Combine(Path.GetDirectoryName(original.Path)!, id + ".meta.json");
+            await File.WriteAllTextAsync(metadata, "{");
+
+            Assert.Equal(id, await store.PutJsonAsync(payload, CancellationToken.None));
+            var repaired = Assert.IsType<StoredArtifact>(new ContentAddressedArtifactStore(root).Find(id));
+            Assert.Equal(payload, await File.ReadAllBytesAsync(repaired.Path));
+            Assert.Empty(Directory.GetFiles(root, "*.tmp", SearchOption.AllDirectories));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task Binary_video_artifact_preserves_media_type_length_and_content()
     {
         var root = Path.Combine(Path.GetTempPath(), "kadr-artifact-tests", Guid.NewGuid().ToString("N"));

@@ -100,7 +100,9 @@ public sealed class AiServerV2Client(
         string analyzerVersion,
         IReadOnlyList<string> assetIds,
         object parameters,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? ownerId = null,
+        string? requestId = null)
     {
         using var response = await _client.PostAsJsonAsync(
             "v2/jobs",
@@ -110,6 +112,8 @@ public sealed class AiServerV2Client(
                 analyzerVersion,
                 assetIds,
                 parameters,
+                ownerId,
+                requestId,
                 requireProduction = _requireProduction
             },
             Json,
@@ -117,6 +121,9 @@ public sealed class AiServerV2Client(
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         var job = await response.Content.ReadFromJsonAsync<AiServerJob>(Json, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("AI server returned an empty job response.");
+        if (ownerId is not null && (job.OwnershipProtocolVersion != 1 ||
+            !string.Equals(job.State, "Succeeded", StringComparison.OrdinalIgnoreCase) && job.OwnerId != ownerId))
+            throw new InvalidDataException("AI server did not confirm job ownership. Update the server before running owned analysis jobs.");
         return job.Id;
     }
 
@@ -163,6 +170,8 @@ public sealed class AiServerV2Client(
         IProgress<double>? progress,
         CancellationToken cancellationToken)
     {
+        if (id.Length != 64 || id.Any(character => !Uri.IsHexDigit(character)))
+            throw new ArgumentException("Artifact identity must be a SHA-256 digest.", nameof(id));
         var started = Stopwatch.GetTimestamp();
         using var response = await _client.GetAsync(
             $"v2/artifacts/{id}", HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
@@ -175,20 +184,29 @@ public sealed class AiServerV2Client(
         try
         {
             await using var input = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            await using var output = new FileStream(
-                temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            var buffer = new byte[1024 * 1024];
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             long received = 0;
-            while (true)
+            await using (var output = new FileStream(
+                temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                var count = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                if (count == 0) break;
-                await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-                received += count;
-                if (total is > 0) progress?.Report(Math.Clamp(received / (double)total.Value, 0, 1));
+                var buffer = new byte[1024 * 1024];
+                while (true)
+                {
+                    var count = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    if (count == 0) break;
+                    await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+                    hash.AppendData(buffer, 0, count);
+                    received += count;
+                    if (total is > 0) progress?.Report(Math.Clamp(received / (double)total.Value, 0, 1));
+                }
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
-            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (total is { } expectedLength && received != expectedLength)
+                throw new InvalidDataException("Artifact download length does not match Content-Length.");
+            if (!CryptographicOperations.FixedTimeEquals(hash.GetHashAndReset(), Convert.FromHexString(id)))
+                throw new InvalidDataException("Artifact download checksum does not match its identity.");
+            cancellationToken.ThrowIfCancellationRequested();
             File.Move(temporary, destinationPath, overwrite: true);
             progress?.Report(1);
             RecordTransport("artifact_download_duration_ms", Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -201,9 +219,10 @@ public sealed class AiServerV2Client(
         }
     }
 
-    public async Task CancelJobAsync(Guid id, CancellationToken cancellationToken = default)
+    public async Task CancelJobAsync(Guid id, CancellationToken cancellationToken = default, string? ownerId = null)
     {
-        using var response = await _client.DeleteAsync($"v2/jobs/{id:D}", cancellationToken).ConfigureAwait(false);
+        var query = ownerId is null ? "" : "?ownerId=" + Uri.EscapeDataString(ownerId);
+        using var response = await _client.DeleteAsync($"v2/jobs/{id:D}" + query, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode != HttpStatusCode.NotFound)
             await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
@@ -344,7 +363,9 @@ public sealed record AiServerJob(
     string Message,
     string[] ArtifactIds,
     string? ErrorCode,
-    string? Error);
+    string? Error,
+    string? OwnerId = null,
+    int OwnershipProtocolVersion = 0);
 
 internal sealed record AssetUploadStatus(
     string AssetId,

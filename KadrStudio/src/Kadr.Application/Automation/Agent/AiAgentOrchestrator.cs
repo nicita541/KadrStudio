@@ -81,6 +81,19 @@ public sealed class AiAgentOrchestrator
         return CurrentTask!;
     }
 
+    public void ReconcileProject(KadrStudio.Core.Domain.ProjectState project)
+    {
+        AgentTaskState? changed;
+        lock (_sync)
+        {
+            if (_currentTask is null) return;
+            changed = Recovery.AgentTaskReferences.Reconcile(_currentTask, project);
+            if (ReferenceEquals(changed, _currentTask)) return;
+            _currentTask = changed;
+        }
+        Publish(changed);
+    }
+
     public AgentTaskState BeginEditorialStage(AgentTaskPhase stage, string? note = null)
     {
         if (stage is not (AgentTaskPhase.Indexing or AgentTaskPhase.Directing or AgentTaskPhase.Retrieving or

@@ -2,11 +2,14 @@ using System.IO.Pipes;
 using System.Diagnostics;
 using System.Threading.Channels;
 using KadrStudio.Application.Preview;
+using KadrStudio.Infrastructure.Preview;
 
 namespace KadrStudio.MediaHost;
 
 public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsyncDisposable
 {
+    private const int FrameSlotCapacity = 48 * 1024 * 1024;
+    private const int FrameSlotCount = 3;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly HostPlaybackSession _playback = new(ffmpegPath);
     private readonly Channel<MediaHostPacket> _events = Channel.CreateBounded<MediaHostPacket>(
@@ -24,10 +27,13 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
     private long _queueDepth;
     private long _pipeWriteTicks;
     private long _pipeFrameBytes;
+    private readonly string _frameBufferName = pipeName + "-frames";
+    private SharedFrameRingWriter? _frameRing;
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        _frameRing = SharedFrameRingWriter.Create(_frameBufferName, FrameSlotCapacity, FrameSlotCount);
         _pipe = new NamedPipeServerStream(
             pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.WriteThrough);
@@ -59,6 +65,7 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
         if (_eventWriter is not null)
             try { await _eventWriter.ConfigureAwait(false); } catch { }
         _pipe?.Dispose();
+        _frameRing?.Dispose();
         _writeGate.Dispose();
     }
 
@@ -75,7 +82,9 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
                             $"MediaHost protocol {hello.ProtocolVersion} is incompatible with {MediaHostProtocol.Version}.");
                     await WriteAsync(MediaHostPacket.Create(
                         MediaHostPacketType.HelloAccepted,
-                        new MediaHostHello(MediaHostProtocol.Version, Environment.ProcessId),
+                        new MediaHostHello(
+                            MediaHostProtocol.Version, Environment.ProcessId,
+                            _frameBufferName, FrameSlotCapacity, FrameSlotCount),
                         packet.CorrelationId), cancellationToken).ConfigureAwait(false);
                     break;
                 case MediaHostPacketType.Prepare:
@@ -95,8 +104,11 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
                     await AcknowledgeAsync(packet, cancellationToken).ConfigureAwait(false);
                     break;
                 case MediaHostPacketType.Seek:
-                    await _playback.SeekAsync(packet.ReadHeader<MediaHostSeek>().Position, cancellationToken)
-                        .ConfigureAwait(false);
+                    var seek = packet.ReadHeader<MediaHostSeek>();
+                    if (seek.Generation is { } generation)
+                        await _playback.SeekAsync(seek.Position, generation, cancellationToken).ConfigureAwait(false);
+                    else
+                        await _playback.SeekAsync(seek.Position, cancellationToken).ConfigureAwait(false);
                     await AcknowledgeAsync(packet, cancellationToken).ConfigureAwait(false);
                     break;
                 case MediaHostPacketType.Pause:
@@ -155,10 +167,19 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
             MediaHostPacketType.StateChanged, new MediaHostState(state, _playback.Position)));
 
     private void Playback_FramePresented(object? sender, VideoFrame frame)
-        => Queue(MediaHostPacket.Create(
+    {
+        if (_frameRing?.TryWrite(frame, out var descriptor) != true)
+        {
+            Interlocked.Increment(ref _framesDropped);
+            return;
+        }
+        Interlocked.Add(ref _pipeFrameBytes, descriptor.ValidLength);
+        Queue(MediaHostPacket.Create(
             MediaHostPacketType.VideoFrame,
-            new MediaHostFrameHeader(frame.Position, frame.Width, frame.Height, frame.Stride, frame.Generation),
-            payload: frame.Bgra));
+            new MediaHostFrameHeader(
+                frame.Position, frame.Width, frame.Height, frame.Stride, frame.Generation,
+                descriptor.FrameId, descriptor.SlotIndex, descriptor.ValidLength)));
+    }
 
     private void Playback_AudioMeterUpdated(object? sender, AudioMeterLevel level)
         => Queue(MediaHostPacket.Create(
@@ -218,7 +239,6 @@ public sealed class MediaHostServer(string pipeName, string ffmpegPath) : IAsync
             if (packet.Type == MediaHostPacketType.VideoFrame)
             {
                 Interlocked.Add(ref _pipeWriteTicks, Stopwatch.GetTimestamp() - started);
-                Interlocked.Add(ref _pipeFrameBytes, packet.Payload.Length);
             }
         }
         finally { _writeGate.Release(); }

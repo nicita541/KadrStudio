@@ -12,13 +12,14 @@ public sealed class ProjectService : IDisposable
 {
     private readonly SqliteProjectStore _projectStore;
     private readonly SqliteRecoveryStore _recoveryStore;
-    private readonly SemaphoreSlim _storageGate = new(1, 1);
+    private readonly ProjectDocumentCoordinator _coordinator;
     private Guid? _pendingRecoveryId;
     private ProjectFileLease? _projectLease;
     private int _disposed;
 
-    public ProjectService(string? recoveryRoot = null)
+    public ProjectService(string? recoveryRoot = null, ProjectDocumentCoordinator? coordinator = null)
     {
+        _coordinator = coordinator ?? new ProjectDocumentCoordinator(KadrLocalDataPaths.HistoryRoot);
         _projectStore = new SqliteProjectStore();
         _recoveryStore = new SqliteRecoveryStore(recoveryRoot);
     }
@@ -26,24 +27,46 @@ public sealed class ProjectService : IDisposable
     public async Task SaveAsync(ProjectState project, string path, CancellationToken cancellationToken = default)
     {
         var fullPath = Path.GetFullPath(path);
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
-            EnsureLease(fullPath);
-            await _projectStore.SaveAsync(fullPath, project, cancellationToken);
-            await _recoveryStore.DeleteAsync(project.Id, cancellationToken: cancellationToken);
-            if (_pendingRecoveryId == project.Id) _pendingRecoveryId = null;
+            var lease = AcquireReplacementLease(fullPath);
+            try
+            {
+                await _projectStore.SaveWithHistoryAsync(fullPath, project,
+                    _coordinator.ResolveHistoryPath(project.Id, _projectLease?.ProjectPath), cancellationToken);
+            }
+            catch
+            {
+                if (!ReferenceEquals(lease, _projectLease)) lease.Dispose();
+                throw;
+            }
+            ReplaceLease(lease);
+            _coordinator.RegisterCommittedPath(project.Id, fullPath);
+            // Never erase a recovery snapshot that represents different edits.
+            try
+            {
+                if (await _recoveryStore.IsLatestSnapshotAsync(project, CancellationToken.None))
+                {
+                    await _recoveryStore.DeleteAsync(project.Id, cancellationToken: CancellationToken.None);
+                    if (_pendingRecoveryId == project.Id) _pendingRecoveryId = null;
+                }
+            }
+            catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException)
+            {
+                System.Diagnostics.Trace.TraceWarning("Saved project; recovery cleanup deferred: {0}", exception.Message);
+            }
         }
         finally
         {
-            _storageGate.Release();
+            storageLease.Dispose();
         }
     }
 
     public async Task<ProjectState> OpenAsync(string path, CancellationToken cancellationToken = default)
     {
         var fullPath = Path.GetFullPath(path);
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
             var lease = AcquireReplacementLease(fullPath);
@@ -58,11 +81,12 @@ public sealed class ProjectService : IDisposable
                 throw;
             }
             ReplaceLease(lease);
+            _coordinator.RegisterCommittedPath(core.Id, fullPath);
             return core;
         }
         finally
         {
-            _storageGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -74,7 +98,7 @@ public sealed class ProjectService : IDisposable
         string reason,
         CancellationToken cancellationToken = default)
     {
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
             await _recoveryStore.SaveAsync(project, reason, cancellationToken);
@@ -82,7 +106,7 @@ public sealed class ProjectService : IDisposable
         }
         finally
         {
-            _storageGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -90,7 +114,7 @@ public sealed class ProjectService : IDisposable
     {
         try
         {
-            await _storageGate.WaitAsync(cancellationToken);
+            var storageLease = await _coordinator.EnterAsync(cancellationToken);
             try
             {
                 var recovery = (await _recoveryStore.ListAsync(cancellationToken)).FirstOrDefault();
@@ -99,7 +123,7 @@ public sealed class ProjectService : IDisposable
             }
             finally
             {
-                _storageGate.Release();
+                storageLease.Dispose();
             }
         }
         catch (OperationCanceledException)
@@ -115,9 +139,9 @@ public sealed class ProjectService : IDisposable
     public async Task<IReadOnlyList<RecoveryProjectInfo>> ListAutosavesAsync(
         CancellationToken cancellationToken = default)
     {
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try { return await _recoveryStore.ListAsync(cancellationToken); }
-        finally { _storageGate.Release(); }
+        finally { storageLease.Dispose(); }
     }
 
     public Task<ProjectState> OpenAutosaveAsync(CancellationToken cancellationToken = default)
@@ -128,7 +152,7 @@ public sealed class ProjectService : IDisposable
         Guid? recoveryId,
         CancellationToken cancellationToken = default)
     {
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
             var id = projectId ?? _pendingRecoveryId;
@@ -145,7 +169,7 @@ public sealed class ProjectService : IDisposable
         }
         finally
         {
-            _storageGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -157,7 +181,7 @@ public sealed class ProjectService : IDisposable
         Guid? recoveryId,
         CancellationToken cancellationToken = default)
     {
-        await _storageGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
             var targetProjectId = projectId ?? _pendingRecoveryId;
@@ -178,15 +202,16 @@ public sealed class ProjectService : IDisposable
         }
         finally
         {
-            _storageGate.Release();
+            storageLease.Dispose();
         }
     }
 
-    private void EnsureLease(string fullPath)
+    public async Task CloseDocumentAsync(CancellationToken cancellationToken = default)
     {
-        if (_projectLease is not null &&
-            string.Equals(_projectLease.ProjectPath, fullPath, StringComparison.OrdinalIgnoreCase)) return;
-        ReplaceLease(ProjectFileLease.Acquire(fullPath));
+        using var operation = await _coordinator.EnterAsync(cancellationToken);
+        _projectLease?.Dispose();
+        _projectLease = null;
+        _pendingRecoveryId = null;
     }
 
     private ProjectFileLease AcquireReplacementLease(string fullPath)
@@ -207,6 +232,6 @@ public sealed class ProjectService : IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _projectLease?.Dispose();
-        _storageGate.Dispose();
+
     }
 }

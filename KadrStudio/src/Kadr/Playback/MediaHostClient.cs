@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Threading.Channels;
 using KadrStudio.Application.Preview;
+using KadrStudio.Infrastructure.Preview;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
 
@@ -24,8 +26,25 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
     private Process? _host;
     private Task? _readerTask;
     private Task? _heartbeatTask;
+    private Task? _hostErrorTask;
+    private string _lastHostErrorTail = string.Empty;
+    private Task? _frameReaderTask;
     private RenderPlan? _lastPlan;
-    private PreviewRequest _lastRequest;
+    private sealed class RequestSnapshot(PreviewRequest request)
+    {
+        public PreviewRequest Request { get; } = request;
+        public long PositionTicks = request.Position.Ticks;
+    }
+    private RequestSnapshot _requestSnapshot = new(default);
+    private PreviewRequest _lastRequest
+    {
+        get
+        {
+            var snapshot = Volatile.Read(ref _requestSnapshot);
+            return snapshot.Request with { Position = new TimelineTime(Interlocked.Read(ref snapshot.PositionTicks)) };
+        }
+        set => Volatile.Write(ref _requestSnapshot, new RequestSnapshot(value));
+    }
     private bool _desiredPlaying;
     private bool _stopping;
     private bool _disposed;
@@ -34,10 +53,20 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
     private long _pipeReadTicks;
     private long _framesReceived;
     private long _pipePayloadBytes;
+    private long _frameBufferAllocatedBytes;
+    private SharedFrameRingReader? _frameRing;
+    private byte[][] _frameBuffers = [];
+    private readonly Channel<byte> _frameSignals = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
+    {
+        SingleReader = true,
+        SingleWriter = true,
+        FullMode = BoundedChannelFullMode.DropOldest
+    });
 
     public PreviewState State { get; private set; } = PreviewState.Idle;
     public TimelineTime Position => _position;
     public int HostProcessId => _host is { HasExited: false } ? _host.Id : 0;
+    public string LastHostErrorTail => Volatile.Read(ref _lastHostErrorTail);
     public event EventHandler<PreviewState>? StateChanged;
     public event EventHandler<VideoFrame>? FramePresented;
     public event EventHandler<AudioMeterLevel>? AudioMeterUpdated;
@@ -74,11 +103,14 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
         await ExecuteCommandAsync(MediaHostPacketType.Start, new { }, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default)
+    public Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default)
+        => SeekAsync(position, _lastRequest.Generation, cancellationToken);
+
+    public async Task SeekAsync(TimelineTime position, PreviewGeneration generation, CancellationToken cancellationToken = default)
     {
         _position = position;
-        _lastRequest = _lastRequest with { Position = position };
-        await ExecuteCommandAsync(MediaHostPacketType.Seek, new MediaHostSeek(position), cancellationToken)
+        _lastRequest = _lastRequest with { Position = position, Generation = generation };
+        await ExecuteCommandAsync(MediaHostPacketType.Seek, new MediaHostSeek(position, generation), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -123,7 +155,7 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
             FramesPresented = Interlocked.Read(ref _framesReceived),
             PipeReadTimeMs = Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _pipeReadTicks)).TotalMilliseconds,
             CopiedBytes = remote.CopiedBytes + Interlocked.Read(ref _pipePayloadBytes),
-            AllocatedBytes = remote.AllocatedBytes + Interlocked.Read(ref _pipePayloadBytes)
+            AllocatedBytes = remote.AllocatedBytes + Interlocked.Read(ref _frameBufferAllocatedBytes)
         };
     }
 
@@ -157,8 +189,10 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
                 try { await _readerTask.ConfigureAwait(false); } catch { }
             if (_heartbeatTask is not null)
                 try { await _heartbeatTask.ConfigureAwait(false); } catch { }
-            TryKill(_host);
-            _host?.Dispose();
+            _frameSignals.Writer.TryComplete();
+            if (_frameReaderTask is not null)
+                try { await _frameReaderTask.ConfigureAwait(false); } catch { }
+            await StopHostProcessAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -223,8 +257,7 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
         if (!File.Exists(_mediaHostPath)) throw new FileNotFoundException("Kadr.MediaHost was not found.", _mediaHostPath);
         if (!File.Exists(_ffmpegPath)) throw new FileNotFoundException("FFmpeg was not found.", _ffmpegPath);
         CloseConnection();
-        TryKill(_host);
-        _host?.Dispose();
+        await StopHostProcessAsync().ConfigureAwait(false);
         var pipeName = $"kadr-media-{Environment.ProcessId}-{Guid.NewGuid():N}";
         var info = new ProcessStartInfo
         {
@@ -241,7 +274,7 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
         info.ArgumentList.Add(MediaHostProtocol.Version.ToString(System.Globalization.CultureInfo.InvariantCulture));
         _host = new Process { StartInfo = info, EnableRaisingEvents = true };
         if (!_host.Start()) throw new InvalidOperationException("Kadr.MediaHost did not start.");
-        _ = DrainHostErrorsAsync(_host);
+        _hostErrorTask = DrainHostErrorsAsync(_host);
         _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.WriteThrough);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(10));
@@ -250,9 +283,18 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
         var hello = MediaHostPacket.Create(MediaHostPacketType.Hello,
             new MediaHostHello(MediaHostProtocol.Version, Environment.ProcessId), Guid.NewGuid());
         var response = await SendAndWaitAsync(hello, cancellationToken).ConfigureAwait(false);
-        if (response.Type != MediaHostPacketType.HelloAccepted ||
-            response.ReadHeader<MediaHostHello>().ProtocolVersion != MediaHostProtocol.Version)
+        var accepted = response.Type == MediaHostPacketType.HelloAccepted
+            ? response.ReadHeader<MediaHostHello>()
+            : null;
+        if (accepted?.ProtocolVersion != MediaHostProtocol.Version ||
+            string.IsNullOrWhiteSpace(accepted.FrameBufferName) ||
+            accepted.FrameSlotCapacity <= 0 || accepted.FrameSlotCount != 3)
             throw new InvalidDataException("Kadr.MediaHost handshake failed.");
+        _frameRing?.Dispose();
+        _frameRing = SharedFrameRingReader.Open(
+            accepted.FrameBufferName, accepted.FrameSlotCapacity, accepted.FrameSlotCount);
+        _frameBuffers = new byte[accepted.FrameSlotCount][];
+        _frameReaderTask ??= ReadFramesAsync(_lifetime.Token);
         _heartbeatTask ??= HeartbeatLoopAsync(_lifetime.Token);
     }
 
@@ -292,11 +334,6 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
                 var packet = await MediaHostPacketIO.ReadAsync(pipe, cancellationToken).ConfigureAwait(false);
                 Interlocked.Add(ref _pipeReadTicks, Stopwatch.GetTimestamp() - readStarted);
                 if (packet is null) break;
-                if (packet.Type == MediaHostPacketType.VideoFrame)
-                {
-                    Interlocked.Increment(ref _framesReceived);
-                    Interlocked.Add(ref _pipePayloadBytes, packet.Payload.Length);
-                }
                 Dispatch(packet);
             }
         }
@@ -326,14 +363,7 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
                 SetState(state.State);
                 break;
             case MediaHostPacketType.VideoFrame:
-                var frame = packet.ReadHeader<MediaHostFrameHeader>();
-                if (frame.Generation == _lastRequest.Generation.Video)
-                {
-                    _position = frame.Position;
-                    _lastRequest = _lastRequest with { Position = frame.Position };
-                    FramePresented?.Invoke(this, new VideoFrame(
-                        frame.Position, frame.Width, frame.Height, frame.Stride, packet.Payload, frame.Generation));
-                }
+                _frameSignals.Writer.TryWrite(0);
                 break;
             case MediaHostPacketType.AudioMeter:
                 var meter = packet.ReadHeader<MediaHostAudioMeterHeader>();
@@ -408,6 +438,49 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
     {
         try { _pipe?.Dispose(); } catch { }
         _pipe = null;
+        try { _frameRing?.Dispose(); } catch { }
+        _frameRing = null;
+        _frameBuffers = [];
+    }
+
+    private async Task ReadFramesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var _ in _frameSignals.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                try
+                {
+                    var ring = _frameRing;
+                    var request = Volatile.Read(ref _requestSnapshot);
+                    using var lease = ring?.TryAcquireLatest();
+                    if (lease is null || lease.Descriptor.Generation != request.Request.Generation.Video) continue;
+                    var descriptor = lease.Descriptor;
+                    var buffers = _frameBuffers;
+                    if ((uint)descriptor.SlotIndex >= (uint)buffers.Length) continue;
+                    var pixels = buffers[descriptor.SlotIndex];
+                    if (pixels is null || pixels.Length < descriptor.ValidLength)
+                    {
+                        pixels = new byte[descriptor.ValidLength];
+                        buffers[descriptor.SlotIndex] = pixels;
+                        Interlocked.Add(ref _frameBufferAllocatedBytes, pixels.Length);
+                    }
+                    lease.CopyTo(pixels);
+                    if (_disposed || !ReferenceEquals(ring, _frameRing)) continue;
+                    var position = new TimelineTime(descriptor.TimestampTicks);
+                    Interlocked.Exchange(ref request.PositionTicks, position.Ticks);
+                    if (!ReferenceEquals(Volatile.Read(ref _requestSnapshot), request)) continue;
+                    Interlocked.Increment(ref _framesReceived);
+                    Interlocked.Add(ref _pipePayloadBytes, descriptor.ValidLength);
+                    _position = position;
+                    FramePresented?.Invoke(this, new VideoFrame(
+                        position, descriptor.Width, descriptor.Height, descriptor.Stride,
+                        pixels.AsMemory(0, descriptor.ValidLength), descriptor.Generation));
+                }
+                catch (ObjectDisposedException) when (!_disposed) { }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
     }
 
     private void FailPending(Exception exception)
@@ -425,9 +498,40 @@ public sealed class MediaHostClient(string mediaHostPath, string ffmpegPath) : I
     private static bool IsRecoverable(Exception exception)
         => exception is IOException or EndOfStreamException or TimeoutException or MediaHostException { Recoverable: true };
 
-    private static async Task DrainHostErrorsAsync(Process process)
+    private async Task DrainHostErrorsAsync(Process process)
     {
-        try { await process.StandardError.ReadToEndAsync().ConfigureAwait(false); } catch { }
+        var tail = new System.Text.StringBuilder();
+        var buffer = new char[4096];
+        try
+        {
+            int count;
+            while ((count = await process.StandardError.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
+            {
+                tail.Append(buffer, 0, count);
+                if (tail.Length > Services.ProcessRunner.MaximumErrorCharacters)
+                    tail.Remove(0, tail.Length - Services.ProcessRunner.MaximumErrorCharacters);
+                Volatile.Write(ref _lastHostErrorTail, tail.ToString());
+            }
+        }
+        catch (Exception exception) when (exception is IOException or ObjectDisposedException)
+        { Trace.TraceWarning("MediaHost stderr drain ended: {0}", exception.Message); }
+    }
+
+    private async Task StopHostProcessAsync()
+    {
+        var process = _host;
+        var errors = _hostErrorTask;
+        _host = null;
+        _hostErrorTask = null;
+        if (process is null) return;
+        try
+        {
+            TryKill(process);
+            await Task.WhenAll(process.WaitForExitAsync(), errors ?? Task.CompletedTask)
+                .WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+        }
+        catch (Exception exception) { Trace.TraceWarning("MediaHost cleanup failed: {0}", exception); }
+        finally { process.Dispose(); }
     }
 
     private static void TryKill(Process? process)

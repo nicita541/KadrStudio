@@ -27,6 +27,15 @@ if (-not (Test-Path -LiteralPath $solutionPath) -or -not (Test-Path -LiteralPath
     throw "Не найдены solution или WPF-проект в $repoRoot"
 }
 
+# Validate required environments before deleting or rebuilding any existing package.
+& (Join-Path $PSScriptRoot 'verify-environment-gates.ps1') -Gate all
+if ($LASTEXITCODE -ne 0) { throw 'Release prerequisites are missing; no package was changed.' }
+$releasePreviousRequireTests = $env:KADR_REQUIRE_ENVIRONMENT_TESTS
+$releasePreviousDataRoot = $env:KADR_STUDIO_DATA_ROOT
+try {
+$env:KADR_REQUIRE_ENVIRONMENT_TESTS = '1'
+$env:KADR_STUDIO_DATA_ROOT = Join-Path $releaseRoot ('verification-data-' + [Guid]::NewGuid().ToString('N'))
+
 $dotnetCommand = Get-Command dotnet.exe -ErrorAction SilentlyContinue
 if (-not $dotnetCommand -and -not $SkipSdkInstall) {
     $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -100,8 +109,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $publishPath 'mediahost\Kadr.MediaHo
 
 
 Write-Host 'Проверка запуска готового приложения…' -ForegroundColor Cyan
+Set-Content -LiteralPath (Join-Path $publishPath 'KadrStudio.portable') -Value 'portable-v1' -Encoding ascii
 $publishedExe = Join-Path $publishPath 'KadrStudio.exe'
-$smokeProcess = Start-Process -FilePath $publishedExe -ArgumentList '--launch-smoke' -PassThru -WindowStyle Hidden
+$previousDataRoot = $env:KADR_STUDIO_DATA_ROOT
+try {
+    $env:KADR_STUDIO_DATA_ROOT = Join-Path $releaseRoot ('smoke-data-' + [Guid]::NewGuid().ToString('N'))
+    $smokeProcess = Start-Process -FilePath $publishedExe -ArgumentList '--launch-smoke' -PassThru -WindowStyle Hidden
+} finally {
+    $env:KADR_STUDIO_DATA_ROOT = $previousDataRoot
+}
 if (-not $smokeProcess.WaitForExit(30000)) {
     Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
     throw 'Готовое приложение не завершило launch smoke за 30 секунд.'
@@ -124,4 +140,8 @@ if ($BuildInstaller) {
     }
     & $iscc.Source (Join-Path $repoRoot 'installer\KadrStudio.iss')
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершился с кодом $LASTEXITCODE" }
+}
+} finally {
+    $env:KADR_REQUIRE_ENVIRONMENT_TESTS = $releasePreviousRequireTests
+    $env:KADR_STUDIO_DATA_ROOT = $releasePreviousDataRoot
 }

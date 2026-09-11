@@ -9,12 +9,13 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class AnalysisProxyPerformanceTests
 {
-    [Fact(Timeout = 180_000)]
+    [EnvironmentRequiredFact(TestEnvironmentGate.AnalysisProxyBenchmark, Timeout = 180_000)]
+    [Trait("Category", "EnvironmentRequired")]
+    [Trait("Environment", "Benchmark")]
     public async Task Benchmark_analysis_proxy_cache_when_requested()
     {
-        var sourcePath = Environment.GetEnvironmentVariable("KADR_ANALYSIS_PROXY_BENCHMARK_SOURCE");
-        var outputPath = Environment.GetEnvironmentVariable("KADR_ANALYSIS_PROXY_BENCHMARK_OUTPUT");
-        if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(outputPath)) return;
+        var sourcePath = TestEnvironment.Require(TestEnvironmentGate.AnalysisProxyBenchmark);
+        var outputPath = Environment.GetEnvironmentVariable("KADR_ANALYSIS_PROXY_BENCHMARK_OUTPUT")!;
 
         var locator = new FfmpegLocator();
         locator.EnsureAvailable();

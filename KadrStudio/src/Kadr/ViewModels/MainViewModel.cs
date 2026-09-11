@@ -39,6 +39,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     private readonly AutomationProposalValidator _automationProposalValidator = new();
     private readonly IMediaRegistry _mediaRegistry;
     private readonly IArtifactStore _artifactStore;
+    private readonly EditorStateDispatcher _stateDispatcher = new(System.Windows.Threading.Dispatcher.CurrentDispatcher);
     private EditorSession _editorSession;
     private CancellationTokenSource? _autosaveCancellation;
     private readonly object _timelineMediaPreparationGate = new();
@@ -84,23 +85,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         AiServer = services.AiServer;
         _automationScheduler = services.AutomationScheduler;
         AutomationOrchestrator = new AutomationOrchestrator(_automationScheduler, AutoSubtitleService);
-        AgentDebugLog = new FileAgentDebugLog();
+        AgentDebugLog = services.AgentDebugLog;
         AiAgentOrchestrator = new AiAgentOrchestrator();
         AgentRecoveryService = new AgentRecoveryService();
-        var editorialTelemetry = new JsonlEditorialTelemetrySink();
-        var aiServerV2 = new AiServerV2Client(AiServer, editorialTelemetry);
-        var editorialIndexer = new AiServerMediaUnderstandingIndexer(
-            aiServerV2,
-            new AnalysisProxyBuilder(services.FfmpegLocator, services.ProcessRunner, editorialTelemetry));
-        var editorialReasoner = new AiServerEditorialReasoner(aiServerV2);
-        EditorialPipeline = new EditorialPipeline(
-            editorialIndexer,
-            editorialReasoner,
-            editorialReasoner,
-            editorialIndexer,
-            retriever: new HierarchicalMediaRetriever(
-                semanticRanker: new AiServerSemanticNodeRanker(aiServerV2)),
-            telemetry: editorialTelemetry);
+        EditorialPipeline = services.EditorialPipeline;
         AgentWorkflow = new AgentWorkflowService(
             AiAgentOrchestrator,
             StartAgentTask,
@@ -112,6 +100,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             PersistAgentTaskState);
         AiAgentOrchestrator.TaskChanged += (_, args) =>
         {
+            _stateDispatcher.TryApply(
+                () => args.State.ProjectId == _editorSession.State.Id &&
+                    ReferenceEquals(AiAgentOrchestrator.CurrentTask, args.State), () =>
+            {
             AgentDebugLog.Write(new AgentDebugLogEntry(
                 DateTimeOffset.UtcNow,
                 "orchestrator",
@@ -123,6 +115,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             OnPropertyChanged(nameof(IsAgentDraftEditingLocked));
             OnPropertyChanged(nameof(CurrentAgentTask));
+            });
         };
 
         AttachProject(_project);
@@ -292,10 +285,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         => _projectService.ListAutosavesAsync(cancellationToken);
 
     public ProjectAutomationSnapshot CaptureAutomationSnapshot()
-        => ProposalFactory.Capture(_editorSession.State);
+        => ProposalFactory.Capture(_editorSession);
 
     public bool IsAutomationSnapshotCurrent(ProjectAutomationSnapshot snapshot)
-        => snapshot.ProjectId == _editorSession.State.Id && snapshot.BaseRevision == _editorSession.State.Revision;
+        => ProposalFactory.IsCurrent(_editorSession, snapshot);
 
     public async Task<AutomationApplyResult> ApplyAutomationProposalAsync(
         AutomationProposal proposal,
@@ -350,6 +343,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         EnsureAgentAllowsManualProjectMutation();
+        var importSession = _editorSession;
 
         var uniquePaths = filePaths
             .Select(Path.GetFullPath)
@@ -385,6 +379,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 }
             }
 
+            if (!ReferenceEquals(importSession, _editorSession) || Volatile.Read(ref _disposeState) != 0)
+                throw new OperationCanceledException("Проект сменился во время импорта.");
             if (imported.Count > 0)
             {
                 var result = _editorSession.Execute(new EditTransaction(
@@ -432,7 +428,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         Guid assetId,
         double? requestedStart = null,
         TrackKind? requestedTrack = null,
-        int requestedTrackIndex = 0)
+        int requestedTrackIndex = 0,
+        int? selectedAudioStreamIndex = null)
     {
         var asset = Project.FindAsset(assetId);
         if (asset is null || asset.IsMissing)
@@ -483,6 +480,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 0, KadrStudio.Core.Domain.MediaStreamKind.Audio,
                 string.IsNullOrWhiteSpace(source.AudioCodec) ? "unknown" : source.AudioCodec,
                 SampleRate: 48_000, Channels: 2)];
+        if (selectedAudioStreamIndex is { } selectedStream)
+        {
+            audioStreams = audioStreams.Where(stream => stream.StreamIndex == selectedStream).ToArray();
+            if (audioStreams.Length == 0)
+            {
+                StatusText = "Выбранный аудиопоток больше недоступен. Выберите дорожку заново.";
+                return;
+            }
+        }
         var firstAudioTrack = FindAvailableTrackIndex(TrackKind.Audio, clip.Start, clip.Duration, 0);
         for (var index = 0; index < audioStreams.Length; index++)
         {
@@ -521,12 +527,10 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         bool verifyContent = true,
         CancellationToken cancellationToken = default)
     {
-        if (!_editorSession.State.Sources.TryGetValue(sourceId, out var source))
-            throw new KeyNotFoundException($"Media source {sourceId} was not found.");
-        var candidate = await _mediaRegistry.ValidateRelinkAsync(
-            source, candidatePath, verifyContent, cancellationToken);
+        var preview = await PreviewRelinkMediaAsync(sourceId, candidatePath, verifyContent, cancellationToken);
+        var candidate = preview.Candidates[0];
         if (candidate.CanApply)
-            ExecuteCoreCommand("Media relinked", new RelinkSourcesCommand([candidate]));
+            ApplyMediaRelinkPreview(preview);
         return candidate;
     }
 
@@ -534,11 +538,26 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         IEnumerable<string> searchRoots,
         CancellationToken cancellationToken = default)
     {
-        var candidates = await _mediaRegistry.FindRelinkCandidatesAsync(
-            _editorSession.State, searchRoots, cancellationToken);
-        if (!candidates.IsDefaultOrEmpty)
-            ExecuteCoreCommand("Missing media relinked", new RelinkSourcesCommand(candidates));
-        return candidates;
+        var preview = await PreviewMissingMediaRelinkAsync(searchRoots, cancellationToken);
+        if (!preview.Candidates.IsDefaultOrEmpty) ApplyMediaRelinkPreview(preview);
+        return preview.Candidates;
+    }
+
+    public Task<MediaRelinkPreview> PreviewRelinkMediaAsync(Guid sourceId, string path, bool verifyContent = true,
+        CancellationToken cancellationToken = default)
+        => new MediaRelinkWorkflow(_mediaRegistry).PrepareAsync(_editorSession, sourceId, path, verifyContent, cancellationToken);
+
+    public Task<MediaRelinkPreview> PreviewMissingMediaRelinkAsync(IEnumerable<string> roots, CancellationToken cancellationToken = default)
+        => new MediaRelinkWorkflow(_mediaRegistry).PrepareMissingAsync(_editorSession, roots, cancellationToken);
+
+    public void ApplyMediaRelinkPreview(MediaRelinkPreview preview)
+    {
+        if (!_stateDispatcher.TryApply(() => Volatile.Read(ref _disposeState) == 0, () =>
+        {
+            MediaRelinkWorkflow.Validate(_editorSession, preview);
+            MediaRelinkFileValidator.Validate(preview);
+            ExecuteCoreCommand("Связи с исходниками восстановлены", new RelinkSourcesCommand(preview.Candidates));
+        })) throw new ObjectDisposedException(nameof(MainViewModel));
     }
 
     public void DeleteSelectedClip()
@@ -563,7 +582,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public bool SplitSelectedAtPlayhead()
     {
         var clip = SelectedClip;
-        if (clip is null || Playhead <= clip.Start + 0.1 || Playhead >= clip.End - 0.1)
+        if (clip is null || !TimelineEditBounds.CanSplit(clip.Start, clip.End, Playhead, Project.FrameRateValue))
         {
             return false;
         }
@@ -577,7 +596,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public bool SplitClipAt(Guid clipId, double seconds, bool includeLinked)
     {
         var clip = Project.FindClip(clipId);
-        if (clip is null || seconds <= clip.Start + 0.1 || seconds >= clip.End - 0.1)
+        if (clip is null || !TimelineEditBounds.CanSplit(clip.Start, clip.End, seconds, Project.FrameRateValue))
         {
             return false;
         }
@@ -655,11 +674,12 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
-        var maximumSourceStart = asset.Kind == MediaKind.Image ? 0 : Math.Max(0, asset.Duration - 0.1);
+        var minimumDuration = KadrStudio.Core.Domain.TimelineTime.FromFrames(1, Project.FrameRateValue).TotalSeconds;
+        var maximumSourceStart = asset.Kind == MediaKind.Image ? 0 : Math.Max(0, asset.Duration - minimumDuration);
         clip.SourceStart = Math.Clamp(clip.SourceStart, 0, maximumSourceStart);
         var maximumDuration = asset.Kind == MediaKind.Image
             ? 3600
-            : Math.Max(0.1, asset.Duration - clip.SourceStart);
+            : Math.Max(minimumDuration, asset.Duration - clip.SourceStart);
         var otherClips = Project.GetTrackClips(clip.Track, clip.TrackIndex).Where(item => item.Id != clip.Id).ToList();
         var previousEnd = otherClips
             .Where(item => item.Start < clip.Start)
@@ -674,9 +694,9 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         clip.Start = Math.Max(previousEnd, clip.Start);
         if (!double.IsPositiveInfinity(nextStart))
         {
-            maximumDuration = Math.Min(maximumDuration, Math.Max(0.1, nextStart - clip.Start));
+            maximumDuration = Math.Min(maximumDuration, Math.Max(minimumDuration, nextStart - clip.Start));
         }
-        clip.Duration = Math.Clamp(clip.Duration, 0.1, maximumDuration);
+        clip.Duration = Math.Clamp(clip.Duration, minimumDuration, maximumDuration);
     }
 
     public void ClearAnalysisMarkers()
@@ -751,12 +771,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             KadrStudio.Core.Domain.UpscaleJobState.Running, 0,
             "AnimeSR-X запускается на сервере", string.Empty, now, now);
         ExecuteCoreCommand("AnimeSR-X поставлен в очередь", new UpsertUpscaleJobCommand(job));
+        var operationSnapshot = CaptureAutomationSnapshot();
         try
         {
             var result = await AiUpscaleService.UpscaleAsync(
                 _editorSession.State, job.Id,
                 new KadrStudio.Core.Domain.UpscaleRequest(sequenceId, ids, scaleMode),
                 progress, cancellationToken).ConfigureAwait(true);
+            if (Volatile.Read(ref _disposeState) != 0 || !IsAutomationSnapshotCurrent(operationSnapshot))
+                throw new OperationCanceledException("Проект изменился во время AnimeSR-X; результат не применён.");
             var completed = job with
             {
                 State = KadrStudio.Core.Domain.UpscaleJobState.Succeeded,
@@ -774,6 +797,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            if (Volatile.Read(ref _disposeState) != 0 || !IsAutomationSnapshotCurrent(operationSnapshot)) throw;
             ExecuteCoreCommand("AnimeSR-X отменён", new UpsertUpscaleJobCommand(job with
             {
                 State = KadrStudio.Core.Domain.UpscaleJobState.Cancelled,
@@ -784,6 +808,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception exception)
         {
+            if (Volatile.Read(ref _disposeState) != 0 || !IsAutomationSnapshotCurrent(operationSnapshot)) throw;
             ExecuteCoreCommand("Ошибка AnimeSR-X", new UpsertUpscaleJobCommand(job with
             {
                 State = KadrStudio.Core.Domain.UpscaleJobState.Failed,
@@ -850,9 +875,11 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     public void PersistAgentTaskState(AgentTaskState task)
     {
         ArgumentNullException.ThrowIfNull(task);
-        SaveAiConversation(BuildConversationWithAgentTask(
-            GetAiConversation(),
-            task));
+        _stateDispatcher.TryApply(
+            () => task.ProjectId == _editorSession.State.Id &&
+                task.ConversationId == _editorSession.State.AiConversation.Id &&
+                ReferenceEquals(AiAgentOrchestrator.CurrentTask, task),
+            () => SaveAiConversation(BuildConversationWithAgentTask(GetAiConversation(), task)));
     }
 
     private static KadrStudio.Core.Domain.AiConversation BuildConversationWithAgentTask(
@@ -918,7 +945,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                 AgentTaskPhase.Compiling or AgentTaskPhase.Verifying))
             return task;
 
-        var snapshot = _editorSession.State.EnsureSequenceContainer().SynchronizeActiveSequence();
+        var operationSnapshot = CaptureAutomationSnapshot();
+        var snapshot = operationSnapshot.State.EnsureSequenceContainer().SynchronizeActiveSequence();
         if (snapshot.Id != task.ProjectId)
             throw new AgentTaskTransitionException("Проект сменился до запуска режиссёрского конвейера.");
         var source = snapshot.FindSequence(task.SourceSequenceId)
@@ -931,6 +959,11 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             MoveEditorialTaskTo(AgentTaskPhase.Indexing, "Начинаю постоянный мультимодальный индекс.");
             var progress = new InlineProgress<EditorialPipelineProgress>(update =>
             {
+                _stateDispatcher.TryApply(
+                    () => IsAutomationSnapshotCurrent(operationSnapshot) &&
+                        AiAgentOrchestrator.CurrentTask is { IsTerminal: false } currentTask && currentTask.Id == task.Id,
+                    () =>
+                {
                 var phase = update.Stage switch
                 {
                     EditorialPipelineStage.Indexing => AgentTaskPhase.Indexing,
@@ -960,6 +993,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
                         DateTimeOffset.UtcNow));
                 }
                 StatusText = update.Message;
+                });
             });
             var previousProfile = snapshot.MontageGraphs
                 .Where(item => item.TaskId == task.Id)
@@ -997,7 +1031,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
             var current = _editorSession.State.EnsureSequenceContainer().SynchronizeActiveSequence();
             var currentSource = current.FindSequence(source.Id);
-            if (current.Id != snapshot.Id || currentSource?.Revision != source.Revision)
+            if (!IsAutomationSnapshotCurrent(operationSnapshot) ||
+                current.Id != snapshot.Id || currentSource?.Revision != source.Revision)
                 throw new AgentTaskTransitionException(
                     "Исходный таймлайн изменился во время анализа; готовый граф не будет применён к другой ревизии.");
 
@@ -1230,15 +1265,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
     {
-        private readonly SynchronizationContext? _context = SynchronizationContext.Current;
-
-        public void Report(T value)
-        {
-            if (_context is null || ReferenceEquals(_context, SynchronizationContext.Current))
-                report(value);
-            else
-                _context.Send(_ => report(value), null);
-        }
+        public void Report(T value) => report(value);
     }
 
     public bool ActivateSequence(Guid sequenceId)
@@ -1359,6 +1386,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        AiAgentOrchestrator.ReconcileProject(_editorSession.State);
         RestoreFromCoreState(_editorSession.State);
         StatusText = "Изменение отменено";
     }
@@ -1376,6 +1404,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             return;
         }
 
+        AiAgentOrchestrator.ReconcileProject(_editorSession.State);
         RestoreFromCoreState(_editorSession.State);
         StatusText = "Изменение повторено";
     }
@@ -1384,7 +1413,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         EnsureAgentAllowsManualProjectMutation();
         CancelAutosave();
-        await _projectService.DeleteAutosaveAsync(cancellationToken);
+        await _projectService.CloseDocumentAsync(cancellationToken);
         SelectedClip = null;
         SelectedAsset = null;
         Playhead = 0;
@@ -1403,7 +1432,6 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             CancelAutosave();
-            await _projectService.DeleteAutosaveAsync(cancellationToken);
             var project = await _projectService.OpenAsync(path, cancellationToken);
             SelectedClip = null;
             SelectedAsset = null;
@@ -1427,9 +1455,15 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         try
         {
             CancelAutosave();
-            await _projectService.SaveAsync(_editorSession.State, path, cancellationToken);
+            var session = _editorSession;
+            var snapshot = session.State;
+            var savedVersion = session.StateVersion;
+            await _projectService.SaveAsync(snapshot, path, cancellationToken);
+            if (!ReferenceEquals(session, _editorSession)) return;
             Project.FilePath = Path.GetFullPath(path);
-            IsDirty = false;
+            _artifactStore.SetProtectedPaths(session.State.Sources.Values.Select(source => source.Path).Append(Project.FilePath).ToArray());
+            IsDirty = savedVersion != session.StateVersion;
+            if (IsDirty) ScheduleAutosave();
             StatusText = $"Проект сохранён: {Path.GetFileName(path)}";
         }
         finally
@@ -1492,6 +1526,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
     {
         if (Interlocked.Exchange(ref _disposeState, 1) != 0)
             return;
+        _stateDispatcher.Dispose();
         _autosaveCancellation?.Cancel();
         _autosaveCancellation?.Dispose();
         _timelineMediaPreparationCancellation.Cancel();
@@ -1730,6 +1765,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
 
     private void AttachProject(ProjectViewState project)
     {
+        _artifactStore.SetProtectedPaths(_editorSession.State.Sources.Values.Select(source => source.Path)
+            .Concat(string.IsNullOrWhiteSpace(project.FilePath) ? [] : new[] { project.FilePath }).ToArray());
         TryRestoreAgentTask();
         var timelineAssetIds = project.Clips.Select(item => item.AssetId).ToHashSet();
         foreach (var asset in project.Media.Where(item => timelineAssetIds.Contains(item.Id)))
@@ -1778,6 +1815,7 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
             }
 
             task = AgentRecoveryService.Reconcile(task, formatVersion);
+            task = KadrStudio.Application.Automation.Agent.Recovery.AgentTaskReferences.Reconcile(task, _editorSession.State);
             AiAgentOrchestrator.RestoreTask(task);
         }
         catch (Exception exception) when (
@@ -1854,11 +1892,13 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         TimelineMediaPreparationKey key,
         CancellationToken cancellationToken)
     {
+        var preparationSession = _editorSession;
         var presentationChanged = false;
         try
         {
             var derived = await TimelineMediaCacheService.PrepareAsync(source, cancellationToken);
-            if (!_editorSession.State.Sources.TryGetValue(source.Id, out var currentSource) ||
+            if (Volatile.Read(ref _disposeState) != 0 || !ReferenceEquals(preparationSession, _editorSession) ||
+                !_editorSession.State.Sources.TryGetValue(source.Id, out var currentSource) ||
                 !KadrStudio.Core.Domain.MediaSourceFingerprint.Stable(currentSource)
                     .Equals(key.Fingerprint, StringComparison.Ordinal))
             {
@@ -1875,7 +1915,8 @@ public sealed class MainViewModel : ObservableObject, IAsyncDisposable
         }
         catch (Exception exception)
         {
-            StatusText = $"Визуальный кэш недоступен: {exception.Message}";
+            if (Volatile.Read(ref _disposeState) == 0 && ReferenceEquals(preparationSession, _editorSession))
+                StatusText = $"Визуальный кэш недоступен: {exception.Message}";
         }
         finally
         {

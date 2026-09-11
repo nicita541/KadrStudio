@@ -26,7 +26,8 @@ public sealed class TimelineControl : FrameworkElement
     private const double TrackBottomPadding = 12;
     private const double TimelineEndPadding = 72;
     private const double ClipEdgeGrip = 12;
-    private const double MinimumClipDuration = 0.1;
+    private double MinimumClipDuration => TimelineTime.FromFrames(1,
+        _document?.FrameRateValue ?? new KadrStudio.Core.Domain.FrameRate(30, 1)).TotalSeconds;
     private const double MinimumPixelsPerSecond = 0.0001;
     private const double MaximumPixelsPerSecond = 4000;
     private const double TrackToggleLeft = 48;
@@ -1415,7 +1416,7 @@ public sealed class TimelineControl : FrameworkElement
             PixelsPerSecond,
             IsSnappingEnabled,
             GetSnapTargets());
-        if (result.Value <= clip.Start + MinimumClipDuration || result.Value >= clip.End - MinimumClipDuration)
+        if (!TimelineEditBounds.CanSplit(clip.Start, clip.End, result.Value, _document.FrameRateValue))
         {
             return null;
         }

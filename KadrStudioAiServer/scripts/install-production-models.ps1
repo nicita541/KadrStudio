@@ -38,6 +38,31 @@ function Test-VerifiedFile([string]$path, [long]$size, [string]$sha256) {
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.Equals($sha256, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-VerifiedDirectoryIdentity([string]$path, [string]$revision) {
+    $files = @(Get-ChildItem -LiteralPath $path -File -Recurse |
+        Where-Object { $_.Name -ne 'kadr-snapshot.json' -and -not $_.Name.EndsWith('.kadr-part', [StringComparison]::OrdinalIgnoreCase) } |
+        Sort-Object FullName)
+    if ($files.Count -eq 0) { throw "Model directory contains no payload: $path" }
+    $sha = [System.Security.Cryptography.IncrementalHash]::CreateHash([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+    foreach ($file in $files) {
+        $relative = [System.IO.Path]::GetRelativePath($path, $file.FullName)
+        $sha.AppendData([System.Text.Encoding]::UTF8.GetBytes($relative))
+        $stream = [System.IO.File]::OpenRead($file.FullName)
+        try {
+            $buffer = New-Object byte[] 1048576
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $sha.AppendData($buffer, 0, $read) }
+        } finally { $stream.Dispose() }
+    }
+    $lastWrite = ($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
+    return [ordered]@{
+        path = [System.IO.Path]::GetFullPath($path)
+        sizeBytes = [long]($files | Measure-Object -Property Length -Sum).Sum
+        lastWriteTimeUtc = ([DateTimeOffset]$lastWrite).ToUniversalTime().ToString('O')
+        sha256 = [Convert]::ToHexString($sha.GetHashAndReset()).ToLowerInvariant()
+        revision = $revision
+    }
+}
+
 $rows = [System.Collections.Generic.List[object]]::new()
 [long]$packBytes = 0
 foreach ($artifact in $manifest.artifacts) {
@@ -191,9 +216,11 @@ if ($rootBytes -gt [long]$manifest.aiRootBudgetBytes) { throw "Complete .kadr-ai
 # a compact Director brief for the exact anime OP/ED workflow. RoughCut and
 # Critic roles remain gated until their separate montage eval is completed.
 New-Item -ItemType Directory -Path $capabilitiesRoot -Force | Out-Null
+$visionModelDirectory = Join-Path $modelsRoot ([string]$visionArtifact[0].targetDirectory)
+$visionIdentity = Get-VerifiedDirectoryIdentity $visionModelDirectory ([string]$visionArtifact[0].revision)
 $visionCapability = [ordered]@{
     model = $visionModelName
-    modelHash = [string]$visionWeight[0].sha256
+    modelHash = [string]$visionIdentity.sha256
     tokenizer = 'qwen3-vl-gguf'
     contextWindowTokens = 8192
     supportedRoles = @('VideoUnderstanding')
@@ -203,13 +230,16 @@ $visionCapability = [ordered]@{
     productionApproved = $true
     evaluatedAt = [DateTimeOffset]::UtcNow.ToString('O')
     qualificationKind = 'pinned-anime-exact'
+    verifiedIdentity = $visionIdentity
 }
 $visionCapabilityPart = $visionCapabilityPath + '.part'
 $visionCapability | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $visionCapabilityPart -Encoding UTF8
 Move-Item -LiteralPath $visionCapabilityPart -Destination $visionCapabilityPath -Force
+$plannerModelDirectory = Join-Path $modelsRoot ([string]$plannerArtifact[0].targetDirectory)
+$plannerIdentity = Get-VerifiedDirectoryIdentity $plannerModelDirectory ([string]$plannerArtifact[0].revision)
 $plannerCapability = [ordered]@{
     model = $plannerModelName
-    modelHash = [string]$plannerWeight[0].sha256
+    modelHash = [string]$plannerIdentity.sha256
     tokenizer = 'qwen3-gguf'
     contextWindowTokens = 32768
     supportedRoles = @('Director')
@@ -219,6 +249,7 @@ $plannerCapability = [ordered]@{
     productionApproved = $true
     evaluatedAt = [DateTimeOffset]::UtcNow.ToString('O')
     qualificationKind = 'pinned-anime-director'
+    verifiedIdentity = $plannerIdentity
 }
 $plannerCapabilityPart = $plannerCapabilityPath + '.part'
 $plannerCapability | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $plannerCapabilityPart -Encoding UTF8

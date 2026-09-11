@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using KadrStudio.Application.Preview;
+using KadrStudio.Infrastructure.Preview;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
 
@@ -83,6 +84,81 @@ public sealed class MediaHostProtocolTests
         Assert.True(float.IsFinite(actual.Level.LeftPeakDb));
         Assert.True(float.IsFinite(actual.Level.RightPeakDb));
         Assert.Equal(StereoPcmMeter.SilenceFloorDb, actual.Level.LeftPeakDb);
+    }
+
+    [Fact]
+    public void Shared_frame_ring_presents_latest_and_never_overwrites_a_reading_slot()
+    {
+        var name = "kadr-frame-test-" + Guid.NewGuid().ToString("N");
+        using var writer = SharedFrameRingWriter.Create(name, slotCapacity: 4096, slotCount: 3);
+        using var reader = SharedFrameRingReader.Open(name, slotCapacity: 4096, slotCount: 3);
+        for (var frameId = 1L; frameId <= 3; frameId++)
+        {
+            var pixels = Enumerable.Repeat((byte)frameId, 64).ToArray();
+            Assert.True(writer.TryWrite(new VideoFrame(
+                new TimelineTime(frameId), 4, 4, 16, pixels, Generation: 7), out _));
+        }
+
+        using var newest = reader.TryAcquireLatest();
+        Assert.NotNull(newest);
+        Assert.Null(reader.TryAcquireLatest());
+        Assert.Equal(3, newest.FrameId);
+        var copy = new byte[newest.ValidLength];
+        newest.CopyTo(copy);
+        Assert.All(copy, value => Assert.Equal((byte)3, value));
+
+        Assert.True(writer.TryWrite(new VideoFrame(
+            new TimelineTime(4), 4, 4, 16, new byte[64], Generation: 7), out var descriptor));
+        Assert.Equal(4, descriptor.FrameId);
+        using var fourth = reader.TryAcquireLatest();
+        Assert.NotNull(fourth);
+        Assert.True(writer.TryWrite(new VideoFrame(
+            new TimelineTime(5), 4, 4, 16, new byte[64], Generation: 8), out _));
+        using var fifth = reader.TryAcquireLatest();
+        Assert.NotNull(fifth);
+        Assert.Equal(5, fifth.FrameId);
+        Assert.False(writer.TryWrite(new VideoFrame(
+            new TimelineTime(6), 4, 4, 16, new byte[64], Generation: 8), out _));
+        newest.CopyTo(copy);
+        Assert.All(copy, value => Assert.Equal((byte)3, value));
+    }
+
+    [Fact]
+    public void Latest_value_dispatcher_has_one_pending_callback_and_drops_superseded_values()
+    {
+        var scheduled = new List<Action>();
+        var presented = new List<int>();
+        var dispatcher = new LatestValueDispatcher<int>(scheduled.Add, presented.Add);
+
+        dispatcher.Offer(1);
+        dispatcher.Offer(2);
+        dispatcher.Offer(3);
+
+        Assert.Single(scheduled);
+        scheduled.Single().Invoke();
+        Assert.Equal([3], presented);
+        Assert.Equal(2, dispatcher.DroppedCount);
+    }
+
+    [Fact]
+    public void Queued_video_is_rechecked_at_presentation_and_can_be_cleared()
+    {
+        var scheduled = new List<Action>();
+        var shown = new List<long>();
+        long generation = 1;
+        var dispatcher = new LatestVideoFrameDispatcher(scheduled.Add,
+            frame => shown.Add(frame.Generation), frame => frame.Generation == generation);
+        dispatcher.Offer(new VideoFrame(TimelineTime.Zero, 1, 1, 4, new byte[4], Generation: 1));
+        generation = 2;
+        scheduled[0]();
+        Assert.Empty(shown);
+        dispatcher.Offer(new VideoFrame(TimelineTime.Zero, 1, 1, 4, new byte[4], Generation: 2));
+        dispatcher.Clear();
+        scheduled[1]();
+        Assert.Empty(shown);
+        dispatcher.Offer(new VideoFrame(TimelineTime.Zero, 1, 1, 4, new byte[4], Generation: 2));
+        scheduled[2]();
+        Assert.Equal([2L], shown);
     }
 
     private static ProjectState CreateProject()

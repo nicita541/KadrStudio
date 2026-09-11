@@ -1,5 +1,55 @@
 # Проверка Kadr Studio
 
+## Installed/portable данные и миграция
+
+Без override и маркера данные хранятся в `%LOCALAPPDATA%\KadrStudio`.
+Файл `KadrStudio.portable` рядом с executable включает `LocalData` рядом с ним.
+`KADR_STUDIO_DATA_ROOT` имеет приоритет. Рабочая директория и наличие solution
+больше не выбирают data root. Для разработки с прежними данными задайте override
+на прежний `LocalData`; автоматического перемещения нет.
+
+Для явного переноса закройте все экземпляры KadrStudio и запустите:
+`KadrStudio.exe --migrate-data-from "F:\старый\LocalData"`.
+Destination определяется указанными выше правилами и должен отсутствовать.
+Команда копирует данные в соседний staging, проверяет SHA256 и публикует каталог
+переименованием. Исходник не удаляется; existing destination, пересекающиеся пути
+и reparse points отвергаются. При сбое staging сохраняется для диагностики.
+После успеха приложение завершается; следующий запуск использует новый root.
+Миграция требует закрытых приложений, не является snapshot живого SQLite/WAL.
+
+`KadrLocalDataPathsTests` и `LocalDataMigrationTests` проверяют выбор режима,
+приоритет override, Unicode, сохранность исходника, отказ слияния/пересечения
+и отмену. Чистая установка, обновление и полный crash/readonly matrix ещё открыты.
+Portable package включает маркер; installer исключает его и LocalData.
+При тестах в рабочем дереве задавайте `KADR_STUDIO_DATA_ROOT` явно.
+
+## Выбор аудиопотока
+
+При добавлении multi-audio файла двойным щелчком или перетаскиванием пользователь
+выбирает один поток либо все потоки на отдельных дорожках. Выбор хранится в
+StreamIndex клипов и проверяется `AudioStreamSelectionTests`, включая Undo/Redo
+и SQLite save/reopen. `Export_uses_selected_audio_stream_instead_of_first_container_audio`
+экспортирует и декодирует fixture с разными тонами, проверяя выбранный поток по
+частотной составляющей. Полный маршрут диалога в WPF пока требует отдельного E2E.
+
+## Автоматический preview proxy
+
+Режим «Авто (до 1080p)» сохраняет native 1080p и автоматически ставит видео
+выше 1920×1080 на visual timeline в очередь одного encoder. Proxy сохраняет
+пропорции и исходную частоту кадров; аудио и экспорт продолжают использовать
+оригинал. UI показывает подготовку, готовность либо fallback на оригинал.
+
+`Automatic_proxy_preparation_only_transcodes_high_resolution` проверяет native
+1080p и подготовку 1440p → 1080p30 через настоящий FFmpeg.
+`Proxy_is_video_only_keeps_audio_on_original_and_rebuilds_after_corruption`
+проверяет relink, изменение файла, повреждение cache и удержание старого proxy
+до подтверждения нового RenderPlan. `PreviewSizingTests` и
+`CoalescingAsyncOperationTests` проверяют размеры и lifetime активации.
+
+Эти тесты не измеряют реально показанные WPF кадры. Полные UI, VFR, portrait,
+4K60 и performance gates остаются отдельными обязательными проверками в
+`READY_FOR_USER_IMPLEMENTATION.md`.
+
 ## Обязательный быстрый gate
 
 ```powershell

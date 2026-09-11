@@ -13,15 +13,17 @@ public partial class ExportWindow : Window
 {
     private readonly ProjectState _project;
     private readonly ExportService _exportService;
+    private readonly string? _projectFilePath;
     private CancellationTokenSource? _cancellation;
     private bool _isExporting;
     private string? _completedOutputPath;
 
-    public ExportWindow(ProjectState project, ExportService exportService)
+    public ExportWindow(ProjectState project, ExportService exportService, string? projectFilePath = null)
     {
         InitializeComponent();
         _project = project;
         _exportService = exportService;
+        _projectFilePath = projectFilePath;
 
         var videosDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
         if (string.IsNullOrWhiteSpace(videosDirectory))
@@ -61,6 +63,12 @@ public partial class ExportWindow : Window
             return;
         }
 
+        var allowOverwrite = File.Exists(OutputPathText.Text);
+        if (allowOverwrite && MessageBox.Show(this,
+                "Файл результата уже существует. Заменить его после успешного экспорта?",
+                "Заменить результат", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+            return;
+
         _isExporting = true;
         _completedOutputPath = null;
         _cancellation = new CancellationTokenSource();
@@ -82,7 +90,9 @@ public partial class ExportWindow : Window
                 OutputPathText.Text,
                 settings,
                 progress,
-                _cancellation.Token);
+                _cancellation.Token,
+                allowOverwrite,
+                _projectFilePath);
 
             _completedOutputPath = OutputPathText.Text;
             StageText.Text = "Экспорт завершён";

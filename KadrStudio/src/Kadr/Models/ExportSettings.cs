@@ -10,9 +10,10 @@ public sealed class ExportSettings
     {
         ExportResolution.P480 => (854, 480),
         ExportResolution.P720 => (1280, 720),
+        ExportResolution.P1440 => (2560, 1440),
+        ExportResolution.P2160 => (3840, 2160),
         _ => (1920, 1080)
     };
 }
 
 public sealed record ExportProgress(double Percent, string Stage, string Detail);
-

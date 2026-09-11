@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using KadrStudio.AiServer.Api;
 using KadrStudio.AiServer.Configuration;
+using KadrStudio.AiServer.Jobs;
 using KadrStudio.AiServer.Workers;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -53,9 +54,18 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
     }
 
     [Fact]
-    public async Task LiveHealthDoesNotRequireAuthentication()
+    public async Task RemoteLiveHealthRequiresAuthentication()
     {
         using var client = _factory.CreateClient();
+        using var response = await client.GetAsync("/health/live");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AuthorizedRemoteLiveHealthRemainsAvailable()
+    {
+        using var client = _factory.CreateAuthorizedClient();
         using var response = await client.GetAsync("/health/live");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -84,6 +94,48 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
         var body = await response.Content.ReadAsStringAsync();
         Assert.Contains("plannerModelError", body);
         Assert.Contains("visionModelError", body);
+        using var json = JsonDocument.Parse(body);
+        Assert.True(json.RootElement.GetProperty("jobStorage").GetProperty("isHealthy").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Readiness_reports_cleanup_storage_failure_and_clears_after_retry()
+    {
+        using var factory = new ApiContractFactory();
+        using var client = factory.CreateAuthorizedClient();
+        var jobs = factory.Services.GetRequiredService<AnalyzerJobService>();
+        var options = factory.Services.GetRequiredService<AiServerOptions>();
+        var id = Guid.NewGuid();
+        var path = Path.Combine(options.DataRoot, "jobs", id.ToString("N") + ".json");
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new
+        {
+            id, analyzer = "embedding", analyzerVersion = "test", assetIds = Array.Empty<string>(),
+            parameters = new { query = "health" }, state = AnalyzerJobState.Succeeded,
+            progress = 1, message = "done", artifactIds = Array.Empty<string>(),
+            createdAt = DateTimeOffset.UtcNow.AddDays(-10), updatedAt = DateTimeOffset.UtcNow.AddDays(-10),
+            requireProduction = false
+        }));
+        await (Task)typeof(AnalyzerJobService).GetMethod("RecoverAsync",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .Invoke(jobs, [CancellationToken.None])!;
+        using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            await jobs.RunCleanupAsync(CancellationToken.None);
+            using var response = await client.GetAsync("/health/ready");
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var storage = body.RootElement.GetProperty("jobStorage");
+            Assert.False(storage.GetProperty("isHealthy").GetBoolean());
+            Assert.Equal(1, storage.GetProperty("jobsWithStorageErrors").GetInt32());
+            using var live = await client.GetAsync("/health/live");
+            Assert.Equal(HttpStatusCode.OK, live.StatusCode);
+        }
+        await jobs.RunCleanupAsync(CancellationToken.None);
+        using var recovered = await client.GetAsync("/health/ready");
+        using var recoveredBody = JsonDocument.Parse(await recovered.Content.ReadAsStringAsync());
+        Assert.True(recoveredBody.RootElement.GetProperty("jobStorage").GetProperty("isHealthy").GetBoolean());
+        // Unqualified models remain a separate readiness blocker after storage recovers.
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, recovered.StatusCode);
     }
 
     [Fact]
@@ -171,6 +223,29 @@ public sealed class ApiContractTests : IClassFixture<ApiContractFactory>
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Contains("asset_invalid", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task V2_owned_job_confirms_owner_and_rejects_foreign_cancellation()
+    {
+        using var factory = _factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+            services.RemoveAll<Microsoft.Extensions.Hosting.IHostedService>()));
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "contract-test-key");
+        using var created = await client.PostAsJsonAsync("/v2/jobs", new AnalyzerJobRequest(
+            "embedding", "owned-contract", [], JsonSerializer.SerializeToElement(new { query = Guid.NewGuid().ToString() }),
+            false, "owner-a", "request-1"));
+        Assert.Equal(HttpStatusCode.Accepted, created.StatusCode);
+        var job = await created.Content.ReadFromJsonAsync<AnalyzerJobResponse>();
+        Assert.Equal("owner-a", job!.OwnerId);
+        Assert.Equal(1, job.OwnershipProtocolVersion);
+        using var unscoped = await client.DeleteAsync($"/v2/jobs/{job.Id}");
+        Assert.Equal(HttpStatusCode.Forbidden, unscoped.StatusCode);
+        using var foreign = await client.DeleteAsync($"/v2/jobs/{job.Id}?ownerId=owner-b");
+        Assert.Equal(HttpStatusCode.Forbidden, foreign.StatusCode);
+        using var owned = await client.DeleteAsync($"/v2/jobs/{job.Id}?ownerId=owner-a");
+        Assert.Equal(HttpStatusCode.OK, owned.StatusCode);
+        Assert.Equal(AnalyzerJobState.Cancelled, (await owned.Content.ReadFromJsonAsync<AnalyzerJobResponse>())!.State);
     }
 
     [Fact]
@@ -318,6 +393,9 @@ public sealed class ApiContractFactory : WebApplicationFactory<Program>
     {
         builder.ConfigureServices(services =>
         {
+            var embeddingModel = Path.Combine(_dataRoot, "models", "embedding", "model.bin");
+            Directory.CreateDirectory(Path.GetDirectoryName(embeddingModel)!);
+            File.WriteAllText(embeddingModel, "contract-embedding-model");
             services.RemoveAll<AiServerOptions>();
             services.RemoveAll<IWorkerGateway>();
             services.AddSingleton(new AiServerOptions
@@ -327,7 +405,10 @@ public sealed class ApiContractFactory : WebApplicationFactory<Program>
                 ProductionModelsRoot = Path.Combine(_dataRoot, "models"),
                 DataRoot = _dataRoot,
                 WorkersRoot = Path.Combine(_dataRoot, "workers"),
+                EmbeddingModelPath = embeddingModel,
                 ApiKey = TestApiKey,
+                AccessMode = AiServerAccessMode.Remote,
+                AllowInsecureRemoteHttp = true,
                 MaxRequestBodyBytes = 4 * 1024 * 1024,
                 MaxImageCount = 4,
                 MaxPromptCharacters = 10_000,

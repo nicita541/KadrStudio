@@ -9,12 +9,12 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class AnimeEpisodeLiveIntegrationTests
 {
-    [Fact(Timeout = 300_000)]
+    [EnvironmentRequiredFact(TestEnvironmentGate.LiveAnimeFixture, Timeout = 300_000)]
+    [Trait("Category", "EnvironmentRequired")]
+    [Trait("Environment", "AnimeFixture")]
     public async Task Real_anime_episode_probe_preserves_source_and_exposes_every_required_stream()
     {
-        var path = Environment.GetEnvironmentVariable("KADR_ANIME_EPISODE_PATH");
-        if (string.IsNullOrWhiteSpace(path)) return;
-        path = Path.GetFullPath(path);
+        var path = TestEnvironment.Require(TestEnvironmentGate.LiveAnimeFixture);
         Assert.True(File.Exists(path), $"Anime fixture was not found: {path}");
         var before = new FileInfo(path);
         var originalLength = before.Length;
@@ -42,12 +42,12 @@ public sealed class AnimeEpisodeLiveIntegrationTests
         Assert.Equal(originalWriteTime, after.LastWriteTimeUtc);
     }
 
-    [Fact(Timeout = 300_000)]
+    [EnvironmentRequiredFact(TestEnvironmentGate.LiveAnimeFixture, Timeout = 300_000)]
+    [Trait("Category", "EnvironmentRequired")]
+    [Trait("Environment", "AnimeFixture")]
     public async Task Real_anime_metadata_compiles_only_OP_and_ED_into_an_exact_complement_draft()
     {
-        var path = Environment.GetEnvironmentVariable("KADR_ANIME_EPISODE_PATH");
-        if (string.IsNullOrWhiteSpace(path)) return;
-        path = Path.GetFullPath(path);
+        var path = TestEnvironment.Require(TestEnvironmentGate.LiveAnimeFixture);
         var info = new FileInfo(path);
         var originalLength = info.Length;
         var originalWriteTime = info.LastWriteTimeUtc;

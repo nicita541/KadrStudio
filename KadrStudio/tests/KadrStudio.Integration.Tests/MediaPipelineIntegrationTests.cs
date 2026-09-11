@@ -13,6 +13,62 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class MediaPipelineIntegrationTests
 {
+    [Fact(Timeout = 60_000)]
+    public async Task Export_uses_selected_audio_stream_instead_of_first_container_audio()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            var runner = new ProcessRunner();
+            var source = Path.Combine(root, "two-languages.mp4");
+            Assert.Equal(0, (await runner.RunAsync(locator.FfmpegPath,
+                ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=s=160x90:r=24:d=2",
+                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                 "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=2",
+                 "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast",
+                 "-c:a", "aac", source])).ExitCode);
+            var project = CreateAvProject(source);
+            var sourceId = project.Sources.Keys.Single();
+            project = project with
+            {
+                Sources = project.Sources.SetItem(sourceId, project.Sources[sourceId] with
+                {
+                    Streams = [new(0, MediaStreamKind.Video, "h264"),
+                        new(1, MediaStreamKind.Audio, "aac", SampleRate: 48000, Channels: 1),
+                        new(2, MediaStreamKind.Audio, "aac", SampleRate: 48000, Channels: 1)]
+                }),
+                MediaClips = project.MediaClips.Select(clip => clip with { StreamIndex = clip.Audio is null ? 0 : 2 }).ToImmutableArray()
+            };
+            var output = Path.Combine(root, "selected.mp4");
+            await using var scheduler = new BackgroundJobScheduler();
+            await new FfmpegRenderEngine(locator.FfmpegPath, new FfmpegRenderCommandBuilder(), scheduler)
+                .RenderAsync(new RenderPlanBuilder().Build(project), new RenderOutputOptions(RenderPurpose.Export, output, 160, 90));
+            var pcm = Path.Combine(root, "decoded.f32");
+            Assert.Equal(0, (await runner.RunAsync(locator.FfmpegPath,
+                ["-hide_banner", "-loglevel", "error", "-i", output, "-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", pcm])).ExitCode);
+            var bytes = await File.ReadAllBytesAsync(pcm);
+            var samples = new float[bytes.Length / sizeof(float)];
+            Buffer.BlockCopy(bytes, 0, samples, 0, bytes.Length);
+            Assert.True(samples.Length > 48000);
+            Assert.True(ToneEnergy(samples, 880) > ToneEnergy(samples, 440) * 100,
+                "Export did not isolate the selected 880Hz stream from the first 440Hz stream.");
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    private static double ToneEnergy(float[] samples, double frequency)
+    {
+        double real = 0, imaginary = 0;
+        for (var index = 0; index < samples.Length; index++)
+        {
+            var phase = 2 * Math.PI * frequency * index / 48000;
+            real += samples[index] * Math.Cos(phase);
+            imaginary += samples[index] * Math.Sin(phase);
+        }
+        return real * real + imaginary * imaginary;
+    }
+
     [Fact(Timeout = 120_000)]
     public async Task Full_length_adjacent_imports_get_real_rendered_transition_without_manual_overlap()
     {
@@ -179,29 +235,103 @@ public sealed class MediaPipelineIntegrationTests
             var coreProject = CreateAvProject(source);
             await using var coordinator = new TimelineRenderCoordinator(locator);
             var originalPlan = coordinator.CreatePlan(coreProject);
+            await using var artifacts = new KadrStudio.Infrastructure.Caching.DiskMediaArtifactCache(Path.Combine(root, "artifacts"));
             string proxyPath;
-            await using (var proxies = new PreviewProxyStore(locator))
+            await using (var proxies = new PreviewProxyStore(locator, artifacts))
             {
                 await proxies.PrepareAsync(coreProject);
                 var proxied = proxies.UseAvailable(originalPlan);
                 proxyPath = proxied.VisualLayers.Single().SourcePath;
                 Assert.NotEqual(source, proxyPath);
                 Assert.Equal(source, proxied.AudioLayers.Single().SourcePath);
+                await artifacts.TrimAsync(0);
+                Assert.True(File.Exists(proxyPath));
+                Assert.NotEqual(originalPlan.VideoContentSignature, proxied.VideoContentSignature);
+                var relinkedPath = Path.Combine(root, "relinked.mp4");
+                File.Copy(source, relinkedPath);
+                var sourceId = coreProject.Sources.Keys.Single();
+                var relinked = coreProject with
+                {
+                    Sources = coreProject.Sources.SetItem(sourceId, coreProject.Sources[sourceId] with { Path = relinkedPath })
+                };
+                proxies.Configure(relinked);
+                var relinkedPlan = coordinator.CreatePlan(relinked);
+                Assert.Equal(relinkedPath, proxies.UseAvailable(relinkedPlan).VisualLayers.Single().SourcePath);
+                await proxies.PrepareAsync(relinked);
+                var relinkedProxy = proxies.UseAvailable(relinkedPlan).VisualLayers.Single().SourcePath;
+                Assert.NotEqual(proxyPath, relinkedProxy);
+                Assert.NotEqual(relinkedPath, relinkedProxy);
+                Assert.Equal(source, proxies.UseAvailable(originalPlan).VisualLayers.Single().SourcePath);
+                File.SetLastWriteTimeUtc(relinkedPath, File.GetLastWriteTimeUtc(relinkedPath).AddSeconds(2));
+                proxies.Configure(relinked);
+                Assert.Equal(relinkedPath, proxies.UseAvailable(relinkedPlan).VisualLayers.Single().SourcePath);
+                await proxies.PrepareAsync(relinked);
+                Assert.NotEqual(relinkedProxy, proxies.UseAvailable(relinkedPlan).VisualLayers.Single().SourcePath);
+                var active = proxies.UseAvailable(relinkedPlan);
+                await artifacts.TrimAsync(0);
+                Assert.True(File.Exists(proxyPath)); // Old decoder has not acknowledged replacement.
+                proxies.AcknowledgePlan(active);
+                await artifacts.TrimAsync(0);
+                Assert.False(File.Exists(proxyPath));
+                proxyPath = active.VisualLayers.Single().SourcePath;
+                Assert.True(File.Exists(proxyPath));
+                coreProject = relinked;
+                originalPlan = coordinator.CreatePlan(coreProject);
             }
 
             var probe = await new ProcessRunner().RunAsync(locator.FfprobePath,
-                ["-v", "error", "-show_entries", "stream=codec_type,width,height", "-of", "csv=p=0", proxyPath]);
+                ["-v", "error", "-show_entries", "stream=codec_type,width,height,r_frame_rate", "-of", "csv=p=0", proxyPath]);
             Assert.Equal(0, probe.ExitCode);
             Assert.Contains("video", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("audio", probe.StandardOutput, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("960,540", probe.StandardOutput);
+            Assert.Contains("320,180", probe.StandardOutput);
+            Assert.Contains("24/1", probe.StandardOutput);
 
             await File.WriteAllBytesAsync(proxyPath, [1, 2, 3, 4]);
-            await using (var reopened = new PreviewProxyStore(locator))
+            await using (var reopened = new PreviewProxyStore(locator, artifacts))
             {
                 await reopened.PrepareAsync(coreProject);
                 Assert.True(new FileInfo(reopened.UseAvailable(originalPlan).VisualLayers.Single().SourcePath).Length > 1024);
             }
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [Theory(Timeout = 60_000)]
+    [InlineData(1920, 1080, false)]
+    [InlineData(2560, 1440, true)]
+    public async Task Automatic_proxy_preparation_only_transcodes_high_resolution(int width, int height, bool expectedProxy)
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            var runner = new ProcessRunner();
+            var path = Path.Combine(root, "source.mp4");
+            Assert.Equal(0, (await runner.RunAsync(locator.FfmpegPath,
+                ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", $"color=s={width}x{height}:r=30:d=0.2",
+                 "-c:v", "libx264", "-preset", "ultrafast", path])).ExitCode);
+            var project = CreateAvProject(path);
+            var sourceId = project.Sources.Keys.Single();
+            project = project with { Sources = project.Sources.SetItem(sourceId,
+                project.Sources[sourceId] with { Width = width, Height = height, FrameRate = new FrameRate(30) }) };
+            await using var coordinator = new TimelineRenderCoordinator(locator);
+            var original = coordinator.CreatePlan(project);
+            await using var artifacts = new KadrStudio.Infrastructure.Caching.DiskMediaArtifactCache(Path.Combine(root, "cache"));
+            await using var proxies = new PreviewProxyStore(locator, artifacts);
+            await proxies.PrepareAsync(project, highResolutionOnly: true);
+            var actual = proxies.UseAvailable(original).VisualLayers.Single().SourcePath;
+            Assert.Equal(expectedProxy, path != actual);
+            Assert.Equal(path, original.VisualLayers.Single().SourcePath);
+            if (expectedProxy)
+            {
+                var probe = await runner.RunAsync(locator.FfprobePath,
+                    ["-v", "error", "-show_entries", "stream=width,height,r_frame_rate", "-of", "csv=p=0", actual]);
+                Assert.Equal(0, probe.ExitCode);
+                Assert.Contains("1920,1080,30/1", probe.StandardOutput);
+                Assert.Contains("Proxy готов", proxies.StatusText);
+            }
+            else Assert.Equal("Оригинал", proxies.StatusText);
         }
         finally { DeleteRoot(root); }
     }

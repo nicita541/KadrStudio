@@ -32,7 +32,12 @@ public sealed record RenderTextLayer(
     int TrackIndex,
     TimeRange TimelineRange,
     string Text,
-    TextStyle Style);
+    TextStyle Style)
+{
+    public string? RasterPath { get; init; }
+    public string? RasterIdentity { get; init; }
+    public ImmutableArray<string> RasterFontIdentities { get; init; } = [];
+}
 
 /// <summary>
 /// A typed video transition in the shared render graph. The two source layers
@@ -184,7 +189,11 @@ public sealed record RenderOutputOptions(
     bool IncludeAudio = true,
     bool IncludeOverlays = true,
     bool TransparentBackground = false,
-    bool UseHardwareDecoding = false);
+    bool UseHardwareDecoding = false)
+{
+    public bool AllowOverwrite { get; init; }
+    public ImmutableArray<string> ProtectedPaths { get; init; } = [];
+}
 
 public sealed record ExternalRenderCommand(
     string ExecutableRole,

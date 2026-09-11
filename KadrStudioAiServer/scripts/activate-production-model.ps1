@@ -54,6 +54,8 @@ foreach ($file in $files) {
     } finally { $stream.Dispose() }
 }
 $modelHash = [Convert]::ToHexString($sha.GetHashAndReset()).ToLowerInvariant()
+$modelSizeBytes = [long]($files | Measure-Object -Property Length -Sum).Sum
+$modelLastWriteTimeUtc = ($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
 if ($eval.schemaVersion -ne 1 -or $eval.passed -ne $true -or
     [string]::IsNullOrWhiteSpace([string]$eval.revision) -or
     [string]$eval.model -ne $Model -or [string]$eval.modelKind -ne $ModelKind -or
@@ -86,6 +88,13 @@ $manifest = [ordered]@{
     montageEvalPassed = $true
     productionApproved = $true
     evaluatedAt = [DateTimeOffset]::UtcNow.ToString('O')
+    verifiedIdentity = [ordered]@{
+        path = $modelPath
+        sizeBytes = $modelSizeBytes
+        lastWriteTimeUtc = ([DateTimeOffset]$modelLastWriteTimeUtc).ToUniversalTime().ToString('O')
+        sha256 = $modelHash
+        revision = [string]$eval.revision
+    }
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $capabilities "$safeName.json") -Encoding UTF8
 Write-Host "Activated $Model with hash $modelHash and eval $($eval.revision)."

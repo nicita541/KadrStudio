@@ -9,6 +9,27 @@ namespace KadrStudio.Core.Tests;
 public sealed class MediaRegistryTests
 {
     [Fact]
+    public async Task Relink_does_not_skip_stored_verified_identity_for_fast_requests()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "candidate.mp4");
+        await File.WriteAllBytesAsync(path, [1]);
+        var source = new MediaSource(Guid.NewGuid(), "offline.mp4", "offline.mp4", MediaKind.Video,
+            TimelineTime.FromSeconds(2), false, VerifiedFingerprint: "original");
+        var registry = new MediaRegistry(new VerificationProbe());
+        var candidate = await registry.ValidateRelinkAsync(source, path, requireVerifiedFingerprint: false);
+        Assert.False(candidate.CanApply);
+        Assert.Equal(RelinkCompatibility.FingerprintMismatch, candidate.Compatibility);
+    }
+
+    private sealed class VerificationProbe : IMediaProbe
+    {
+        public Task<MediaProbeResult> ProbeAsync(string path, bool verifyContent, CancellationToken cancellationToken = default)
+            => Task.FromResult(new MediaProbeResult(path, MediaKind.Video, TimelineTime.FromSeconds(2), [],
+                new MediaFingerprint(1, 1, "fast", verifyContent ? "different" : null)));
+    }
+
+    [Fact]
     public async Task Fast_fingerprint_detects_content_change_with_same_size_and_timestamp()
     {
         using var directory = new TemporaryDirectory();

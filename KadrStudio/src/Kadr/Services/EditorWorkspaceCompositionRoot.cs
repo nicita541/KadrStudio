@@ -4,6 +4,10 @@ using KadrStudio.Infrastructure.Caching;
 using KadrStudio.Infrastructure.Jobs;
 using KadrStudio.Infrastructure.Media;
 using KadrStudio.Application.Upscaling;
+using KadrStudio.Application.Automation.Agent.Diagnostics;
+using KadrStudio.Application.Automation.Editorial;
+using KadrStudio.Services.Agent;
+using KadrStudio.Services.Editorial;
 
 namespace KadrStudio.Services;
 
@@ -27,7 +31,9 @@ public sealed record EditorWorkspaceServices(
     IAiUpscaleService AiUpscaleService,
     AiServerConnection AiServer,
     BackgroundJobScheduler AutomationScheduler,
-    WorkspaceSettingsService SettingsService);
+    WorkspaceSettingsService SettingsService,
+    EditorialPipeline EditorialPipeline,
+    IAgentDebugLog AgentDebugLog);
 
 public static class EditorWorkspaceCompositionRoot
 {
@@ -37,8 +43,18 @@ public static class EditorWorkspaceCompositionRoot
         var processes = new ProcessRunner();
         var settingsService = new WorkspaceSettingsService();
         var settings = settingsService.Load();
-        var artifacts = new DiskMediaArtifactCache(new ArtifactStoreOptions(
-            settings.ArtifactRoot, settings.ArtifactDiskBudgetBytes));
+        var artifacts = ArtifactStoreFactory.Create(new ArtifactStoreOptions(
+            settings.ArtifactRoot, settings.ArtifactDiskBudgetBytes,
+            OwnershipId: settings.ArtifactCacheOwnerId));
+        if (settings.ArtifactCacheOwnerId != artifacts.Options.OwnershipId ||
+            !settings.ArtifactRoot.Equals(artifacts.Options.Root, StringComparison.OrdinalIgnoreCase))
+        {
+            settingsService.Save(settings with
+            {
+                ArtifactRoot = artifacts.Options.Root,
+                ArtifactCacheOwnerId = artifacts.Options.OwnershipId
+            });
+        }
         var probe = new MediaProbeService(ffmpeg, processes);
         var registry = new MediaRegistry(probe);
         var thumbnails = new ThumbnailService(ffmpeg, processes, artifacts);
@@ -48,11 +64,21 @@ public static class EditorWorkspaceCompositionRoot
         var export = new ExportService(ffmpeg, processes, renderCoordinator);
         var subtitles = new AutoSubtitleService(ffmpeg, processes);
         var aiServer = new AiServerConnection();
+        var editorialTelemetry = new JsonlEditorialTelemetrySink();
+        var aiServerV2 = new AiServerV2Client(aiServer, editorialTelemetry);
+        var editorialIndexer = new AiServerMediaUnderstandingIndexer(
+            aiServerV2, new AnalysisProxyBuilder(ffmpeg, processes, editorialTelemetry));
+        var editorialReasoner = new AiServerEditorialReasoner(aiServerV2);
+        var editorialPipeline = new EditorialPipeline(
+            editorialIndexer, editorialReasoner, editorialReasoner, editorialIndexer,
+            retriever: new HierarchicalMediaRetriever(semanticRanker: new AiServerSemanticNodeRanker(aiServerV2)),
+            telemetry: editorialTelemetry);
         var upscale = new AnimeSrUpscaleService(ffmpeg, probe, processes, aiServer);
+        var document = new KadrStudio.Application.Storage.ProjectDocumentCoordinator(KadrLocalDataPaths.HistoryRoot);
         return new EditorWorkspaceServices(
             ffmpeg,
             processes,
-            new ProjectService(KadrLocalDataPaths.RecoveryRoot),
+            new ProjectService(KadrLocalDataPaths.RecoveryRoot, document),
             artifacts,
             registry,
             probe,
@@ -60,11 +86,13 @@ public static class EditorWorkspaceCompositionRoot
             renderCoordinator,
             timelineCache,
             export,
-            new ProjectHistoryService(),
+            new ProjectHistoryService(coordinator: document),
             subtitles,
             upscale,
             aiServer,
             new BackgroundJobScheduler(),
-            settingsService);
+            settingsService,
+            editorialPipeline,
+            new FileAgentDebugLog());
     }
 }

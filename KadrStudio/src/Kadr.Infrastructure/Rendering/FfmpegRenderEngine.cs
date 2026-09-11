@@ -5,6 +5,7 @@ using System.Text.Json;
 using KadrStudio.Application.Jobs;
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
+using KadrStudio.Infrastructure.Storage;
 
 namespace KadrStudio.Infrastructure.Rendering;
 
@@ -25,6 +26,14 @@ public sealed partial class FfmpegRenderEngine(
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(options);
         var fullOutput = Path.GetFullPath(options.OutputPath);
+        var protectedPaths = options.ProtectedPaths
+            .Concat(plan.VisualLayers.Select(layer => layer.SourcePath))
+            .Concat(plan.AudioLayers.Select(layer => layer.SourcePath))
+            .Concat(plan.VideoTransitions.SelectMany(transition => new[] { transition.From.SourcePath, transition.To.SourcePath }))
+            .Concat(plan.AudioTransitions.SelectMany(transition => new[] { transition.From.SourcePath, transition.To.SourcePath }))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var allowOverwrite = options.AllowOverwrite || options.Purpose != RenderPurpose.Export;
+        OutputFileGuard.Validate(fullOutput, protectedPaths, allowOverwrite);
         var directory = Path.GetDirectoryName(fullOutput)!;
         Directory.CreateDirectory(directory);
         var extension = Path.GetExtension(fullOutput);
@@ -63,7 +72,9 @@ public sealed partial class FfmpegRenderEngine(
                         await ExecuteAsync(cpuCommand, plan.Duration, progress, token).ConfigureAwait(false);
                     }
                     await VerifyOutputAsync(temporary, temporaryOptions, plan, token).ConfigureAwait(false);
-                    File.Move(temporary, fullOutput, overwrite: true);
+                    token.ThrowIfCancellationRequested();
+                    OutputFileGuard.Validate(fullOutput, protectedPaths, allowOverwrite);
+                    File.Move(temporary, fullOutput, overwrite: allowOverwrite);
                     progress?.Report(new RenderProgress(1, plan.Duration, "Completed"));
                     return fullOutput;
                 }
@@ -100,8 +111,7 @@ public sealed partial class FfmpegRenderEngine(
         using var registration = token.Register(() => TryKill(process));
         var stderrTask = ReadErrorAsync(process.StandardError, duration, progress, errors, token);
         var stdoutTask = process.StandardOutput.ReadToEndAsync(token);
-        await process.WaitForExitAsync(token).ConfigureAwait(false);
-        await Task.WhenAll(stderrTask, stdoutTask).ConfigureAwait(false);
+        await AwaitOwnedProcessAsync(process, token, stderrTask, stdoutTask).ConfigureAwait(false);
         if (process.ExitCode != 0)
             throw new InvalidOperationException(
                 $"FFmpeg exited with code {process.ExitCode}.\n{string.Join(Environment.NewLine, errors)}");
@@ -168,7 +178,7 @@ public sealed partial class FfmpegRenderEngine(
         using var registration = token.Register(() => TryKill(process));
         var outputTask = process.StandardOutput.ReadToEndAsync(token);
         var errorTask = process.StandardError.ReadToEndAsync(token);
-        await process.WaitForExitAsync(token).ConfigureAwait(false);
+        await AwaitOwnedProcessAsync(process, token, outputTask, errorTask).ConfigureAwait(false);
         var output = await outputTask.ConfigureAwait(false);
         var error = await errorTask.ConfigureAwait(false);
         if (process.ExitCode != 0)
@@ -196,6 +206,48 @@ public sealed partial class FfmpegRenderEngine(
     private static void TryKill(Process process)
     {
         try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+    }
+
+    private static async Task AwaitOwnedProcessAsync(Process process, CancellationToken token, params Task[] readers)
+    {
+        // A failed reader must also terminate the producer, which might be blocked on its pipe.
+        var drains = Task.WhenAll(readers.Select(async reader =>
+        {
+            try { await reader.ConfigureAwait(false); }
+            catch { TryKill(process); throw; }
+        }));
+        _ = drains.ContinueWith(completed => { _ = completed.Exception; }, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try
+        {
+            await process.WaitForExitAsync(token).ConfigureAwait(false);
+            await drains.WaitAsync(token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+        }
+        finally
+        {
+            // Cancellation of WaitForExitAsync is not process exit. Keep inputs and streams
+            // owned until the child has actually stopped and both readers have completed.
+            TryKill(process);
+            try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+            catch (TimeoutException)
+            {
+                // Tree enumeration can fail independently of terminating our direct child.
+                try { if (!process.HasExited) process.Kill(); } catch (InvalidOperationException) { }
+                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+            try { await drains.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+            catch (Exception) when (drains.IsCompleted) { /* Observed; preserve the original failure. */ }
+            catch (TimeoutException)
+            {
+                process.StandardOutput.Dispose();
+                process.StandardError.Dispose();
+                try { await drains.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false); }
+                catch (Exception) when (drains.IsCompleted) { }
+                // A user progress callback that never returns cannot be forcibly stopped.
+                // Surface the timeout rather than reporting successful resource cleanup.
+            }
+        }
     }
 
     private static void TryDelete(string path)

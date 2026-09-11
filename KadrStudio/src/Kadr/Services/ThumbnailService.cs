@@ -18,7 +18,7 @@ public sealed class ThumbnailService : IAsyncDisposable
         _locator = locator;
         _processRunner = processRunner;
         _ownsArtifacts = artifacts is null;
-        _artifacts = artifacts ?? new DiskMediaArtifactCache(DefaultArtifactRoot());
+        _artifacts = artifacts ?? ArtifactStoreFactory.Create(new ArtifactStoreOptions(DefaultArtifactRoot()));
     }
 
     public async Task<string?> CreateAsync(MediaAsset asset, CancellationToken cancellationToken = default)

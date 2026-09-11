@@ -11,12 +11,38 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class MediaHostIntegrationTests
 {
-    [Fact(Timeout = 180_000)]
+    [Fact(Timeout = 20000)]
+    public async Task Video_only_playback_finishes_at_exact_end_and_can_play_again()
+    {
+        var root = CreateRoot();
+        try
+        {
+            var locator = new FfmpegLocator();
+            var source = Path.Combine(root, "eof.mp4");
+            await CreateColorAsync(locator, source, "red");
+            var plan = new RenderPlanBuilder().Build(CreateProject(source));
+            plan = plan with { Range = new TimeRange(TimelineTime.Zero, TimelineTime.FromSeconds(1)) };
+            await using var host = new KadrStudio.MediaHost.HostPlaybackSession(locator.FfmpegPath);
+            await host.PrepareAsync(plan, new PreviewRequest(TimelineTime.Zero, new FrameRate(24),
+                320, 240, false, new PreviewGeneration(1, 1, 1)));
+            for (var pass = 0; pass < 2; pass++)
+            {
+                await host.StartAsync();
+                Assert.Equal(PreviewState.Playing, host.State);
+                await WaitUntilAsync(() => host.State == PreviewState.Paused, TimeSpan.FromSeconds(5));
+                Assert.Equal(plan.Range.End, host.Position);
+            }
+        }
+        finally { DeleteRoot(root); }
+    }
+
+    [EnvironmentRequiredFact(TestEnvironmentGate.PreviewBenchmark, Timeout = 180_000)]
+    [Trait("Category", "EnvironmentRequired")]
+    [Trait("Environment", "Benchmark")]
     public async Task Performance_benchmark_writes_diagnostics_when_requested()
     {
-        var sourcePath = Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_SOURCE");
-        var outputPath = Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_OUTPUT");
-        if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(outputPath)) return;
+        var sourcePath = TestEnvironment.Require(TestEnvironmentGate.PreviewBenchmark);
+        var outputPath = Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_OUTPUT")!;
         var width = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_WIDTH") ?? "1920");
         var height = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_HEIGHT") ?? "1080");
         var fps = int.Parse(Environment.GetEnvironmentVariable("KADR_PREVIEW_BENCHMARK_FPS") ?? "60");
@@ -28,8 +54,9 @@ public sealed class MediaHostIntegrationTests
         var locator = new FfmpegLocator();
         locator.EnsureAvailable();
         await using var client = new MediaHostClient(ResolveMediaHost(), locator.FfmpegPath);
-        var timestamps = new System.Collections.Concurrent.ConcurrentQueue<long>();
-        client.FramePresented += (_, _) => timestamps.Enqueue(System.Diagnostics.Stopwatch.GetTimestamp());
+        var timestamps = new System.Collections.Concurrent.ConcurrentQueue<(long Wall, long MediaTicks)>();
+        client.FramePresented += (_, frame) => timestamps.Enqueue(
+            (System.Diagnostics.Stopwatch.GetTimestamp(), frame.Position.Ticks));
         var first = NextFrame(client);
         var request = new PreviewRequest(
             TimelineTime.Zero, new FrameRate(fps), width, height, false,
@@ -37,6 +64,10 @@ public sealed class MediaHostIntegrationTests
         await client.PrepareAsync(plan, request);
         await first.WaitAsync(TimeSpan.FromSeconds(30));
         timestamps.Clear();
+        using var hostProcess = System.Diagnostics.Process.GetProcessById(client.HostProcessId);
+        using var clientProcess = System.Diagnostics.Process.GetCurrentProcess();
+        var cpuBefore = hostProcess.TotalProcessorTime + clientProcess.TotalProcessorTime;
+        var wallStartTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         var wall = System.Diagnostics.Stopwatch.StartNew();
         await client.StartAsync();
         await Task.Delay(TimeSpan.FromSeconds(seconds + 0.5));
@@ -45,12 +76,35 @@ public sealed class MediaHostIntegrationTests
         await client.PauseAsync();
         var values = timestamps.ToArray();
         var intervals = values.Zip(values.Skip(1), (left, right) =>
-                System.Diagnostics.Stopwatch.GetElapsedTime(left, right).TotalMilliseconds)
+                System.Diagnostics.Stopwatch.GetElapsedTime(left.Wall, right.Wall).TotalMilliseconds)
             .OrderBy(value => value)
             .ToArray();
         var p95 = intervals.Length == 0
             ? 0
             : intervals[Math.Min(intervals.Length - 1, (int)Math.Ceiling(intervals.Length * 0.95) - 1)];
+        var presentationLatencies = values.Select(value => Math.Max(0,
+                System.Diagnostics.Stopwatch.GetElapsedTime(wallStartTimestamp, value.Wall).TotalMilliseconds -
+                value.MediaTicks * 1000d / TimelineTime.TicksPerSecond))
+            .OrderBy(value => value).ToArray();
+        var presentationP95 = presentationLatencies.Length == 0 ? 0 : presentationLatencies[
+            Math.Min(presentationLatencies.Length - 1, (int)Math.Ceiling(presentationLatencies.Length * 0.95) - 1)];
+        var seekSamples = new List<double>();
+        for (var index = 0; index < 10; index++)
+        {
+            var next = NextFrame(client);
+            var seekClock = System.Diagnostics.Stopwatch.StartNew();
+            await client.SeekAsync(TimelineTime.FromSeconds(index * Math.Max(0.1, seconds - 0.1) / 10));
+            await next.WaitAsync(TimeSpan.FromSeconds(10));
+            seekClock.Stop();
+            seekSamples.Add(seekClock.Elapsed.TotalMilliseconds);
+        }
+        seekSamples.Sort();
+        var seekP95 = seekSamples[(int)Math.Ceiling(seekSamples.Count * 0.95) - 1];
+        hostProcess.Refresh();
+        clientProcess.Refresh();
+        var cpuTime = hostProcess.TotalProcessorTime + clientProcess.TotalProcessorTime - cpuBefore;
+        var cpuPercent = cpuTime.TotalMilliseconds /
+                         Math.Max(1, wall.Elapsed.TotalMilliseconds * Environment.ProcessorCount) * 100;
         var expected = (long)Math.Round(seconds * fps, MidpointRounding.AwayFromZero);
         var payload = new
         {
@@ -64,6 +118,11 @@ public sealed class MediaHostIntegrationTests
             expectedFrames = expected,
             observedDroppedFrames = Math.Max(0, expected - values.LongLength),
             frameInterarrivalP95Ms = p95,
+            presentationLatencyP95Ms = presentationP95,
+            seekP95Ms = seekP95,
+            cpuPercentHostAndClient = cpuPercent,
+            workingSetBytesHostAndClient = hostProcess.WorkingSet64 + clientProcess.WorkingSet64,
+            peakWorkingSetBytesHostAndClient = hostProcess.PeakWorkingSet64 + clientProcess.PeakWorkingSet64,
             wallTimeMs = wall.Elapsed.TotalMilliseconds,
             diagnostics
         };
@@ -107,8 +166,9 @@ public sealed class MediaHostIntegrationTests
             Assert.Contains(firstFrame.Bgra.Span.ToArray(), value => value != 0);
 
             var sought = NextFrame(client);
-            await client.SeekAsync(TimelineTime.FromSeconds(2));
+            await ((IPreviewEngine)client).SeekAsync(TimelineTime.FromSeconds(2), new PreviewGeneration(72, 20, 3));
             var soughtFrame = await sought.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(72, soughtFrame.Generation);
             Assert.InRange(soughtFrame.Position.TotalSeconds, 2, 2.05);
             Assert.False(firstFrame.Bgra.Span.SequenceEqual(soughtFrame.Bgra.Span));
 
@@ -118,7 +178,7 @@ public sealed class MediaHostIntegrationTests
             await WaitUntilAsync(() => client.HostProcessId > 0 && client.HostProcessId != firstPid,
                 TimeSpan.FromSeconds(15));
 
-            Assert.Equal(71, recoveredFrame.Generation);
+            Assert.Equal(72, recoveredFrame.Generation);
             Assert.InRange(recoveredFrame.Position.TotalSeconds, 2, 2.05);
             Assert.NotEqual(firstPid, client.HostProcessId);
             await client.PingAsync();
@@ -502,14 +562,13 @@ public sealed class MediaHostIntegrationTests
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root is not null && !File.Exists(Path.Combine(root.FullName, "KadrStudio.sln"))) root = root.Parent;
         if (root is null) throw new DirectoryNotFoundException("KadrStudio solution root was not found.");
-        var candidates = new[] { "Debug", "Release" }
-            .Select(configuration => Path.Combine(
-                root.FullName, "src", "Kadr.MediaHost", "bin", configuration,
-                "net10.0-windows", "win-x64", "Kadr.MediaHost.exe"))
-            .ToArray();
-        return candidates.FirstOrDefault(File.Exists)
-               ?? throw new FileNotFoundException(
-                   "Kadr.MediaHost test binary was not found. Checked: " + string.Join(", ", candidates));
+        var configuration = System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyConfigurationAttribute>(
+            typeof(MediaHostIntegrationTests).Assembly)?.Configuration
+            ?? throw new InvalidOperationException("Test build configuration is missing.");
+        var path = Path.Combine(root.FullName, "src", "Kadr.MediaHost", "bin", configuration,
+            "net10.0-windows", "win-x64", "Kadr.MediaHost.exe");
+        return File.Exists(path) ? path : throw new FileNotFoundException(
+            "Matching Kadr.MediaHost test binary was not found.", path);
     }
 
     private static ProjectState CreatePerformanceProject(

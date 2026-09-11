@@ -43,15 +43,21 @@ if (-not (Test-Path -LiteralPath $serverExe -PathType Leaf)) {
 $listenUris = @($Listen.Split(';', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
 if ($listenUris.Count -eq 0) { throw 'At least one listen URL is required.' }
 $exposesNetwork = $false
+$usesInsecureHttp = $false
 foreach ($listenUrl in $listenUris) {
     $uri = $null
     if (-not [Uri]::TryCreate($listenUrl, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @('http', 'https')) {
         throw "Invalid listen URL: $listenUrl"
     }
+    if ($uri.Scheme -eq 'http') { $usesInsecureHttp = $true }
     if (-not (Test-IsLoopbackHost -HostName $uri.Host)) { $exposesNetwork = $true }
 }
 if ($exposesNetwork -and [string]::IsNullOrWhiteSpace($ApiKey)) {
     throw 'A non-loopback AI server must be started with -ApiKey.'
+}
+$remoteMode = $exposesNetwork -or -not [string]::IsNullOrWhiteSpace($ApiKey)
+if ($remoteMode -and $usesInsecureHttp -and $env:KADR_AI_ALLOW_INSECURE_REMOTE_HTTP -ne '1') {
+    throw 'Remote AI Server mode requires HTTPS. Set KADR_AI_ALLOW_INSECURE_REMOTE_HTTP=1 only for explicit development use.'
 }
 
 $workersRoot = Join-Path $dataRootFull 'workers'
@@ -198,6 +204,7 @@ $env:TRITON_CACHE_DIR = Join-Path $cacheRoot 'triton'
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 $env:KADR_AI_URLS = $Listen
+$env:KADR_AI_MODE = if ($remoteMode) { 'remote' } else { 'local' }
 if ([string]::IsNullOrWhiteSpace($ApiKey)) {
     Remove-Item Env:KADR_AI_API_KEY -ErrorAction SilentlyContinue
 } else {

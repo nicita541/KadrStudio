@@ -76,6 +76,15 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
             indexes.Add(clipId, indexes.Count);
             windows.Add(clipId, window);
         }
+        if (options.IncludeVideo && options.IncludeOverlays)
+            foreach (var text in plan.TextLayers.Where(text => text.RasterPath is not null))
+            {
+                arguments.Add("-loop"); arguments.Add("1");
+                arguments.Add("-framerate"); arguments.Add(FrameRateValue(plan.FrameRate));
+                arguments.Add("-t"); arguments.Add(Format(plan.Duration.TotalSeconds));
+                arguments.Add("-i"); arguments.Add(text.RasterPath!);
+                indexes.Add(text.ClipId, indexes.Count);
+            }
         return new RenderInputs(indexes, windows);
     }
 
@@ -122,6 +131,14 @@ public sealed class FfmpegRenderCommandBuilder : IRenderCommandBuilder
         {
             var layer = plan.TextLayers[index];
             var output = $"vtext{index}";
+            if (layer.RasterPath is not null)
+            {
+                filters.Add($"[{inputs.Indexes[layer.ClipId]}:v:0]format=rgba,scale={options.Width}:{options.Height}[textimage{index}]");
+                filters.Add($"[{previous}][textimage{index}]overlay=0:0:format=auto:eof_action=pass:" +
+                    $"enable='gte(t,{Format(RelativeStart(layer.TimelineRange, plan.Range))})*lt(t,{Format(RelativeEnd(layer.TimelineRange, plan.Range))})'[{output}]");
+                previous = output;
+                continue;
+            }
             var fontSize = Math.Max(4, layer.Style.FontSize * options.Height / plan.CanvasHeight);
             var box = layer.Style.IsSubtitle ? ":box=1:boxcolor=black@0.58:boxborderw=10" : string.Empty;
             var x = $"max(0,min(w-text_w,w*{Format(layer.Style.X)}-text_w/2))";

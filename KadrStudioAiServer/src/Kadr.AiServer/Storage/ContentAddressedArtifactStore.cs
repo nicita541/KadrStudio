@@ -6,11 +6,18 @@ namespace KadrStudio.AiServer.Storage;
 public sealed class ContentAddressedArtifactStore
 {
     private readonly string _root;
+    private readonly DataRootQuota _quota;
 
     public ContentAddressedArtifactStore(string dataRoot)
+        : this(dataRoot, new DataRootQuota(dataRoot, long.MaxValue))
+    {
+    }
+
+    public ContentAddressedArtifactStore(string dataRoot, DataRootQuota quota)
     {
         _root = Path.GetFullPath(Path.Combine(dataRoot, "artifacts"));
         Directory.CreateDirectory(_root);
+        _quota = quota;
     }
 
     public async Task<string> PutJsonAsync(byte[] content, CancellationToken cancellationToken)
@@ -32,25 +39,33 @@ public sealed class ContentAddressedArtifactStore
         Directory.CreateDirectory(directory);
         var normalizedExtension = NormalizeExtension(extension);
         var path = Path.Combine(directory, id + normalizedExtension);
-        if (!File.Exists(path))
-        {
-            var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try
+        return await _quota.ExecuteWriteAsync(
+            (HasVerifiedContent(path, id) ? 0 : input.Length) + 512,
+            async () =>
             {
-                await using (var output = new FileStream(
-                                 temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                                 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
-                    await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
-                File.Move(temporary, path, overwrite: true);
-            }
-            finally
-            {
-                try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
-            }
-        }
-        var artifact = new StoredArtifact(id, path, mediaType, new FileInfo(path).Length, normalizedExtension);
-        await WriteMetadataAsync(artifact, cancellationToken).ConfigureAwait(false);
-        return artifact;
+                if (!HasVerifiedContent(path, id))
+                {
+                    var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    try
+                    {
+                        await using (var output = new FileStream(
+                                         temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                                         1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                            await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                        if (!HasVerifiedContent(temporary, id))
+                            throw new InvalidDataException("Artifact staging checksum does not match its identity.");
+                        cancellationToken.ThrowIfCancellationRequested();
+                        File.Move(temporary, path, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+                    }
+                }
+                var artifact = new StoredArtifact(id, path, mediaType, new FileInfo(path).Length, normalizedExtension);
+                await WriteMetadataAsync(artifact, cancellationToken).ConfigureAwait(false);
+                return artifact;
+            }, cancellationToken).ConfigureAwait(false);
     }
 
     public StoredArtifact? Find(string id)
@@ -67,7 +82,7 @@ public sealed class ContentAddressedArtifactStore
                 if (metadata is not null)
                 {
                     var path = Path.Combine(directory, normalized + NormalizeExtension(metadata.Extension));
-                    if (File.Exists(path))
+                    if (HasVerifiedContent(path, normalized))
                         return new StoredArtifact(normalized, path, metadata.MediaType, new FileInfo(path).Length,
                             NormalizeExtension(metadata.Extension));
                 }
@@ -78,7 +93,7 @@ public sealed class ContentAddressedArtifactStore
             }
         }
         var legacy = Path.Combine(directory, normalized + ".json");
-        return File.Exists(legacy)
+        return HasVerifiedContent(legacy, normalized)
             ? new StoredArtifact(normalized, legacy, "application/json", new FileInfo(legacy).Length, ".json")
             : null;
     }
@@ -94,11 +109,16 @@ public sealed class ContentAddressedArtifactStore
         Directory.CreateDirectory(directory);
         var normalizedExtension = NormalizeExtension(extension);
         var path = Path.Combine(directory, id + normalizedExtension);
-        if (!File.Exists(path))
-            await File.WriteAllBytesAsync(path, content, cancellationToken).ConfigureAwait(false);
-        var artifact = new StoredArtifact(id, path, mediaType, content.LongLength, normalizedExtension);
-        await WriteMetadataAsync(artifact, cancellationToken).ConfigureAwait(false);
-        return artifact;
+        return await _quota.ExecuteWriteAsync(
+            (HasVerifiedContent(path, id) ? 0 : content.LongLength) + 512,
+            async () =>
+            {
+                if (!HasVerifiedContent(path, id))
+                    await PublishBytesAsync(path, content, cancellationToken).ConfigureAwait(false);
+                var artifact = new StoredArtifact(id, path, mediaType, content.LongLength, normalizedExtension);
+                await WriteMetadataAsync(artifact, cancellationToken).ConfigureAwait(false);
+                return artifact;
+            }, cancellationToken).ConfigureAwait(false);
     }
 
     private static string NormalizeExtension(string extension)
@@ -111,9 +131,36 @@ public sealed class ContentAddressedArtifactStore
     private static async Task WriteMetadataAsync(StoredArtifact artifact, CancellationToken cancellationToken)
     {
         var path = Path.Combine(Path.GetDirectoryName(artifact.Path)!, artifact.Id + ".meta.json");
-        if (File.Exists(path)) return;
         var payload = JsonSerializer.SerializeToUtf8Bytes(new ArtifactMetadata(artifact.MediaType, artifact.Extension));
-        await File.WriteAllBytesAsync(path, payload, cancellationToken).ConfigureAwait(false);
+        await PublishBytesAsync(path, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task PublishBytesAsync(string path, byte[] payload, CancellationToken cancellationToken)
+    {
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await File.WriteAllBytesAsync(temporary, payload, cancellationToken).ConfigureAwait(false);
+            var expected = Convert.ToHexStringLower(SHA256.HashData(payload));
+            if (!HasVerifiedContent(temporary, expected))
+                throw new InvalidDataException("Artifact staging checksum mismatch.");
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporary, path, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); } catch (IOException) { }
+        }
+    }
+
+    private static bool HasVerifiedContent(string path, string id)
+    {
+        try
+        {
+            using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+            return CryptographicOperations.FixedTimeEquals(SHA256.HashData(input), Convert.FromHexString(id));
+        }
+        catch (IOException) { return false; }
     }
 
     private sealed record ArtifactMetadata(string MediaType, string Extension);

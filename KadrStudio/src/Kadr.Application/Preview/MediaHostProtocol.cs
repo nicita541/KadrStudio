@@ -8,7 +8,7 @@ namespace KadrStudio.Application.Preview;
 
 public static class MediaHostProtocol
 {
-    public const int Version = 1;
+    public const int Version = 2;
     public const int MaximumHeaderBytes = 64 * 1024 * 1024;
     public const int MaximumPayloadBytes = 256 * 1024 * 1024;
     public static JsonSerializerOptions JsonOptions { get; } = CreateJsonOptions();
@@ -70,21 +70,29 @@ public sealed record MediaHostPacket(
         => new(type, correlationId, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<byte>.Empty);
 }
 
-public sealed record MediaHostHello(int ProtocolVersion, int ProcessId);
+public sealed record MediaHostHello(
+    int ProtocolVersion,
+    int ProcessId,
+    string? FrameBufferName = null,
+    int FrameSlotCapacity = 0,
+    int FrameSlotCount = 0);
 public sealed record MediaHostPrepare(RenderPlan Plan, PreviewRequest Request);
 public sealed record MediaHostUpdatePlan(
     RenderPlan Plan,
     PreviewRequest Request,
     bool RestartVideo,
     bool RestartAudio);
-public sealed record MediaHostSeek(TimelineTime Position);
+public sealed record MediaHostSeek(TimelineTime Position, PreviewGeneration? Generation = null);
 public sealed record MediaHostState(PreviewState State, TimelineTime Position);
 public sealed record MediaHostFrameHeader(
     TimelineTime Position,
     int Width,
     int Height,
     int Stride,
-    long Generation);
+    long Generation,
+    long FrameId = 0,
+    int SlotIndex = -1,
+    int ValidLength = 0);
 public sealed record MediaHostAudioMeterHeader(
     AudioMeterLevel Level,
     TimelineTime Position,

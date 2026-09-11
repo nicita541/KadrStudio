@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Security.Cryptography;
 using KadrStudio.AiServer.Configuration;
 using KadrStudio.AiServer.Inference;
 
@@ -112,6 +113,44 @@ public sealed class ModelCapabilityGateTests
         Assert.False(roughCut.IsAllowed);
     }
 
+    [Fact]
+    public async Task Production_capability_is_invalidated_when_model_payload_changes()
+    {
+        using var root = new TemporaryModelRoot();
+        const string model = AiServerOptions.DefaultVisionBackendModel;
+        root.WriteManifest(Approved(model, "VideoUnderstanding"));
+        var gate = new ModelCapabilityGate(CreateOptions(root.Path));
+
+        var before = await gate.CheckAsync(
+            model, "VideoUnderstanding", "anime-episode", true, CancellationToken.None);
+        root.ReplaceModelPayload("different-model-payload");
+        var after = await gate.CheckAsync(
+            model, "VideoUnderstanding", "anime-episode", true, CancellationToken.None);
+
+        Assert.True(before.IsAllowed, before.Error);
+        Assert.False(after.IsAllowed);
+        Assert.Contains("SHA-256", after.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Changed_metadata_is_hashed_once_and_then_uses_cached_sha()
+    {
+        using var root = new TemporaryModelRoot();
+        const string model = AiServerOptions.DefaultVisionBackendModel;
+        root.WriteManifest(Approved(model, "VideoUnderstanding"));
+        var gate = new ModelCapabilityGate(CreateOptions(root.Path));
+        root.TouchModelPayload();
+
+        var first = await gate.CheckAsync(
+            model, "VideoUnderstanding", "anime-episode", true, CancellationToken.None);
+        var second = await gate.CheckAsync(
+            model, "VideoUnderstanding", "anime-episode", true, CancellationToken.None);
+
+        Assert.True(first.IsAllowed, first.Error);
+        Assert.True(second.IsAllowed, second.Error);
+        Assert.Equal(1, gate.HashComputationCount);
+    }
+
     private static ModelCapabilityManifest Approved(string model, string role)
         => new(
             model,
@@ -140,22 +179,44 @@ public sealed class ModelCapabilityGateTests
 
     private sealed class TemporaryModelRoot : IDisposable
     {
+        private readonly string _modelPath;
+
         public TemporaryModelRoot()
         {
             Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "kadr-model-gate-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(System.IO.Path.Combine(Path, "capabilities"));
+            Directory.CreateDirectory(System.IO.Path.Combine(Path, "payload"));
+            _modelPath = System.IO.Path.Combine(Path, "payload", "model.bin");
+            File.WriteAllText(_modelPath, "approved-model-payload");
         }
 
         public string Path { get; }
 
         public void WriteManifest(ModelCapabilityManifest manifest)
         {
+            var item = new FileInfo(_modelPath);
+            var sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(_modelPath))).ToLowerInvariant();
+            manifest = manifest with
+            {
+                ModelHash = sha256,
+                VerifiedIdentity = new VerifiedModelIdentity(
+                    _modelPath, item.Length, item.LastWriteTimeUtc, sha256, manifest.MontageEvalRevision)
+            };
             var name = string.Concat(manifest.Model.Select(character =>
                 char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '_'));
             File.WriteAllText(
                 System.IO.Path.Combine(Path, "capabilities", name + ".json"),
                 JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
         }
+
+        public void ReplaceModelPayload(string payload)
+        {
+            File.WriteAllText(_modelPath, payload);
+            File.SetLastWriteTimeUtc(_modelPath, DateTime.UtcNow.AddSeconds(2));
+        }
+
+        public void TouchModelPayload()
+            => File.SetLastWriteTimeUtc(_modelPath, DateTime.UtcNow.AddSeconds(2));
 
         public void Dispose()
         {

@@ -3,6 +3,14 @@ namespace KadrStudio.Core.Tests;
 public sealed class SourceArchitectureTests
 {
     [Fact]
+    public void Application_does_not_implement_operating_system_frame_transport()
+    {
+        var application = ReadSources(Path.Combine(SourceRoot(), "Kadr.Application"));
+        Assert.DoesNotContain("MemoryMappedFile", application, StringComparison.Ordinal);
+        Assert.DoesNotContain("new Mutex(", application, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Production_source_contains_no_removed_mutable_project_or_json_undo_bridge()
     {
         var source = ReadProductionSources();
@@ -21,6 +29,10 @@ public sealed class SourceArchitectureTests
         Assert.DoesNotContain("new ProcessRunner", viewModels, StringComparison.Ordinal);
         Assert.DoesNotContain("Process.Start", viewModels, StringComparison.Ordinal);
         Assert.DoesNotContain("File.", viewModels, StringComparison.Ordinal);
+        Assert.DoesNotContain("new AiServerV2Client", viewModels, StringComparison.Ordinal);
+        Assert.DoesNotContain("new AnalysisProxyBuilder", viewModels, StringComparison.Ordinal);
+        Assert.DoesNotContain("new JsonlEditorialTelemetrySink", viewModels, StringComparison.Ordinal);
+        Assert.DoesNotContain("new FileAgentDebugLog", viewModels, StringComparison.Ordinal);
     }
 
     [Fact]

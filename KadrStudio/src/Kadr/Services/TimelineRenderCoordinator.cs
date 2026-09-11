@@ -27,12 +27,17 @@ public sealed class TimelineRenderCoordinator : IAsyncDisposable
     public RenderPlan CreatePlan(ProjectState project, TimeRange? range = null)
         => _planBuilder.Build(project, range);
 
-    public Task<string> RenderAsync(
+    public async Task<string> RenderAsync(
         RenderPlan plan,
         RenderOutputOptions options,
         IProgress<RenderProgress>? progress = null,
         CancellationToken cancellationToken = default)
-        => _engine.RenderAsync(plan, options, progress, cancellationToken);
+    {
+        if (!options.IncludeVideo || !options.IncludeOverlays || plan.TextLayers.IsDefaultOrEmpty)
+            return await _engine.RenderAsync(plan, options, progress, cancellationToken).ConfigureAwait(false);
+        using var overlays = await TextOverlayRasterizer.PrepareAsync(plan, options.Width, options.Height, cancellationToken).ConfigureAwait(false);
+        return await _engine.RenderAsync(overlays.Plan, options, progress, cancellationToken).ConfigureAwait(false);
+    }
 
     public ExternalRenderCommand CreateCommand(RenderPlan plan, RenderOutputOptions options)
         => _commandBuilder.Build(plan, options);

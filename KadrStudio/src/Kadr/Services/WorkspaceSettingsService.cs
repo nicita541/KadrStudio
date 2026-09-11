@@ -4,7 +4,8 @@ namespace KadrStudio.Services;
 
 public sealed record WorkspaceSettings(
     string ArtifactRoot,
-    long ArtifactDiskBudgetBytes)
+    long ArtifactDiskBudgetBytes,
+    Guid ArtifactCacheOwnerId = default)
 {
     public static WorkspaceSettings Default => new(
         ThumbnailService.DefaultArtifactRoot(), 8L * 1024 * 1024 * 1024);
@@ -43,11 +44,7 @@ public sealed class WorkspaceSettingsService
 
     public async Task SaveAsync(WorkspaceSettings settings, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(settings);
-        var normalized = settings with
-        {
-            ArtifactRoot = Path.GetFullPath(settings.ArtifactRoot)
-        };
+        var normalized = Normalize(settings);
         var directory = Path.GetDirectoryName(_path)!;
         Directory.CreateDirectory(directory);
         var temporary = _path + $".{Guid.NewGuid():N}.tmp";
@@ -64,6 +61,32 @@ public sealed class WorkspaceSettingsService
             try { if (File.Exists(temporary)) File.Delete(temporary); }
             catch (IOException) { }
         }
+    }
+
+    public void Save(WorkspaceSettings settings)
+    {
+        var normalized = Normalize(settings);
+        var directory = Path.GetDirectoryName(_path)!;
+        Directory.CreateDirectory(directory);
+        var temporary = _path + $".{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(
+                temporary,
+                JsonSerializer.Serialize(normalized, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(temporary, _path, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); }
+            catch (IOException) { }
+        }
+    }
+
+    private static WorkspaceSettings Normalize(WorkspaceSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        return settings with { ArtifactRoot = Path.GetFullPath(settings.ArtifactRoot) };
     }
 
 }

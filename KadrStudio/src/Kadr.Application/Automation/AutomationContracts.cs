@@ -10,7 +10,10 @@ public sealed record ProjectAutomationSnapshot(
     long BaseRevision,
     DateTimeOffset CapturedAt,
     ProjectState State,
-    string SourceFingerprint);
+    string SourceFingerprint)
+{
+    public EditorSessionStamp? SessionStamp { get; init; }
+}
 
 public sealed record AutomationProposal(
     Guid Id,
@@ -21,7 +24,11 @@ public sealed record AutomationProposal(
     string Summary,
     string Producer,
     ImmutableArray<IEditCommand> Commands,
-    bool CreateCheckpoint = true);
+    bool CreateCheckpoint = true)
+{
+    public EditorSessionStamp? SessionStamp { get; init; }
+    public ProjectState? InputState { get; init; }
+}
 
 public sealed record AutomationApplyResult(
     bool Applied,
@@ -43,14 +50,17 @@ public sealed class AutomationProposalValidator(IProjectValidator? projectValida
         var errors = new List<ValidationError>();
         if (proposal.Id == Guid.Empty) errors.Add(new("automation.id", "Proposal ID cannot be empty."));
         if (proposal.ProjectId != current.Id) errors.Add(new("automation.project", "Proposal belongs to another project."));
-        if (proposal.BaseRevision != current.Revision) errors.Add(new("automation.stale", "Project changed after automation started."));
+        if (proposal.InputState is { } input
+                ? !EditorSession.HasSameEditableState(current, input)
+                : proposal.BaseRevision != current.Revision)
+            errors.Add(new("automation.stale", "Project changed after automation started."));
         if (proposal.Commands.IsDefaultOrEmpty) errors.Add(new("automation.empty", "Proposal contains no commands."));
         if (errors.Count > 0) return new ValidationResult(errors);
 
         var candidate = current;
         try
         {
-            foreach (var command in proposal.Commands) candidate = command.Apply(candidate);
+            foreach (var command in proposal.Commands) candidate = TrackEditGuard.Apply(command, candidate);
         }
         catch (Exception exception)
         {
@@ -69,6 +79,9 @@ public sealed class AutomationProposalApplier(IAutomationProposalValidator? vali
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(proposal);
+        if (proposal.SessionStamp is { } stamp &&
+            stamp != new EditorSessionStamp(session.SessionId, session.EditVersion))
+            return new AutomationApplyResult(false, true, session.State, "Editor session changed after automation started.");
         var validation = _validator.Validate(session.State, proposal);
         if (!validation.IsValid)
         {

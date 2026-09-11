@@ -18,18 +18,28 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
     private const string ProtocolVersion = "2";
     private readonly string _workersRoot;
     private readonly string _dataRoot;
-    private readonly ConcurrentDictionary<string, WorkerRuntime> _workers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, IWorkerRuntime> _workers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _startupLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Func<string, CancellationToken, Task<IWorkerRuntime>> _startRuntime;
     private readonly SemaphoreSlim _acceleratorLease = new(1, 1);
 
     private static readonly HashSet<string> AcceleratorAnalyzers = new(StringComparer.OrdinalIgnoreCase)
     {
-        "video-understanding", "asr-align", "diarization", "embedding", "anime-upscale", "director", "critic"
+        "video-understanding", "asr-align", "diarization", "anime-upscale", "director", "critic"
     };
 
     public LoopbackGrpcWorkerGateway(AiServerOptions options)
+        : this(options, null)
+    {
+    }
+
+    internal LoopbackGrpcWorkerGateway(
+        AiServerOptions options,
+        Func<string, CancellationToken, Task<IWorkerRuntime>>? startRuntime)
     {
         _workersRoot = Path.GetFullPath(options.WorkersRoot);
         _dataRoot = Path.GetFullPath(options.DataRoot);
+        _startRuntime = startRuntime ?? StartRuntimeAsync;
     }
 
     public async Task<WorkerJobResult> ExecuteAsync(
@@ -40,11 +50,12 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
         var usesAccelerator = UsesAccelerator(job.Analyzer);
         if (usesAccelerator)
             await _acceleratorLease.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IWorkerRuntime? runtime = null;
         try
         {
             if (usesAccelerator)
                 await EvictOtherAcceleratorWorkersAsync(job.Analyzer).ConfigureAwait(false);
-            var runtime = await GetRuntimeAsync(job.Analyzer, cancellationToken).ConfigureAwait(false);
+            runtime = await GetRuntimeAsync(job.Analyzer, cancellationToken).ConfigureAwait(false);
             progress?.Report(0.05);
             var message = ProtoWriter.Create()
                 .String(1, job.Id.ToString("N"))
@@ -64,6 +75,12 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
                 reader.Strings(5).ToArray(),
                 reader.String(2),
                 reader.String(3));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (runtime is not null)
+                await RemoveRuntimeAsync(job.Analyzer, runtime).ConfigureAwait(false);
+            throw;
         }
         finally
         {
@@ -90,16 +107,32 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
         string text,
         CancellationToken cancellationToken)
     {
-        var runtime = await GetRuntimeAsync("director", cancellationToken).ConfigureAwait(false);
-        var message = ProtoWriter.Create()
-            .String(1, model)
-            .String(2, text)
-            .String(3, ProtocolVersion)
-            .ToArray();
-        var reply = await CallAsync(runtime, "CountTokens", message, cancellationToken).ConfigureAwait(false);
-        var count = new ProtoReader(reply).Int32(1);
-        if (count <= 0) throw new WorkerUnavailableException("Director worker returned an invalid tokenizer count.");
-        return count;
+        await _acceleratorLease.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IWorkerRuntime? runtime = null;
+        try
+        {
+            await EvictOtherAcceleratorWorkersAsync("director").ConfigureAwait(false);
+            runtime = await GetRuntimeAsync("director", cancellationToken).ConfigureAwait(false);
+            var message = ProtoWriter.Create()
+                .String(1, model)
+                .String(2, text)
+                .String(3, ProtocolVersion)
+                .ToArray();
+            var reply = await CallAsync(runtime, "CountTokens", message, cancellationToken).ConfigureAwait(false);
+            var count = new ProtoReader(reply).Int32(1);
+            if (count <= 0) throw new WorkerUnavailableException("Director worker returned an invalid tokenizer count.");
+            return count;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (runtime is not null)
+                await RemoveRuntimeAsync("director", runtime).ConfigureAwait(false);
+            throw;
+        }
+        finally
+        {
+            _acceleratorLease.Release();
+        }
     }
 
     public async Task ReleaseAcceleratorAsync(CancellationToken cancellationToken)
@@ -120,13 +153,39 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
         }
     }
 
-    private async Task<WorkerRuntime> GetRuntimeAsync(string analyzer, CancellationToken cancellationToken)
+    private async Task<IWorkerRuntime> GetRuntimeAsync(string analyzer, CancellationToken cancellationToken)
     {
         if (!WorkerAnalyzers.Allowed.Contains(analyzer))
             throw new WorkerUnavailableException($"Analyzer '{analyzer}' is not allowed.");
-        if (_workers.TryGetValue(analyzer, out var existing) && !existing.Process.HasExited)
+        if (_workers.TryGetValue(analyzer, out var existing) && !existing.HasExited)
             return existing;
+        var startupLock = _startupLocks.GetOrAdd(analyzer, _ => new SemaphoreSlim(1, 1));
+        await startupLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_workers.TryGetValue(analyzer, out existing) && !existing.HasExited)
+                return existing;
+            if (existing is not null)
+                await RemoveRuntimeAsync(analyzer, existing).ConfigureAwait(false);
+            var runtime = await _startRuntime(analyzer, cancellationToken).ConfigureAwait(false);
+            _workers[analyzer] = runtime;
+            return runtime;
+        }
+        finally
+        {
+            startupLock.Release();
+        }
+    }
 
+    private async Task RemoveRuntimeAsync(string analyzer, IWorkerRuntime runtime)
+    {
+        if (((ICollection<KeyValuePair<string, IWorkerRuntime>>)_workers).Remove(
+                new KeyValuePair<string, IWorkerRuntime>(analyzer, runtime)))
+            await runtime.DisposeAsync().ConfigureAwait(false);
+    }
+
+    private async Task<IWorkerRuntime> StartRuntimeAsync(string analyzer, CancellationToken cancellationToken)
+    {
         var directory = Path.GetFullPath(Path.Combine(_workersRoot, analyzer));
         if (!directory.StartsWith(_workersRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
             throw new WorkerUnavailableException("Worker path escaped the configured root.");
@@ -174,11 +233,7 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
             DefaultRequestVersion = HttpVersion.Version20,
             DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact
         };
-        var runtime = new WorkerRuntime(process, client);
-        if (_workers.TryGetValue(analyzer, out var previous))
-            await previous.DisposeAsync().ConfigureAwait(false);
-        _workers[analyzer] = runtime;
-        return runtime;
+        return new WorkerRuntime(process, client);
     }
 
     private static int GetAvailableLoopbackPort()
@@ -196,7 +251,7 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
     }
 
     private static async Task<byte[]> CallAsync(
-        WorkerRuntime runtime,
+        IWorkerRuntime runtime,
         string method,
         byte[] protobuf,
         CancellationToken cancellationToken)
@@ -205,8 +260,8 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
         for (var attempt = 1; attempt <= 20; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (runtime.Process.HasExited)
-                throw new WorkerUnavailableException($"Worker exited with code {runtime.Process.ExitCode}.");
+            if (runtime.HasExited)
+                throw new WorkerUnavailableException($"Worker exited with code {runtime.ExitCode}.");
             try
             {
                 var framed = new byte[protobuf.Length + 5];
@@ -246,6 +301,8 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
     {
         foreach (var runtime in _workers.Values) runtime.Dispose();
         _workers.Clear();
+        foreach (var startupLock in _startupLocks.Values) startupLock.Dispose();
+        _startupLocks.Clear();
         _acceleratorLease.Dispose();
     }
 
@@ -254,13 +311,17 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
         foreach (var runtime in _workers.Values)
             await runtime.DisposeAsync().ConfigureAwait(false);
         _workers.Clear();
+        foreach (var startupLock in _startupLocks.Values) startupLock.Dispose();
+        _startupLocks.Clear();
         _acceleratorLease.Dispose();
     }
 
-    private sealed class WorkerRuntime(Process process, HttpClient client) : IDisposable, IAsyncDisposable
+    private sealed class WorkerRuntime(Process process, HttpClient client) : IWorkerRuntime
     {
         public Process Process { get; } = process;
         public HttpClient Client { get; } = client;
+        public bool HasExited => Process.HasExited;
+        public int ExitCode => Process.HasExited ? Process.ExitCode : 0;
 
         public void Dispose()
         {
@@ -312,6 +373,13 @@ public sealed class LoopbackGrpcWorkerGateway : IWorkerGateway, IDisposable, IAs
             }
         }
     }
+}
+
+internal interface IWorkerRuntime : IDisposable, IAsyncDisposable
+{
+    bool HasExited { get; }
+    int ExitCode { get; }
+    HttpClient Client { get; }
 }
 
 public sealed class WorkerUnavailableException(string message, Exception? inner = null)

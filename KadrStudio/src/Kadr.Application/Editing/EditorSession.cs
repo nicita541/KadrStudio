@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using KadrStudio.Application.Automation.Agent.Recovery;
 using KadrStudio.Core.Domain;
 using KadrStudio.Core.Validation;
 
@@ -20,6 +21,9 @@ public sealed class EditorSession : IEditorSession
     }
 
     public ProjectState State => _state;
+    public Guid SessionId { get; } = Guid.NewGuid();
+    public long StateVersion { get; private set; }
+    public long EditVersion { get; private set; }
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
     public event EventHandler<ProjectStateChangedEventArgs>? StateChanged;
@@ -35,7 +39,7 @@ public sealed class EditorSession : IEditorSession
         try
         {
             foreach (var command in transaction.Commands)
-                candidate = command.Apply(candidate);
+                candidate = TrackEditGuard.Apply(command, candidate);
         }
         catch (EditRejectedException)
         {
@@ -61,6 +65,7 @@ public sealed class EditorSession : IEditorSession
         EnsureValid(candidate);
         var changes = ProjectChangeSet.Between(before, candidate);
 
+        AdvanceVersions(before, candidate);
         _state = candidate;
         if (transaction.RecordInHistory)
         {
@@ -78,7 +83,8 @@ public sealed class EditorSession : IEditorSession
         var entry = _undo.Last.Value;
         _undo.RemoveLast();
         var previous = _state;
-        _state = entry.Before;
+        _state = entry.Before with { AiConversation = AgentTaskReferences.Reconcile(previous.AiConversation, entry.Before) };
+        AdvanceVersions(previous, _state, forceEdit: true);
         _redo.Push(entry);
         StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
             previous, _state, $"Отмена: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
@@ -90,7 +96,8 @@ public sealed class EditorSession : IEditorSession
         if (_redo.Count == 0) return false;
         var entry = _redo.Pop();
         var previous = _state;
-        _state = entry.After;
+        _state = entry.After with { AiConversation = AgentTaskReferences.Reconcile(previous.AiConversation, entry.After) };
+        AdvanceVersions(previous, _state, forceEdit: true);
         _undo.AddLast(entry);
         StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
             previous, _state, $"Повтор: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
@@ -103,7 +110,8 @@ public sealed class EditorSession : IEditorSession
         var entry = _undo.Last.Value;
         _undo.RemoveLast();
         var previous = _state;
-        _state = entry.Before;
+        _state = entry.Before with { AiConversation = AgentTaskReferences.Reconcile(previous.AiConversation, entry.Before) };
+        AdvanceVersions(previous, _state, forceEdit: true);
         _redo.Clear();
         StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
             previous, _state, $"Rollback: {entry.Description}", true, ProjectChangeSet.Between(previous, _state)));
@@ -115,6 +123,7 @@ public sealed class EditorSession : IEditorSession
         EnsureValid(state);
         var previous = _state;
         _state = state;
+        AdvanceVersions(previous, state, forceEdit: true);
         if (clearHistory)
         {
             _undo.Clear();
@@ -122,6 +131,21 @@ public sealed class EditorSession : IEditorSession
         }
         StateChanged?.Invoke(this, new ProjectStateChangedEventArgs(
             previous, state, reason, false, ProjectChangeSet.Between(previous, state)));
+    }
+
+    public static bool HasSameEditableState(ProjectState current, ProjectState captured)
+        => current with
+        {
+            AiConversation = captured.AiConversation,
+            Revision = captured.Revision,
+            UpdatedAt = captured.UpdatedAt
+        } == captured;
+
+    private void AdvanceVersions(ProjectState previous, ProjectState current, bool forceEdit = false)
+    {
+        StateVersion = checked(StateVersion + 1);
+        if (forceEdit || !HasSameEditableState(current, previous))
+            EditVersion = checked(EditVersion + 1);
     }
 
     private void EnsureValid(ProjectState state)

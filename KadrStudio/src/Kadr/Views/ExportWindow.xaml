@@ -37,6 +37,8 @@
                     <ComboBoxItem Content="480p" Tag="P480" />
                     <ComboBoxItem Content="720p HD" Tag="P720" />
                     <ComboBoxItem Content="1080p Full HD" Tag="P1080" />
+                    <ComboBoxItem Content="1440p QHD" Tag="P1440" />
+                    <ComboBoxItem Content="2160p 4K UHD" Tag="P2160" />
                 </ComboBox>
             </StackPanel>
             <StackPanel Grid.Column="1" Margin="9,0,0,0">

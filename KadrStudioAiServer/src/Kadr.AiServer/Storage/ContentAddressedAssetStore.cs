@@ -14,12 +14,19 @@ public sealed class ContentAddressedAssetStore
 {
     private readonly string _root;
     private readonly long _maximumBytes;
+    private readonly DataRootQuota _quota;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.Ordinal);
 
     public ContentAddressedAssetStore(string dataRoot, long maximumBytes)
+        : this(dataRoot, maximumBytes, new DataRootQuota(dataRoot, long.MaxValue))
+    {
+    }
+
+    public ContentAddressedAssetStore(string dataRoot, long maximumBytes, DataRootQuota quota)
     {
         _root = Path.GetFullPath(Path.Combine(dataRoot, "assets"));
         _maximumBytes = maximumBytes;
+        _quota = quota;
         Directory.CreateDirectory(_root);
     }
 
@@ -56,31 +63,36 @@ public sealed class ContentAddressedAssetStore
             var current = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
             if (current != offset)
                 throw new AssetUploadException("asset_offset_mismatch", $"Server expects offset {current}, not {offset}.");
-            await using (var output = new FileStream(
-                             partialPath, FileMode.Append, FileAccess.Write, FileShare.None,
-                             128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
-            {
-                await content.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
-                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-            }
-            current = new FileInfo(partialPath).Length;
-            if (current > totalBytes)
-            {
-                File.Delete(partialPath);
-                throw new AssetUploadException("asset_too_large", "Uploaded bytes exceed the declared asset length.");
-            }
-            if (current < totalBytes)
-                return new StoredAsset(id, partialPath, current, NormalizeMediaType(mediaType), false);
+            return await _quota.ExecuteWriteAsync(
+                checked(totalBytes - current + 512),
+                async () =>
+                {
+                    await using (var output = new FileStream(
+                                     partialPath, FileMode.Append, FileAccess.Write, FileShare.None,
+                                     128 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+                    {
+                        await content.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    current = new FileInfo(partialPath).Length;
+                    if (current > totalBytes)
+                    {
+                        File.Delete(partialPath);
+                        throw new AssetUploadException("asset_too_large", "Uploaded bytes exceed the declared asset length.");
+                    }
+                    if (current < totalBytes)
+                        return new StoredAsset(id, partialPath, current, NormalizeMediaType(mediaType), false);
 
-            var actual = await ComputeHashAsync(partialPath, cancellationToken).ConfigureAwait(false);
-            if (!actual.Equals(id, StringComparison.Ordinal))
-            {
-                File.Delete(partialPath);
-                throw new AssetUploadException("asset_hash_mismatch", "Completed upload does not match its SHA-256 id.");
-            }
-            File.Move(partialPath, finalPath);
-            await File.WriteAllTextAsync(metadataPath, NormalizeMediaType(mediaType), cancellationToken).ConfigureAwait(false);
-            return new StoredAsset(id, finalPath, current, NormalizeMediaType(mediaType), true);
+                    var actual = await ComputeHashAsync(partialPath, cancellationToken).ConfigureAwait(false);
+                    if (!actual.Equals(id, StringComparison.Ordinal))
+                    {
+                        File.Delete(partialPath);
+                        throw new AssetUploadException("asset_hash_mismatch", "Completed upload does not match its SHA-256 id.");
+                    }
+                    File.Move(partialPath, finalPath);
+                    await File.WriteAllTextAsync(metadataPath, NormalizeMediaType(mediaType), cancellationToken).ConfigureAwait(false);
+                    return new StoredAsset(id, finalPath, current, NormalizeMediaType(mediaType), true);
+                }, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -114,6 +126,24 @@ public sealed class ContentAddressedAssetStore
                 id, partialPath, new FileInfo(partialPath).Length,
                 "application/octet-stream", false)
             : null;
+    }
+
+    public int CleanupAbandonedUploads(TimeSpan ttl)
+    {
+        var cutoff = DateTime.UtcNow - ttl;
+        var removed = 0;
+        foreach (var path in Directory.EnumerateFiles(_root, "*.upload", SearchOption.AllDirectories))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(path) > cutoff) continue;
+                File.Delete(path);
+                removed++;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return removed;
     }
 
     private static string NormalizeHash(string value)

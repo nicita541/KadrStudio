@@ -15,6 +15,13 @@ public partial class App : System.Windows.Application
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         base.OnStartup(e);
 
+        if (e.Args.FirstOrDefault()?.Equals("--migrate-data-from", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _ = RunDataMigrationAsync(e.Args);
+            return;
+        }
+
         if (e.Args.Contains("--launch-smoke", StringComparer.OrdinalIgnoreCase))
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
@@ -35,6 +42,23 @@ public partial class App : System.Windows.Application
         var startWindow = new StartWindow();
         MainWindow = startWindow;
         startWindow.Show();
+    }
+
+    private async Task RunDataMigrationAsync(string[] args)
+    {
+        try
+        {
+            if (args.Length != 2) throw new ArgumentException("Usage: KadrStudio.exe --migrate-data-from <old data directory>");
+            await Task.Run(() => LocalDataMigration.CopyAsync(args[1], KadrLocalDataPaths.Root));
+            MessageBox.Show("Данные скопированы и проверены. Исходная папка сохранена. Запустите KadrStudio снова.",
+                "Миграция данных", MessageBoxButton.OK, MessageBoxImage.Information);
+            Shutdown(0);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(error.Message, "Миграция не выполнена", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown(1);
+        }
     }
 
     private async Task RunLaunchSmokeAsync()

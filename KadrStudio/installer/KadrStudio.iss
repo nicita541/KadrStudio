@@ -25,7 +25,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Files]
-Source: "..\release\KadrStudio-win-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\release\KadrStudio-win-x64\*"; DestDir: "{app}"; Excludes: "KadrStudio.portable,LocalData\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\Kadr Studio"; Filename: "{app}\{#MyAppExeName}"
@@ -36,4 +36,3 @@ Name: "desktopicon"; Description: "Создать ярлык на рабочем
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Запустить Kadr Studio"; Flags: nowait postinstall skipifsilent
-

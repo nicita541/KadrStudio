@@ -16,17 +16,9 @@ public sealed class KadrApiAuthorizationMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (string.Equals(
-                context.Request.Path.Value,
-                "/health/live",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            await _next(context).ConfigureAwait(false);
-            return;
-        }
-
         var remoteAddress = context.Connection.RemoteIpAddress;
-        if (remoteAddress is not null && IPAddress.IsLoopback(remoteAddress))
+        if (_options.AccessMode == AiServerAccessMode.Local &&
+            remoteAddress is not null && IPAddress.IsLoopback(remoteAddress))
         {
             await _next(context).ConfigureAwait(false);
             return;

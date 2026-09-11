@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using KadrStudio.Application.Automation.Editorial;
 using KadrStudio.Core.Domain;
 
@@ -19,21 +20,8 @@ public sealed class AnalysisProxyBundle(string directory, IReadOnlyList<Analysis
     public string Directory { get; } = directory;
     public IReadOnlyList<AnalysisProxyFile> Files { get; } = files;
 
-    public ValueTask DisposeAsync()
-    {
-        try
-        {
-            var root = Path.GetFullPath(KadrLocalDataPaths.TempRoot) + Path.DirectorySeparatorChar;
-            var target = Path.GetFullPath(Directory);
-            if (target.StartsWith(root, StringComparison.OrdinalIgnoreCase) && System.IO.Directory.Exists(target))
-                System.IO.Directory.Delete(target, recursive: true);
-        }
-        catch
-        {
-            // Disposable analysis proxies are recoverable and can be cleaned on next startup.
-        }
-        return ValueTask.CompletedTask;
-    }
+    // Published cache entries outlive consumers. Only the builder owns its staging files.
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 public sealed class AnalysisProxyBuilder(
@@ -41,7 +29,7 @@ public sealed class AnalysisProxyBuilder(
     ProcessRunner processes,
     IEditorialTelemetrySink? telemetry = null)
 {
-    private const string ProxyFormatVersion = "analysis-proxy-v2-1280x720-x264-crf24-flac16k";
+    private const string ProxyFormatVersion = "analysis-proxy-v3-1280x720-x264-crf24-flac16k-sha256";
     private readonly IEditorialTelemetrySink _telemetry = telemetry ?? NullEditorialTelemetrySink.Instance;
 
     public async Task<AnalysisProxyBundle> BuildAsync(
@@ -54,7 +42,7 @@ public sealed class AnalysisProxyBuilder(
         ffmpeg.EnsureAvailable();
         var cacheDirectory = Path.Combine(
             KadrLocalDataPaths.CacheRoot, "analysis-v2", BuildCacheKey(source));
-        var cached = TryOpenCache(source, cacheDirectory);
+        var cached = await FindCacheAsync(source, cacheDirectory, cancellationToken).ConfigureAwait(false);
         if (cached is not null)
         {
             Record("proxy_cache_hit", 1);
@@ -65,13 +53,16 @@ public sealed class AnalysisProxyBuilder(
         Record("proxy_cache_miss", 1);
         var directory = Path.Combine(
             KadrLocalDataPaths.TempRoot, "analysis-v2", Guid.NewGuid().ToString("N"));
+        EnsureNoReparsePoints(directory);
         System.IO.Directory.CreateDirectory(directory);
         var files = new List<AnalysisProxyFile>();
+        var stagingFiles = new List<string>();
         try
         {
             if (source.Kind is MediaKind.Video or MediaKind.Image)
             {
                 var visualPath = Path.Combine(directory, source.Kind == MediaKind.Image ? "visual.jpg" : "visual.mp4");
+                stagingFiles.Add(visualPath);
                 var arguments = source.Kind == MediaKind.Image
                     ? new[]
                     {
@@ -115,6 +106,7 @@ public sealed class AnalysisProxyBuilder(
                         var durationSeconds = Math.Min(chunkSeconds, source.Duration.TotalSeconds - startSeconds);
                         if (durationSeconds <= 0) break;
                         var audioPath = Path.Combine(directory, $"audio-s{stream.StreamIndex:D3}-{order:D4}.flac");
+                        stagingFiles.Add(audioPath);
                         await RunFfmpegAsync(
                         [
                             "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
@@ -132,18 +124,28 @@ public sealed class AnalysisProxyBuilder(
             }
             if (files.Count == 0)
                 throw new InvalidOperationException($"No safe analysis proxy could be created for '{source.Name}'.");
+            var checksums = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var file in files)
+            {
+                await using var input = File.OpenRead(file.Path);
+                checksums.Add(Path.GetFileName(file.Path), Convert.ToHexString(
+                    await SHA256.HashDataAsync(input, cancellationToken).ConfigureAwait(false)));
+            }
+            stagingFiles.Add(Path.Combine(directory, "checksums.json"));
+            stagingFiles.Add(Path.Combine(directory, ".complete"));
+            await File.WriteAllTextAsync(Path.Combine(directory, "checksums.json"),
+                JsonSerializer.Serialize(checksums), cancellationToken).ConfigureAwait(false);
             await File.WriteAllTextAsync(
                 Path.Combine(directory, ".complete"), ProxyFormatVersion, cancellationToken).ConfigureAwait(false);
             System.IO.Directory.CreateDirectory(Path.GetDirectoryName(cacheDirectory)!);
-            try
-            {
-                System.IO.Directory.Move(directory, cacheDirectory);
-            }
-            catch (IOException) when (System.IO.Directory.Exists(cacheDirectory))
-            {
-                await new AnalysisProxyBundle(directory, files).DisposeAsync();
-            }
-            var result = TryOpenCache(source, cacheDirectory)
+            // Immutable generations avoid replacing an entry held by another analysis and
+            // never delete unknown contents of an invalid/legacy cache directory.
+            cacheDirectory += "-" + Guid.NewGuid().ToString("N");
+            EnsureNoReparsePoints(directory);
+            EnsureNoReparsePoints(Path.GetDirectoryName(cacheDirectory)!);
+            cancellationToken.ThrowIfCancellationRequested();
+            System.IO.Directory.Move(directory, cacheDirectory);
+            var result = await TryOpenCacheAsync(source, cacheDirectory, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidDataException("Completed analysis proxy cache could not be reopened.");
             Record("proxy_preparation_duration_ms", Stopwatch.GetElapsedTime(totalStarted).TotalMilliseconds,
                 ("cache", "miss"));
@@ -151,8 +153,27 @@ public sealed class AnalysisProxyBuilder(
         }
         catch
         {
-            await new AnalysisProxyBundle(directory, files).DisposeAsync();
+            CleanupStaging(directory, stagingFiles);
             throw;
+        }
+    }
+
+    private static void CleanupStaging(string directory, IEnumerable<string> files)
+    {
+        try
+        {
+            EnsureNoReparsePoints(directory);
+            foreach (var file in files)
+            {
+                EnsureNoReparsePoints(file);
+                File.Delete(file);
+            }
+            // Unknown contents prevent removal; never recursively delete a staging tree.
+            if (System.IO.Directory.Exists(directory)) System.IO.Directory.Delete(directory, recursive: false);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Trace.TraceWarning("Analysis staging cleanup incomplete: {0}", error.GetType().Name);
         }
     }
 
@@ -175,11 +196,50 @@ public sealed class AnalysisProxyBuilder(
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
     }
 
-    private static AnalysisProxyBundle? TryOpenCache(MediaSource source, string directory)
+    private static async Task<AnalysisProxyBundle?> FindCacheAsync(
+        MediaSource source, string keyPath, CancellationToken cancellationToken)
+    {
+        var parent = Path.GetDirectoryName(keyPath)!;
+        if (!System.IO.Directory.Exists(parent)) return null;
+        EnsureNoReparsePoints(parent);
+        foreach (var candidate in System.IO.Directory.EnumerateDirectories(parent, Path.GetFileName(keyPath) + "-*"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var suffix = Path.GetFileName(candidate)[(Path.GetFileName(keyPath).Length + 1)..];
+            if (!Guid.TryParseExact(suffix, "N", out _)) continue;
+            var result = await TryOpenCacheAsync(source, candidate, cancellationToken).ConfigureAwait(false);
+            if (result is not null) return result;
+        }
+        return null;
+    }
+
+    private static async Task<AnalysisProxyBundle?> TryOpenCacheAsync(
+        MediaSource source, string directory, CancellationToken cancellationToken)
+    {
+        try
+        {
+            EnsureNoReparsePoints(directory);
+            return await ReadCacheAsync(source, directory, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static async Task<AnalysisProxyBundle?> ReadCacheAsync(
+        MediaSource source, string directory, CancellationToken cancellationToken)
     {
         var marker = Path.Combine(directory, ".complete");
-        if (!File.Exists(marker) ||
+        EnsureNoReparsePoints(marker);
+        if (!File.Exists(marker) || new FileInfo(marker).Length > 256 ||
             !string.Equals(File.ReadAllText(marker), ProxyFormatVersion, StringComparison.Ordinal)) return null;
+        var manifestPath = Path.Combine(directory, "checksums.json");
+        EnsureNoReparsePoints(manifestPath);
+        if (!File.Exists(manifestPath) || new FileInfo(manifestPath).Length > 1024 * 1024) return null;
+        var checksums = JsonSerializer.Deserialize<Dictionary<string, string>>(
+            await File.ReadAllTextAsync(manifestPath, cancellationToken).ConfigureAwait(false));
+        if (checksums is null) return null;
         var files = new List<AnalysisProxyFile>();
         if (source.Kind is MediaKind.Video or MediaKind.Image)
         {
@@ -208,7 +268,24 @@ public sealed class AnalysisProxyBuilder(
                 }
             }
         }
-        return files.Count == 0 ? null : new AnalysisProxyBundle(directory, files);
+        if (files.Count == 0 || checksums.Count != files.Count) return null;
+        foreach (var file in files)
+        {
+            EnsureNoReparsePoints(file.Path);
+            if (!checksums.TryGetValue(Path.GetFileName(file.Path), out var expected)) return null;
+            await using var input = File.OpenRead(file.Path);
+            var actual = Convert.ToHexString(await SHA256.HashDataAsync(input, cancellationToken).ConfigureAwait(false));
+            if (!string.Equals(actual, expected, StringComparison.Ordinal)) return null;
+        }
+        return new AnalysisProxyBundle(directory, files);
+    }
+
+    private static void EnsureNoReparsePoints(string path)
+    {
+        for (var current = Path.GetFullPath(path); current is not null; current = Path.GetDirectoryName(current))
+            if ((File.Exists(current) || System.IO.Directory.Exists(current)) &&
+                (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Analysis cache cannot traverse a reparse point.");
     }
 
     private async Task RunFfmpegAsync(

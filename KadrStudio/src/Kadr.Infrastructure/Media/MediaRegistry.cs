@@ -40,7 +40,6 @@ public sealed class MediaRegistry(IMediaProbe probe) : IMediaRegistry
         if (Math.Abs(source.Duration.Ticks - candidate.Duration.Ticks) > tolerance)
             return RelinkCompatibility.DurationMismatch;
         if (!string.IsNullOrWhiteSpace(source.VerifiedFingerprint) &&
-            !string.IsNullOrWhiteSpace(candidate.Fingerprint.VerifiedHash) &&
             !source.VerifiedFingerprint.Equals(candidate.Fingerprint.VerifiedHash, StringComparison.OrdinalIgnoreCase))
             return RelinkCompatibility.FingerprintMismatch;
         return RelinkCompatibility.Compatible;
@@ -97,7 +96,8 @@ public sealed class MediaRegistry(IMediaProbe probe) : IMediaRegistry
         if (!File.Exists(candidatePath))
             return new RelinkCandidate(source.Id, Path.GetFullPath(candidatePath),
                 RelinkCompatibility.MissingCandidate, null, "Candidate file does not exist.");
-        var candidate = await probe.ProbeAsync(candidatePath, requireVerifiedFingerprint, cancellationToken).ConfigureAwait(false);
+        var candidate = await probe.ProbeAsync(candidatePath,
+            requireVerifiedFingerprint || !string.IsNullOrWhiteSpace(source.VerifiedFingerprint), cancellationToken).ConfigureAwait(false);
         var compatibility = CheckCompatibility(source, candidate);
         return new RelinkCandidate(source.Id, candidate.Path, compatibility, candidate,
             compatibility == RelinkCompatibility.Compatible ? "Compatible media." : $"Relink rejected: {compatibility}.");

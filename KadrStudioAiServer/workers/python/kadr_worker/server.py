@@ -4,12 +4,20 @@ import argparse
 import json
 import os
 import signal
+import threading
 from concurrent import futures
 from pathlib import Path
 
 import grpc
 
-from .analyzers import CapabilityUnavailable, _shutdown_llama, count_tokens, resolve_assets, run_analyzer
+from .analyzers import (
+    CapabilityUnavailable,
+    JobCancelled,
+    _shutdown_llama,
+    count_tokens,
+    resolve_assets,
+    run_analyzer,
+)
 from .proto_wire import binary, field_bytes, field_int, field_text, parse_fields, text, texts
 
 
@@ -24,6 +32,12 @@ class WorkerService:
         self.data_root = data_root.resolve()
 
     def run_job(self, request: bytes, context: grpc.ServicerContext) -> bytes:
+        cancelled = threading.Event()
+        context.add_callback(cancelled.set)
+
+        def cancellation_requested() -> bool:
+            return cancelled.is_set() or not context.is_active()
+
         try:
             fields = parse_fields(request)
             analyzer = text(fields, 2)
@@ -33,9 +47,13 @@ class WorkerService:
                 raise ValueError("worker protocol mismatch")
             parameters = json.loads(binary(fields, 5) or b"{}")
             assets = resolve_assets(self.data_root, texts(fields, 4), parameters)
-            result = run_analyzer(analyzer, assets, parameters, self.data_root)
+            result = run_analyzer(
+                analyzer, assets, parameters, self.data_root,
+                cancel=cancellation_requested)
             payload = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             return field_int(1, 1) + field_bytes(4, payload)
+        except JobCancelled:
+            return field_int(1, 0) + field_text(2, "cancelled") + field_text(3, "job cancelled")
         except CapabilityUnavailable as exception:
             return field_int(1, 0) + field_text(2, "capability_unavailable") + field_text(3, str(exception))
         except Exception as exception:  # process survives one damaged job

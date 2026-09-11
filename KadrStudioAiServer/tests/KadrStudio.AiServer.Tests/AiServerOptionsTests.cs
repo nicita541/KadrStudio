@@ -41,11 +41,54 @@ public sealed class AiServerOptionsTests
     [InlineData("video-understanding", true)]
     [InlineData("director", true)]
     [InlineData("critic", true)]
-    [InlineData("embedding", true)]
+    [InlineData("embedding", false)]
     [InlineData("anime-upscale", true)]
     [InlineData("audio-events", false)]
     public void Worker_accelerator_policy_matches_model_residency(string analyzer, bool expected)
     {
         Assert.Equal(expected, LoopbackGrpcWorkerGateway.UsesAccelerator(analyzer));
+    }
+
+    [Fact]
+    public void Remote_http_is_rejected_without_explicit_development_override()
+    {
+        var options = new AiServerOptions
+        {
+            AccessMode = AiServerAccessMode.Remote,
+            ApiKey = "secret",
+            ListenUrls = "http://0.0.0.0:5080"
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => options.ValidateForStartup());
+
+        Assert.Contains("HTTPS", exception.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Explicit_development_override_allows_remote_http()
+    {
+        var options = new AiServerOptions
+        {
+            AccessMode = AiServerAccessMode.Remote,
+            ApiKey = "secret",
+            ListenUrls = "http://127.0.0.1:5080",
+            AllowInsecureRemoteHttp = true
+        };
+
+        options.ValidateForStartup();
+    }
+
+    [Fact]
+    public void Remote_mode_requires_an_api_key_at_startup()
+    {
+        var options = new AiServerOptions
+        {
+            AccessMode = AiServerAccessMode.Remote,
+            ListenUrls = "https://0.0.0.0:5080"
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => options.ValidateForStartup());
+
+        Assert.Contains("API key", exception.Message, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -36,8 +36,8 @@ public sealed class TimelineMediaCacheService : IAsyncDisposable
         _locator = locator;
         _processRunner = processRunner;
         _ownsArtifacts = artifacts is null;
-        _artifacts = artifacts ?? new DiskMediaArtifactCache(
-            cacheRoot ?? ThumbnailService.DefaultArtifactRoot());
+        _artifacts = artifacts ?? ArtifactStoreFactory.Create(new ArtifactStoreOptions(
+            cacheRoot ?? ThumbnailService.DefaultArtifactRoot()));
     }
 
     public async Task<TimelineMediaArtifacts> PrepareAsync(

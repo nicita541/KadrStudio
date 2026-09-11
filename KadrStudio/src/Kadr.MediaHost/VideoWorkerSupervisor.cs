@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using KadrStudio.Application.Preview;
@@ -14,10 +15,11 @@ namespace KadrStudio.MediaHost;
 /// </summary>
 public sealed class VideoWorkerSupervisor(
     string ffmpegPath,
-    Action<Exception>? reportFailure = null) : IAsyncDisposable
+    Action<Exception>? reportFailure = null,
+    IRenderCommandBuilder? commands = null) : IAsyncDisposable
 {
     private readonly string _ffmpegPath = Path.GetFullPath(ffmpegPath);
-    private readonly FfmpegRenderCommandBuilder _commands = new();
+    private readonly IRenderCommandBuilder _commands = commands ?? new FfmpegRenderCommandBuilder();
     private readonly Dictionary<Guid, VideoLayerWorker> _workers = [];
     private bool _disposed;
 
@@ -27,7 +29,8 @@ public sealed class VideoWorkerSupervisor(
     public long FrameSizeBytes { get; private set; }
     public long FramesProduced { get; private set; }
     public long FramesDecoded { get; private set; }
-    public long AllocatedBytes { get; private set; }
+    private readonly long _allocationStart = GC.GetTotalAllocatedBytes(false);
+    public long AllocatedBytes => Math.Max(0, GC.GetTotalAllocatedBytes(false) - _allocationStart);
     public long CopiedBytes { get; private set; }
     public TimeSpan DecoderReadTime { get; private set; }
     public string Decoder { get; private set; } = "ffmpeg-cuda";
@@ -52,12 +55,18 @@ public sealed class VideoWorkerSupervisor(
             cancellationToken.ThrowIfCancellationRequested();
             var position = start + TimelineTime.FromFrames(frameIndex++, request.FrameRate);
             if (position >= plan.Range.End) break;
-            var pixels = await ComposeAsync(plan, request, position, cancellationToken).ConfigureAwait(false);
+            var composed = await ComposeAsync(plan, request, position, cancellationToken).ConfigureAwait(false);
             FramesProduced++;
-            FrameSizeBytes = pixels.LongLength;
-            await present(new VideoFrame(
+            FrameSizeBytes = composed.Length;
+            var frame = new VideoFrame(
                 position, request.Width, request.Height, request.Width * 4,
-                pixels, request.Generation.Video)).ConfigureAwait(false);
+                composed.Pixels.AsMemory(0, composed.Length), request.Generation.Video, composed.Owner);
+            try { await present(frame).ConfigureAwait(false); }
+            catch
+            {
+                composed.Owner.Dispose();
+                throw;
+            }
             if (!continuous) break;
         } while (true);
     }
@@ -71,7 +80,7 @@ public sealed class VideoWorkerSupervisor(
         foreach (var worker in workers) await worker.DisposeAsync().ConfigureAwait(false);
     }
 
-    private async Task<byte[]> ComposeAsync(
+    private async Task<ComposedFrame> ComposeAsync(
         RenderPlan plan,
         PreviewRequest request,
         TimelineTime position,
@@ -97,7 +106,7 @@ public sealed class VideoWorkerSupervisor(
                     plan, request, active[0], position, cancellationToken, opaqueOutput: true).ConfigureAwait(false);
                 var decoded = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
                 RecordDecodedFrame(worker, decoded);
-                return decoded.Pixels;
+                return new ComposedFrame(decoded.Pixels, decoded.Length, decoded.Owner);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -110,41 +119,45 @@ public sealed class VideoWorkerSupervisor(
         var frameSize = checked(request.Width * request.Height * 4);
         var whiteBackground = plan.VideoTransitions.Any(item =>
             item.Kind == TransitionKind.DipToWhite && item.TimelineRange.Contains(position));
-        var destination = GC.AllocateUninitializedArray<byte>(frameSize);
-        AllocatedBytes += frameSize;
-        FillBackground(destination, whiteBackground ? (byte)255 : (byte)0);
+        var destination = ArrayPool<byte>.Shared.Rent(frameSize);
+        var destinationOwner = new PooledBufferOwner(destination);
+        FillBackground(destination.AsSpan(0, frameSize), whiteBackground ? (byte)255 : (byte)0);
 
-        foreach (var layer in active)
+        try
         {
-            byte[]? source = null;
-            try
+            foreach (var layer in active)
             {
-                var worker = await GetOrCreateAsync(plan, request, layer, position, cancellationToken)
-                    .ConfigureAwait(false);
-                var decoded = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
-                source = decoded.Pixels;
-                RecordDecodedFrame(worker, decoded);
+                DecodedFrame? decoded = null;
+                try
+                {
+                    var worker = await GetOrCreateAsync(plan, request, layer, position, cancellationToken)
+                        .ConfigureAwait(false);
+                    decoded = await worker.ReadFrameAsync(cancellationToken).ConfigureAwait(false);
+                    RecordDecodedFrame(worker, decoded);
+                    AlphaComposite(destination.AsSpan(0, frameSize), decoded.Pixels.AsSpan(0, decoded.Length));
+                    CopiedBytes += decoded.Length;
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    reportFailure?.Invoke(new VideoWorkerException(layer.ClipId, exception));
+                    if (_workers.Remove(layer.ClipId, out var failed))
+                        await failed.DisposeAsync().ConfigureAwait(false);
+                }
+                finally { decoded?.Owner.Dispose(); }
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-                reportFailure?.Invoke(new VideoWorkerException(layer.ClipId, exception));
-                if (_workers.Remove(layer.ClipId, out var failed))
-                    await failed.DisposeAsync().ConfigureAwait(false);
-            }
-            if (source is not null)
-            {
-                AlphaComposite(destination, source);
-                CopiedBytes += source.LongLength;
-            }
+            return new ComposedFrame(destination, frameSize, destinationOwner);
         }
-        return destination;
+        catch
+        {
+            destinationOwner.Dispose();
+            throw;
+        }
     }
 
     private void RecordDecodedFrame(VideoLayerWorker worker, DecodedFrame decoded)
     {
         FramesDecoded++;
-        AllocatedBytes += decoded.Pixels.LongLength;
-        CopiedBytes += decoded.Pixels.LongLength;
+        CopiedBytes += decoded.Length;
         DecoderReadTime += decoded.ReadTime;
         if (!worker.FellBackToSoftware) return;
         Decoder = "ffmpeg-software";
@@ -285,7 +298,7 @@ public sealed class VideoWorkerSupervisor(
 
         public static Task<VideoLayerWorker> StartAsync(
             string ffmpegPath,
-            FfmpegRenderCommandBuilder commands,
+            IRenderCommandBuilder commands,
             RenderPlan plan,
             PreviewRequest request,
             bool opaqueOutput,
@@ -336,22 +349,28 @@ public sealed class VideoWorkerSupervisor(
 
         private async Task<DecodedFrame> ReadFrameCoreAsync(CancellationToken cancellationToken)
         {
-            var bytes = GC.AllocateUninitializedArray<byte>(_frameSize);
+            var bytes = ArrayPool<byte>.Shared.Rent(_frameSize);
+            var owner = new PooledBufferOwner(bytes);
             var offset = 0;
             var started = Stopwatch.GetTimestamp();
-            while (offset < bytes.Length)
+            try
             {
-                var read = await _process.StandardOutput.BaseStream
-                    .ReadAsync(bytes.AsMemory(offset), cancellationToken).ConfigureAwait(false);
-                if (read == 0)
+                while (offset < _frameSize)
                 {
-                    var errors = await _errorOutput.ConfigureAwait(false);
-                    throw new EndOfStreamException(
-                        string.IsNullOrWhiteSpace(errors) ? "Visual source decoder ended early." : errors);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var read = await _process.StandardOutput.BaseStream.ReadAsync(
+                        bytes.AsMemory(offset, _frameSize - offset), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                        throw new EndOfStreamException("Visual source decoder ended before a complete BGRA frame.");
+                    offset += read;
                 }
-                offset += read;
+                return new DecodedFrame(bytes, _frameSize, Stopwatch.GetElapsedTime(started), owner);
             }
-            return new DecodedFrame(bytes, Stopwatch.GetElapsedTime(started));
+            catch
+            {
+                owner.Dispose();
+                throw;
+            }
         }
 
         private async Task StopProcessAsync()
@@ -369,7 +388,19 @@ public sealed class VideoWorkerSupervisor(
         }
     }
 
-    private sealed record DecodedFrame(byte[] Pixels, TimeSpan ReadTime);
+    private sealed record DecodedFrame(byte[] Pixels, int Length, TimeSpan ReadTime, PooledBufferOwner Owner);
+    private sealed record ComposedFrame(byte[] Pixels, int Length, PooledBufferOwner Owner);
+
+    private sealed class PooledBufferOwner(byte[] buffer) : IDisposable
+    {
+        private byte[]? _buffer = buffer;
+
+        public void Dispose()
+        {
+            var value = Interlocked.Exchange(ref _buffer, null);
+            if (value is not null) ArrayPool<byte>.Shared.Return(value);
+        }
+    }
 }
 
 public sealed class VideoWorkerException(Guid clipId, Exception innerException)

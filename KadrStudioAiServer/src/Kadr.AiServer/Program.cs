@@ -34,6 +34,8 @@ else if (string.IsNullOrWhiteSpace(configuredUrls))
     effectiveListenUrls = AiServerOptions.DefaultListenUrls;
 }
 
+options.ValidateForStartup(effectiveListenUrls);
+
 builder.WebHost.ConfigureKestrel(serverOptions =>
 {
     serverOptions.Limits.MaxRequestBodySize = options.MaxRequestBodyBytes;
@@ -43,12 +45,19 @@ builder.Services.AddSingleton(options);
 builder.Services.AddSingleton(serviceProvider =>
 {
     var configured = serviceProvider.GetRequiredService<AiServerOptions>();
-    return new ContentAddressedAssetStore(configured.DataRoot, configured.MaxAssetBytes);
+    return new DataRootQuota(configured.DataRoot, configured.MaxDataRootBytes);
 });
 builder.Services.AddSingleton(serviceProvider =>
 {
     var configured = serviceProvider.GetRequiredService<AiServerOptions>();
-    return new ContentAddressedArtifactStore(configured.DataRoot);
+    return new ContentAddressedAssetStore(
+        configured.DataRoot, configured.MaxAssetBytes, serviceProvider.GetRequiredService<DataRootQuota>());
+});
+builder.Services.AddSingleton(serviceProvider =>
+{
+    var configured = serviceProvider.GetRequiredService<AiServerOptions>();
+    return new ContentAddressedArtifactStore(
+        configured.DataRoot, serviceProvider.GetRequiredService<DataRootQuota>());
 });
 builder.Services.AddSingleton<IWorkerGateway, LoopbackGrpcWorkerGateway>();
 builder.Services.AddSingleton<RoleStructuredReasoningService>();
@@ -76,7 +85,7 @@ app.MapGet("/health/live", () => Results.Json(new
     version = "0.1.0"
 }));
 
-app.MapGet("/health/ready", async (AiServerOptions configured, ModelCapabilityGate gate, CancellationToken token) =>
+app.MapGet("/health/ready", async (AiServerOptions configured, ModelCapabilityGate gate, AnalyzerJobService jobs, CancellationToken token) =>
 {
     var requiredWorkers = new[] { "video-understanding", "audio-events", "embedding", "director", "critic" };
     var missingWorkers = requiredWorkers.Where(name =>
@@ -88,7 +97,8 @@ app.MapGet("/health/ready", async (AiServerOptions configured, ModelCapabilityGa
     // The exact anime profile uses Qwen3-VL for candidate classification and
     // the 30B planner for a bounded Director brief. The heavy models are still
     // isolated by the worker gateway and are never resident simultaneously.
-    var ready = missingWorkers.Length == 0 && vision.IsAllowed && model.IsAllowed;
+    var jobStorage = jobs.GetStorageHealth();
+    var ready = missingWorkers.Length == 0 && vision.IsAllowed && model.IsAllowed && jobStorage.IsHealthy;
     var animeSrModel = configured.AnimeSrModelPath;
     var upscaleReady = File.Exists(animeSrModel) &&
                        File.Exists(Environment.GetEnvironmentVariable("KADR_AI_FFMPEG")) &&
@@ -97,6 +107,7 @@ app.MapGet("/health/ready", async (AiServerOptions configured, ModelCapabilityGa
     {
         status = ready ? "ready" : "not_ready",
         missingWorkers,
+        jobStorage,
         plannerRequired = true,
         plannerModelError = model.Error,
         visionModelError = vision.Error,

@@ -11,11 +11,12 @@ public sealed class ProjectHistoryService
 {
     private readonly SqliteProjectStore _store = new();
     private readonly string _historyRoot;
-    private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private readonly KadrStudio.Application.Storage.ProjectDocumentCoordinator _coordinator;
 
-    public ProjectHistoryService(string? historyRoot = null)
+    public ProjectHistoryService(string? historyRoot = null, KadrStudio.Application.Storage.ProjectDocumentCoordinator? coordinator = null)
     {
-        _historyRoot = Path.GetFullPath(historyRoot ?? KadrLocalDataPaths.HistoryRoot);
+        _coordinator = coordinator ?? new KadrStudio.Application.Storage.ProjectDocumentCoordinator(historyRoot ?? KadrLocalDataPaths.HistoryRoot);
+        _historyRoot = _coordinator.HistoryRoot;
         Directory.CreateDirectory(_historyRoot);
     }
 
@@ -28,10 +29,10 @@ public sealed class ProjectHistoryService
     {
         ArgumentNullException.ThrowIfNull(project);
         var core = existingSnapshot ?? project;
-        var path = GetHistoryPath(project, projectFilePath);
-        await _operationGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
+            var path = GetHistoryPath(project, projectFilePath);
             if (!File.Exists(path))
                 await _store.SaveAsync(path, core, cancellationToken);
             var info = await _store.CreateCheckpointAsync(path, core, NormalizeMessage(message), cancellationToken);
@@ -39,7 +40,7 @@ public sealed class ProjectHistoryService
         }
         finally
         {
-            _operationGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -49,18 +50,18 @@ public sealed class ProjectHistoryService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(project);
-        var path = GetHistoryPath(project, projectFilePath);
-        if (!File.Exists(path)) return [];
-        await _operationGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
+            var path = GetHistoryPath(project, projectFilePath);
+            if (!File.Exists(path)) return [];
             return (await _store.GetCheckpointsAsync(path, cancellationToken))
                 .Select(item => ToEntry(item.Id, item.ProjectId, item.CreatedAt, item.Name, path))
                 .ToArray();
         }
         finally
         {
-            _operationGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -69,15 +70,15 @@ public sealed class ProjectHistoryService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
-        await _operationGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
+            var path = _coordinator.ResolveHistoryPath(entry.ProjectId, entry.StoragePath);
             return await _store.RestoreCheckpointAsync(path, entry.Id, cancellationToken);
         }
         finally
         {
-            _operationGate.Release();
+            storageLease.Dispose();
         }
     }
 
@@ -86,22 +87,20 @@ public sealed class ProjectHistoryService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        var path = entry.StoragePath ?? throw new InvalidOperationException("The checkpoint storage path is missing.");
-        await _operationGate.WaitAsync(cancellationToken);
+        var storageLease = await _coordinator.EnterAsync(cancellationToken);
         try
         {
+            var path = _coordinator.ResolveHistoryPath(entry.ProjectId, entry.StoragePath);
             await _store.DeleteCheckpointAsync(path, entry.Id, cancellationToken);
         }
         finally
         {
-            _operationGate.Release();
+            storageLease.Dispose();
         }
     }
 
     private string GetHistoryPath(ProjectState project, string? projectFilePath)
-        => string.IsNullOrWhiteSpace(projectFilePath)
-            ? Path.Combine(_historyRoot, $"{project.Id:N}.history.kadr")
-            : Path.GetFullPath(projectFilePath);
+        => _coordinator.ResolveHistoryPath(project.Id, projectFilePath);
 
     private static ProjectHistoryEntry ToEntry(
         Guid id,

@@ -1,6 +1,7 @@
 using KadrStudio.Application.Rendering;
 using KadrStudio.Core.Domain;
 using KadrStudio.Models;
+using System.Collections.Immutable;
 
 namespace KadrStudio.Services;
 
@@ -14,7 +15,9 @@ public sealed class ExportService(
         string outputPath,
         ExportSettings settings,
         IProgress<ExportProgress>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool allowOverwrite = false,
+        string? projectFilePath = null)
     {
         ArgumentNullException.ThrowIfNull(project);
         ArgumentNullException.ThrowIfNull(settings);
@@ -45,7 +48,13 @@ public sealed class ExportService(
                 settings.Quality,
                 settings.UseHardwareEncoding,
                 IncludeVideo: true,
-                IncludeAudio: true),
+                IncludeAudio: true)
+            {
+                AllowOverwrite = allowOverwrite,
+                ProtectedPaths = project.Sources.Values.Select(source => source.Path)
+                    .Concat(string.IsNullOrWhiteSpace(projectFilePath) ? [] : new[] { projectFilePath })
+                    .ToImmutableArray()
+            },
             renderProgress,
             cancellationToken).ConfigureAwait(false);
     }

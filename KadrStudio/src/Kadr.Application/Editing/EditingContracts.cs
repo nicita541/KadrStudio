@@ -46,6 +46,9 @@ public sealed class ProjectStateChangedEventArgs(
 
 public interface IEditorSession
 {
+    Guid SessionId { get; }
+    long StateVersion { get; }
+    long EditVersion { get; }
     ProjectState State { get; }
     bool CanUndo { get; }
     bool CanRedo { get; }
@@ -56,6 +59,8 @@ public interface IEditorSession
     void ReplaceState(ProjectState state, string reason, bool clearHistory = true);
     event EventHandler<ProjectStateChangedEventArgs>? StateChanged;
 }
+
+public readonly record struct EditorSessionStamp(Guid SessionId, long EditVersion);
 
 public sealed class EditRejectedException(string message, IReadOnlyList<ValidationError>? errors = null)
     : InvalidOperationException(message)

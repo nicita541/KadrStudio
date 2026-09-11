@@ -16,6 +16,7 @@ using KadrStudio.Application.Automation.Agent;
 using KadrStudio.Application.Automation.Agent.Diagnostics;
 using KadrStudio.Application.Automation.Agent.Workflow;
 using KadrStudio.Application.Editing;
+using KadrStudio.Application.Rendering;
 using KadrStudio.Models;
 using KadrStudio.Playback;
 using KadrStudio.Services;
@@ -28,6 +29,8 @@ namespace KadrStudio.Views;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
+    private KadrStudio.Core.Domain.ProjectState? _textPreviewState;
+    private RenderPlan? _textPreviewPlan;
     private readonly WorkspaceSettingsService _workspaceSettingsService;
     private readonly RecentProjectsService _recentProjectsService = new();
     private readonly DispatcherTimer _playbackTimer;
@@ -91,6 +94,7 @@ public partial class MainWindow : Window
             AudioLeftMeter.Value = level.LeftPeak;
             AudioRightMeter.Value = level.RightPeak;
         });
+        _previewPresenter.ProxyStatusChanged += (_, _) => PreviewProxyStatus.Text = _previewPresenter.ProxyStatus;
         _previewPresenter.SetProject(_viewModel.CoreState, _useHalfQualityPreview);
         DataContext = _viewModel;
         AiChatMessagesListBox.ItemsSource = _aiChatRows;
@@ -253,6 +257,40 @@ public partial class MainWindow : Window
     private async void SaveProject_Click(object sender, RoutedEventArgs e)
         => await SaveProjectInternalAsync(forceSaveAs: false);
 
+    private async void SaveProjectAs_Click(object sender, RoutedEventArgs e)
+        => await SaveProjectInternalAsync(forceSaveAs: true);
+
+    private async void RelinkSelectedMedia_Click(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.SelectedAsset is not { } asset) return;
+        var dialog = new OpenFileDialog { Title = $"Указать исходник: {asset.Name}", CheckFileExists = true };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            StopPlayback();
+            var preview = await _viewModel.PreviewRelinkMediaAsync(asset.Id, dialog.FileName);
+            if (new RelinkPreviewWindow(preview) { Owner = this }.ShowDialog() == true)
+                _viewModel.ApplyMediaRelinkPreview(preview);
+            ResetPreviewState();
+        }
+        catch (Exception exception) { ShowError("Не удалось восстановить связь с исходником", exception); }
+    }
+
+    private async void RelinkMissingMedia_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFolderDialog { Title = "Папка с перемещёнными исходниками" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            StopPlayback();
+            var preview = await _viewModel.PreviewMissingMediaRelinkAsync([dialog.FolderName]);
+            if (new RelinkPreviewWindow(preview) { Owner = this }.ShowDialog() == true)
+                _viewModel.ApplyMediaRelinkPreview(preview);
+            ResetPreviewState();
+        }
+        catch (Exception exception) { ShowError("Не удалось найти исходники", exception); }
+    }
+
     private void ProjectHistory_Click(object sender, RoutedEventArgs e)
         => new ProjectHistoryWindow(_viewModel) { Owner = this }.ShowDialog();
 
@@ -301,9 +339,9 @@ public partial class MainWindow : Window
         {
             _viewModel.IsBusy = true;
             _viewModel.StatusText = "Перенос кэша медиа…";
-            await _viewModel.ArtifactStore.MoveAsync(dialog.FolderName);
+            await _viewModel.ArtifactStore.MoveAsync(dialog.FolderName, CacheProtectedPaths());
             await SaveArtifactSettingsAsync();
-            _viewModel.StatusText = $"Кэш перенесён: {dialog.FolderName}";
+            _viewModel.StatusText = $"Кэш перенесён: {_viewModel.ArtifactStore.Options.Root}";
         }
         catch (Exception exception)
         {
@@ -327,7 +365,7 @@ public partial class MainWindow : Window
         try
         {
             _viewModel.IsBusy = true;
-            await _viewModel.ArtifactStore.ClearAsync();
+            await _viewModel.ArtifactStore.ClearAsync(CacheProtectedPaths());
             _viewModel.StatusText = "Кэш медиа очищен";
         }
         catch (Exception exception)
@@ -367,7 +405,18 @@ public partial class MainWindow : Window
     {
         var options = _viewModel.ArtifactStore.Options;
         return _workspaceSettingsService.SaveAsync(new WorkspaceSettings(
-            options.Root, options.DiskBudgetBytes));
+            options.Root, options.DiskBudgetBytes, options.OwnershipId));
+    }
+
+    private IReadOnlyCollection<string> CacheProtectedPaths()
+    {
+        var paths = _viewModel.Project.Media
+            .Select(asset => asset.Path)
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .ToList();
+        if (!string.IsNullOrWhiteSpace(_viewModel.Project.FilePath))
+            paths.Add(_viewModel.Project.FilePath);
+        return paths;
     }
 
     private async Task<bool> SaveProjectInternalAsync(bool forceSaveAs)
@@ -408,7 +457,7 @@ public partial class MainWindow : Window
     private void Export_Click(object sender, RoutedEventArgs e)
     {
         StopPlayback();
-        var exportWindow = new ExportWindow(_viewModel.CoreState, _viewModel.ExportService)
+        var exportWindow = new ExportWindow(_viewModel.CoreState, _viewModel.ExportService, _viewModel.Project.FilePath)
         {
             Owner = this
         };
@@ -434,7 +483,8 @@ public partial class MainWindow : Window
         StopPlayback();
         if (TextOverlayList.SelectedItem is TextOverlay overlay &&
             TimelineEditor.SelectedTextOverlayId == overlay.Id &&
-            _viewModel.Playhead > overlay.Start + 0.1 && _viewModel.Playhead < overlay.End - 0.1)
+            KadrStudio.Application.Editing.TimelineEditBounds.CanSplit(
+                overlay.Start, overlay.End, _viewModel.Playhead, _viewModel.Project.FrameRateValue))
         {
             var rightId = _viewModel.SplitTextOverlay(overlay.Id, _viewModel.Playhead);
             if (rightId is null) return;
@@ -2067,7 +2117,8 @@ public partial class MainWindow : Window
                 : "Видео или изображение добавлено на видеодорожку";
         }
 
-        _viewModel.AddAssetToTimeline(e.AssetId, e.RequestedStart, e.RequestedTrack, e.RequestedTrackIndex);
+        if (!ChooseAudioStream(e.AssetId, out var selectedAudioStream)) return;
+        _viewModel.AddAssetToTimeline(e.AssetId, e.RequestedStart, e.RequestedTrack, e.RequestedTrackIndex, selectedAudioStream);
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
     }
 
@@ -2099,8 +2150,21 @@ public partial class MainWindow : Window
             return;
         }
 
-        _viewModel.AddAssetToTimeline(asset.Id);
+        if (!ChooseAudioStream(asset.Id, out var selectedAudioStream)) return;
+        _viewModel.AddAssetToTimeline(asset.Id, selectedAudioStreamIndex: selectedAudioStream);
         TimelineEditor.SelectedClipId = _viewModel.SelectedClip?.Id;
+    }
+
+    private bool ChooseAudioStream(Guid sourceId, out int? selectedStream)
+    {
+        selectedStream = null;
+        if (!_viewModel.CoreState.Sources.TryGetValue(sourceId, out var source)) return false;
+        if (source.Streams.IsDefaultOrEmpty || source.Streams.Count(stream =>
+                stream.Kind == KadrStudio.Core.Domain.MediaStreamKind.Audio) < 2) return true;
+        var dialog = new AudioStreamSelectionWindow(source) { Owner = this };
+        if (dialog.ShowDialog() != true) return false;
+        selectedStream = dialog.SelectedStreamIndex;
+        return true;
     }
 
     private void TimelineScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
@@ -2265,19 +2329,21 @@ public partial class MainWindow : Window
 
     private void UpdateTextOverlayPreview(double timelineSeconds)
     {
-        var textTrackVisible = _viewModel.Project.Tracks
-            .Where(track => track.Kind == KadrStudio.Core.Domain.TrackKind.Text)
-            .OrderBy(track => track.Index)
-            .FirstOrDefault()?.IsVisible != false;
-        var active = _viewModel.Project.TextOverlays
-            .Where(item => textTrackVisible && timelineSeconds >= item.Start && timelineSeconds < item.End)
-            .OrderBy(item => item.Start)
-            .ThenBy(item => item.Id)
-            .ToArray();
+        var canvasWidth = _viewModel.Project.CanvasWidth;
+        var canvasHeight = _viewModel.Project.CanvasHeight;
+        PreviewTextCanvas.Width = PreviewPassiveTextLayer.Width = canvasWidth;
+        PreviewTextCanvas.Height = PreviewPassiveTextLayer.Height = canvasHeight;
+        var viewport = (FrameworkElement)PreviewTextCanvas.Parent;
+        var scale = Math.Min((viewport.ActualWidth > 0 ? viewport.ActualWidth : 960) / canvasWidth,
+            (viewport.ActualHeight > 0 ? viewport.ActualHeight : 540) / canvasHeight);
+        if (PreviewTextCanvas.LayoutTransform is not ScaleTransform currentScale || currentScale.ScaleX != scale)
+            PreviewTextCanvas.LayoutTransform = new ScaleTransform(scale, scale);
+        var active = ActiveTextLayers(timelineSeconds);
         var selectedId = (TextOverlayList.SelectedItem as TextOverlay)?.Id ?? TimelineEditor.SelectedTextOverlayId;
-        var storedOverlay = active.LastOrDefault(item => item.Id == selectedId) ?? active.LastOrDefault();
-        RenderPassiveTextOverlays(active.Where(item => item.Id != storedOverlay?.Id));
+        var selectedLayer = active.LastOrDefault(item => item.ClipId == selectedId) ?? active.LastOrDefault();
+        var storedOverlay = _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == selectedLayer?.ClipId);
         var overlay = ResolvePreviewTextDraft(storedOverlay);
+        RenderPassiveTextOverlays(active, ReferenceEquals(overlay, storedOverlay) ? null : overlay);
         if (overlay is null)
         {
             FinishPreviewTextEditing(commit: true, refresh: false);
@@ -2285,28 +2351,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        PreviewTextBlock.Text = overlay.Text;
-        PreviewTextBlock.FontFamily = new FontFamily(overlay.FontFamily);
-        PreviewTextBlock.FontSize = overlay.FontSize;
+        TextOverlayVisualFactory.Apply(PreviewTextBorder, PreviewTextBlock, overlay.Text, TextLayoutStyle(overlay),
+            PreviewTextCanvas.Width, PreviewTextCanvas.Height);
+        // The canonical stack is drawn below; selection controls must not reorder text layers.
+        PreviewTextBlock.Opacity = 0;
+        PreviewTextBorder.Background = Brushes.Transparent;
         PreviewTextEditor.FontFamily = PreviewTextBlock.FontFamily;
         PreviewTextEditor.FontSize = overlay.FontSize;
-        try
-        {
-            PreviewTextBlock.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(overlay.Color));
-        }
-        catch
-        {
-            PreviewTextBlock.Foreground = Brushes.White;
-        }
         PreviewTextEditor.Foreground = PreviewTextBlock.Foreground;
-        PreviewTextBorder.RenderTransformOrigin = new Point(0.5, 0.5);
-        PreviewTextBorder.RenderTransform = new RotateTransform(overlay.Rotation);
-        var width = Math.Clamp(overlay.BoxWidth * 960, 80, 960);
-        var height = Math.Clamp(overlay.BoxHeight * 540, 36, 540);
-        PreviewTextBorder.Width = width;
-        PreviewTextBorder.Height = height;
-        Canvas.SetLeft(PreviewTextBorder, Math.Clamp(overlay.X * 960 - width / 2, 0, 960 - width));
-        Canvas.SetTop(PreviewTextBorder, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
         var selected = selectedId == overlay.Id;
         PreviewTextSelectionOutline.Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
         PreviewTextResizeHandles.Visibility = selected && !_isEditingPreviewText ? Visibility.Visible : Visibility.Collapsed;
@@ -2365,10 +2417,10 @@ public partial class MainWindow : Window
         var point = e.GetPosition(PreviewTextCanvas);
         var width = Math.Max(1, PreviewTextBorder.ActualWidth);
         var height = Math.Max(1, PreviewTextBorder.ActualHeight);
-        var left = Math.Clamp(point.X - _previewTextDragOffset.X, 0, 960 - width);
-        var top = Math.Clamp(point.Y - _previewTextDragOffset.Y, 0, 540 - height);
-        _previewDraggedOverlay.X = Math.Clamp((left + width / 2) / 960, 0, 1);
-        _previewDraggedOverlay.Y = Math.Clamp((top + height / 2) / 540, 0, 1);
+        var left = Math.Clamp(point.X - _previewTextDragOffset.X, 0, PreviewTextCanvas.Width - width);
+        var top = Math.Clamp(point.Y - _previewTextDragOffset.Y, 0, PreviewTextCanvas.Height - height);
+        _previewDraggedOverlay.X = Math.Clamp((left + width / 2) / PreviewTextCanvas.Width, 0, 1);
+        _previewDraggedOverlay.Y = Math.Clamp((top + height / 2) / PreviewTextCanvas.Height, 0, 1);
         UpdateTextOverlayPreview(_viewModel.Playhead);
         e.Handled = true;
     }
@@ -2481,12 +2533,21 @@ public partial class MainWindow : Window
     private TextOverlay? GetDisplayedTextOverlay()
     {
         var selectedId = (TextOverlayList.SelectedItem as TextOverlay)?.Id ?? TimelineEditor.SelectedTextOverlayId;
-        var active = _viewModel.Project.TextOverlays
-            .Where(item => _viewModel.Playhead >= item.Start && _viewModel.Playhead < item.End)
-            .OrderBy(item => item.Start)
-            .ThenBy(item => item.Id)
-            .ToArray();
-        return active.LastOrDefault(item => item.Id == selectedId) ?? active.LastOrDefault();
+        var active = ActiveTextLayers(_viewModel.Playhead);
+        var layer = active.LastOrDefault(item => item.ClipId == selectedId) ?? active.LastOrDefault();
+        return _viewModel.Project.TextOverlays.FirstOrDefault(item => item.Id == layer?.ClipId);
+    }
+
+    private RenderTextLayer[] ActiveTextLayers(double seconds)
+    {
+        var state = _viewModel.CoreState;
+        if (!ReferenceEquals(state, _textPreviewState))
+        {
+            _textPreviewPlan = _viewModel.RenderCoordinator.CreatePlan(state);
+            _textPreviewState = state;
+        }
+        var time = KadrStudio.Core.Domain.TimelineTime.FromSeconds(seconds);
+        return _textPreviewPlan!.TextLayers.Where(layer => layer.TimelineRange.Contains(time)).ToArray();
     }
 
     private TextOverlay? ResolvePreviewTextDraft(TextOverlay? stored)
@@ -2498,42 +2559,21 @@ public partial class MainWindow : Window
         return stored;
     }
 
-    private void RenderPassiveTextOverlays(IEnumerable<TextOverlay> overlays)
+    private void RenderPassiveTextOverlays(IEnumerable<RenderTextLayer> overlays, TextOverlay? draft)
     {
         PreviewPassiveTextLayer.Children.Clear();
         foreach (var overlay in overlays)
         {
-            var width = Math.Clamp(overlay.BoxWidth * 960, 80, 960);
-            var height = Math.Clamp(overlay.BoxHeight * 540, 36, 540);
-            var text = new TextBlock
-            {
-                Text = overlay.Text,
-                TextWrapping = TextWrapping.Wrap,
-                TextAlignment = TextAlignment.Center,
-                FontFamily = new FontFamily(overlay.FontFamily),
-                FontSize = overlay.FontSize,
-                FontWeight = FontWeights.SemiBold,
-                VerticalAlignment = VerticalAlignment.Center,
-                HorizontalAlignment = HorizontalAlignment.Stretch,
-                Margin = new Thickness(8),
-                Foreground = ParseTextBrush(overlay.Color)
-            };
-            var border = new Border
-            {
-                Width = width,
-                Height = height,
-                Background = new SolidColorBrush(Color.FromArgb(102, 0, 0, 0)),
-                CornerRadius = new CornerRadius(4),
-                Padding = new Thickness(8, 3, 8, 3),
-                RenderTransformOrigin = new Point(0.5, 0.5),
-                RenderTransform = new RotateTransform(overlay.Rotation),
-                Child = text
-            };
-            Canvas.SetLeft(border, Math.Clamp(overlay.X * 960 - width / 2, 0, 960 - width));
-            Canvas.SetTop(border, Math.Clamp(overlay.Y * 540 - height / 2, 0, 540 - height));
+            var isDraft = draft?.Id == overlay.ClipId;
+            var border = TextOverlayVisualFactory.Create(isDraft ? draft!.Text : overlay.Text, isDraft ? TextLayoutStyle(draft!) : overlay.Style,
+                PreviewTextCanvas.Width, PreviewTextCanvas.Height);
             PreviewPassiveTextLayer.Children.Add(border);
         }
     }
+
+    private static KadrStudio.Core.Domain.TextStyle TextLayoutStyle(TextOverlay overlay)
+        => new(overlay.FontFamily, overlay.FontSize, overlay.Color, overlay.X, overlay.Y,
+            overlay.Rotation, overlay.BoxWidth, overlay.BoxHeight, overlay.IsSubtitle);
 
     private static Brush ParseTextBrush(string color)
     {
@@ -2609,7 +2649,7 @@ public partial class MainWindow : Window
         }
         else if (resizeRight)
         {
-            width = Math.Clamp(width + deltaX, minWidth, 960 - left);
+            width = Math.Clamp(width + deltaX, minWidth, PreviewTextCanvas.Width - left);
         }
 
         if (resizeTop)
@@ -2620,13 +2660,13 @@ public partial class MainWindow : Window
         }
         else if (resizeBottom)
         {
-            height = Math.Clamp(height + deltaY, minHeight, 540 - top);
+            height = Math.Clamp(height + deltaY, minHeight, PreviewTextCanvas.Height - top);
         }
 
-        _previewDraggedOverlay.BoxWidth = width / 960;
-        _previewDraggedOverlay.BoxHeight = height / 540;
-        _previewDraggedOverlay.X = (left + width / 2) / 960;
-        _previewDraggedOverlay.Y = (top + height / 2) / 540;
+        _previewDraggedOverlay.BoxWidth = width / PreviewTextCanvas.Width;
+        _previewDraggedOverlay.BoxHeight = height / PreviewTextCanvas.Height;
+        _previewDraggedOverlay.X = (left + width / 2) / PreviewTextCanvas.Width;
+        _previewDraggedOverlay.Y = (top + height / 2) / PreviewTextCanvas.Height;
         UpdateTextOverlayPreview(_viewModel.Playhead);
     }
 
@@ -2655,7 +2695,7 @@ public partial class MainWindow : Window
         _ = _previewPresenter.InvalidateAsync(video: true, audio: false, overlay: false);
         UpdatePreviewAt(_viewModel.Playhead, forceSeek: true);
         _viewModel.StatusText = _useHalfQualityPreview
-            ? "Предпросмотр: 1/2 качества"
+            ? "Предпросмотр: авто до 1080p, proxy для видео высокого разрешения"
             : "Предпросмотр: оригинальное качество";
     }
 
@@ -3014,7 +3054,8 @@ public partial class MainWindow : Window
         }
         else if (e.Key == Key.S && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
         {
-            SaveProject_Click(sender, e);
+            if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) SaveProjectAs_Click(sender, e);
+            else SaveProject_Click(sender, e);
             e.Handled = true;
         }
         else if (e.Key == Key.H && Keyboard.Modifiers == ModifierKeys.Control)

@@ -9,12 +9,12 @@ namespace KadrStudio.Integration.Tests;
 
 public sealed class RealAnimeAiPipelineIntegrationTests
 {
-    [Fact(Timeout = 3_600_000)]
+    [EnvironmentRequiredFact(TestEnvironmentGate.RealAnimeAi, Timeout = 3_600_000)]
+    [Trait("Category", "EnvironmentRequired")]
+    [Trait("Environment", "RealAI")]
     public async Task Real_models_find_and_remove_only_opening_and_ending_without_injected_hypotheses()
     {
-        if (Environment.GetEnvironmentVariable("KADR_RUN_REAL_ANIME_AI") != "1") return;
-        var path = Environment.GetEnvironmentVariable("KADR_ANIME_EPISODE_PATH")
-            ?? throw new InvalidOperationException("KADR_ANIME_EPISODE_PATH is required.");
+        var path = TestEnvironment.Require(TestEnvironmentGate.RealAnimeAi);
         var ffmpeg = new FfmpegLocator();
         ffmpeg.EnsureAvailable();
         var processes = new ProcessRunner();
@@ -69,8 +69,7 @@ public sealed class RealAnimeAiPipelineIntegrationTests
         }).EnsureSequenceContainer();
 
         using var connection = new AiServerConnection();
-        var requireProduction = Environment.GetEnvironmentVariable("KADR_REAL_AI_REQUIRE_PRODUCTION") == "1";
-        var client = new AiServerV2Client(connection, requireProduction: requireProduction);
+        var client = new AiServerV2Client(connection, requireProduction: true);
         var indexer = new AiServerMediaUnderstandingIndexer(client, new AnalysisProxyBuilder(ffmpeg, processes));
         var reasoner = new AiServerEditorialReasoner(client);
         var pipeline = new EditorialPipeline(

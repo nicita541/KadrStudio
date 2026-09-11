@@ -20,7 +20,7 @@ public sealed record EditBatchCommand(string Description, IReadOnlyList<IEditCom
     public ProjectState Apply(ProjectState project)
     {
         var state = project;
-        foreach (var command in Commands) state = command.Apply(state);
+        foreach (var command in Commands) state = TrackEditGuard.Apply(command, state);
         return state;
     }
 }
@@ -137,9 +137,10 @@ public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool In
     public ProjectState Apply(ProjectState project)
     {
         var ids = ClipIds.ToHashSet();
+        var groups = new HashSet<Guid>();
         if (IncludeLinked)
         {
-            var groups = project.MediaClips
+            groups = project.MediaClips
                 .Where(item => ids.Contains(item.Id) && item.LinkGroupId.HasValue)
                 .Select(item => item.LinkGroupId!.Value)
                 .ToHashSet();
@@ -148,6 +149,7 @@ public sealed record DeleteMediaClipsCommand(IReadOnlySet<Guid> ClipIds, bool In
         return project with
         {
             MediaClips = project.MediaClips.Where(item => !ids.Contains(item.Id)).ToImmutableArray(),
+            SubtitleClips = project.SubtitleClips.Where(item => item.LinkGroupId is not { } group || !groups.Contains(group)).ToImmutableArray(),
             Transitions = RemoveTransitionsForClips(project.Transitions, ids)
         };
     }
@@ -174,6 +176,7 @@ public sealed record MoveMediaClipCommand(Guid ClipId, Guid TargetTrackId, Timel
             : new HashSet<Guid> { selected.Id };
         return project with
         {
+            SubtitleClips = LinkedSubtitleEdits.Move(project, selected.LinkGroupId, delta),
             MediaClips = project.MediaClips.Select(item => item.Id == selected.Id
                 ? item with { TrackId = TargetTrackId, Start = NewStart }
                 : linkedIds.Contains(item.Id)
@@ -222,6 +225,7 @@ public sealed record TrimMediaClipCommand(Guid ClipId, TrimEdge Edge, TimelineTi
 
         return project with
         {
+            SubtitleClips = LinkedSubtitleEdits.Trim(project, selected.LinkGroupId, startDelta, durationDelta),
             MediaClips = project.MediaClips.Select(item =>
             {
                 if (!linked.Contains(item.Id)) return item;
@@ -278,6 +282,7 @@ public sealed record SplitMediaClipsCommand(TimelineTime Position) : IEditComman
         }
         return project with
         {
+            SubtitleClips = LinkedSubtitleEdits.Split(project, Position, rightGroups),
             MediaClips = project.MediaClips.Select(item => replacements.GetValueOrDefault(item.Id, item))
                 .Concat(additions).ToImmutableArray(),
             Transitions = RemoveTransitionsForClips(
@@ -301,7 +306,7 @@ public sealed record SplitSelectedMediaClipCommand(
         var targets = IncludeLinked && selected.LinkGroupId is { } group
             ? project.MediaClips.Where(item => item.LinkGroupId == group && Position > item.Start && Position < item.End).ToArray()
             : [selected];
-        var rightGroup = targets.Length > 1 ? Guid.NewGuid() : (Guid?)null;
+        var rightGroup = IncludeLinked && selected.LinkGroupId.HasValue ? Guid.NewGuid() : (Guid?)null;
         var unlinkedGroup = !IncludeLinked ? selected.LinkGroupId : null;
         var left = new Dictionary<Guid, MediaClip>();
         var right = new List<MediaClip>();
@@ -326,6 +331,10 @@ public sealed record SplitSelectedMediaClipCommand(
         }
         return project with
         {
+            SubtitleClips = !IncludeLinked
+                ? LinkedSubtitleEdits.Unlink(project, selected.LinkGroupId)
+                : LinkedSubtitleEdits.Split(project, Position, selected.LinkGroupId is { } linkedGroup && rightGroup is { } newGroup
+                    ? new Dictionary<Guid, Guid> { [linkedGroup] = newGroup } : new Dictionary<Guid, Guid>()),
             MediaClips = project.MediaClips.Select(item =>
                     unlinkedGroup.HasValue && item.LinkGroupId == unlinkedGroup
                         ? left.GetValueOrDefault(item.Id, item with { LinkGroupId = null })
@@ -346,6 +355,7 @@ public sealed record UnlinkMediaClipCommand(Guid ClipId) : IEditCommand
         if (clip.LinkGroupId is not { } group) return project;
         return project with
         {
+            SubtitleClips = LinkedSubtitleEdits.Unlink(project, group),
             MediaClips = project.MediaClips.Select(item => item.LinkGroupId == group
                 ? item with { LinkGroupId = null }
                 : item).ToImmutableArray()
@@ -417,7 +427,10 @@ public sealed record RippleDeleteSelectedMediaClipCommand(Guid ClipId) : IEditCo
         var hasUnselectedOverlap = project.MediaClips.Any(item =>
             !targetIds.Contains(item.Id) && item.Start < rangeEnd && item.End > rangeStart);
         var hasTextOverlap = project.TextClips.Any(item => item.Start < rangeEnd && item.End > rangeStart);
-        if (hasUnselectedOverlap || hasTextOverlap)
+        var hasSubtitleOverlap = project.SubtitleClips.Any(item =>
+            (selected.LinkGroupId is null || item.LinkGroupId != selected.LinkGroupId) &&
+            item.Start < rangeEnd && item.End > rangeStart);
+        if (hasUnselectedOverlap || hasTextOverlap || hasSubtitleOverlap)
         {
             throw new EditRejectedException(
                 "Ripple Delete остановлен: диапазон пересекает несвязанное содержимое на другой дорожке.");

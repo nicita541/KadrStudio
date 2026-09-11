@@ -14,7 +14,11 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
     private const int OldestReadableSchemaVersion = 1;
     private readonly IProjectValidator _validator = validator ?? new ProjectValidator();
 
-    public async Task SaveAsync(string path, ProjectState project, CancellationToken cancellationToken = default)
+    public Task SaveAsync(string path, ProjectState project, CancellationToken cancellationToken = default)
+        => SaveWithHistoryAsync(path, project, null, cancellationToken);
+
+    public async Task SaveWithHistoryAsync(string path, ProjectState project, string? historySourcePath,
+        CancellationToken cancellationToken = default)
     {
         EnsureValid(project);
         var fullPath = NormalizeProjectPath(path);
@@ -25,6 +29,11 @@ public sealed class SqliteProjectStore(IProjectValidator? validator = null) : IP
             var checkpoints = File.Exists(fullPath)
                 ? await ReadCheckpointDocumentsAsync(fullPath, cancellationToken).ConfigureAwait(false)
                 : Array.Empty<CheckpointDocument>();
+            if (!string.IsNullOrWhiteSpace(historySourcePath) && File.Exists(historySourcePath) &&
+                !Path.GetFullPath(historySourcePath).Equals(fullPath, StringComparison.OrdinalIgnoreCase))
+                checkpoints = checkpoints.Concat(await ReadCheckpointDocumentsAsync(historySourcePath, cancellationToken).ConfigureAwait(false))
+                    .DistinctBy(checkpoint => checkpoint.Id).ToArray();
+            checkpoints = checkpoints.Where(checkpoint => checkpoint.ProjectId == project.Id).ToArray();
             await using (var connection = await OpenAsync(temporaryPath, readOnly: false, cancellationToken).ConfigureAwait(false))
             {
                 await CreateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);

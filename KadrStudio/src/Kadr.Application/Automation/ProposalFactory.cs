@@ -6,6 +6,17 @@ namespace KadrStudio.Application.Automation;
 
 public static class ProposalFactory
 {
+    public static ProjectAutomationSnapshot Capture(IEditorSession session)
+        => Capture(session.State) with
+        {
+            SessionStamp = new EditorSessionStamp(session.SessionId, session.EditVersion)
+        };
+
+    public static bool IsCurrent(IEditorSession session, ProjectAutomationSnapshot snapshot)
+        => (snapshot.SessionStamp is null || snapshot.SessionStamp ==
+                new EditorSessionStamp(session.SessionId, session.EditVersion)) &&
+            EditorSession.HasSameEditableState(session.State, snapshot.State);
+
     public static ProjectAutomationSnapshot Capture(ProjectState state)
     {
         ArgumentNullException.ThrowIfNull(state);
@@ -48,5 +59,9 @@ public static class ProposalFactory
             summary,
             producer,
             commands.ToImmutableArray(),
-            CreateCheckpoint: true);
+            CreateCheckpoint: true)
+        {
+            SessionStamp = snapshot.SessionStamp,
+            InputState = snapshot.State
+        };
 }

@@ -140,6 +140,9 @@ public sealed class AiServerMediaUnderstandingIndexer(
             .Select(item => (int?)item.StreamIndex)
             .FirstOrDefault();
         var jobs = new List<Guid>(analyzers.Length);
+        var ownerId = Guid.NewGuid().ToString("N");
+        try
+        {
         foreach (var analyzer in analyzers)
         {
             var relevantGaps = gaps
@@ -176,7 +179,7 @@ public sealed class AiServerMediaUnderstandingIndexer(
                     primaryAsrStreamIndex,
                     gaps = relevantGaps
                 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, ownerId, analyzer).ConfigureAwait(false);
             jobs.Add(jobId);
             progress?.Report(new EditorialPipelineProgress(
                 EditorialPipelineStage.Indexing, 0.1,
@@ -229,6 +232,17 @@ public sealed class AiServerMediaUnderstandingIndexer(
             assetIds.Distinct(StringComparer.Ordinal).ToImmutableArray(),
             jobs.Select(item => item.ToString("N")).ToImmutableArray(),
             artifactIds.ToImmutableArray());
+        }
+        catch
+        {
+            using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(jobs.Select(async id =>
+            {
+                try { await client.CancelJobAsync(id, cleanup.Token, ownerId).ConfigureAwait(false); }
+                catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Remote job cancellation failed for {0}: {1}", id, error.GetType().Name); }
+            })).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private static ImmutableArray<string> SelectAnalyzers(

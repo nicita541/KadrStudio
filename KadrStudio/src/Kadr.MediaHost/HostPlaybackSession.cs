@@ -36,6 +36,8 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
     private Task? _videoPump;
     private Task? _presentation;
     private Task? _audioPump;
+    private Task? _completionMonitor;
+    private CancellationTokenSource? _completionCancellation;
     private BufferedWaveProvider? _audioBuffer;
     private WasapiOut? _audioOutput;
     private VideoFrame? _lastFrame;
@@ -124,6 +126,7 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
         {
             ThrowIfDisposed();
             var wasPlaying = State == PreviewState.Playing;
+            await StopCompletionMonitorAsync().ConfigureAwait(false);
             var current = Clamp(Position, plan.Range.Start, plan.Range.End);
             _plan = plan;
             _request = request;
@@ -145,6 +148,7 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
                 _fallbackClock.Restart();
             }
             SetState(wasPlaying ? PreviewState.Playing : PreviewState.Paused);
+            if (wasPlaying) StartCompletionMonitor();
         }
         finally { _gate.Release(); }
     }
@@ -157,15 +161,23 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
             ThrowIfDisposed();
             if (_plan is null) throw new InvalidOperationException("Preview is not prepared.");
             if (State == PreviewState.Playing) return;
+            if (_position >= _plan.Range.End) _position = _plan.Range.Start;
             SetState(PreviewState.Buffering);
             await StopPipelinesAsync().ConfigureAwait(false);
             await StartPipelinesAsync(_position, play: true, cancellationToken).ConfigureAwait(false);
             SetState(PreviewState.Playing);
+            StartCompletionMonitor();
         }
         finally { _gate.Release(); }
     }
 
-    public async Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default)
+    public Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default)
+        => SeekCoreAsync(position, null, cancellationToken);
+
+    public Task SeekAsync(TimelineTime position, PreviewGeneration generation, CancellationToken cancellationToken = default)
+        => SeekCoreAsync(position, generation, cancellationToken);
+
+    private async Task SeekCoreAsync(TimelineTime position, PreviewGeneration? generation, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -176,8 +188,10 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
             _position = Clamp(position, _plan.Range.Start, _plan.Range.End);
             SetState(PreviewState.Buffering);
             await StopPipelinesAsync().ConfigureAwait(false);
+            _request = _request with { Position = _position, Generation = generation ?? _request.Generation };
             await StartPipelinesAsync(_position, wasPlaying, cancellationToken).ConfigureAwait(false);
             SetState(wasPlaying ? PreviewState.Playing : PreviewState.Paused);
+            if (wasPlaying) StartCompletionMonitor();
         }
         finally { _gate.Release(); }
     }
@@ -299,7 +313,12 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
                 if (continuous)
                 {
                     var waitStarted = Stopwatch.GetTimestamp();
-                    await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+                    try { await writer!.WriteAsync(frame, cancellationToken).ConfigureAwait(false); }
+                    catch
+                    {
+                        frame.Owner?.Dispose();
+                        throw;
+                    }
                     Interlocked.Add(ref _producerWaitTicks, Stopwatch.GetTimestamp() - waitStarted);
                 }
                 else Present(frame);
@@ -331,17 +350,30 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
                 var latest = frame;
                 while (latest.Position < GetClockPosition() - frameDuration && reader.TryRead(out var newer))
                 {
+                    latest.Owner?.Dispose();
                     latest = newer;
                     Interlocked.Increment(ref _framesDropped);
                 }
                 var delta = latest.Position - GetClockPosition();
-                if (delta > TimelineTime.Zero)
-                    await Task.Delay(TimeSpan.FromSeconds(delta.TotalSeconds), cancellationToken).ConfigureAwait(false);
-                Present(latest);
+                try
+                {
+                    if (delta > TimelineTime.Zero)
+                        await Task.Delay(TimeSpan.FromSeconds(delta.TotalSeconds), cancellationToken).ConfigureAwait(false);
+                    Present(latest);
+                }
+                catch
+                {
+                    latest.Owner?.Dispose();
+                    throw;
+                }
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception exception) { ReportPipelineFailure(exception, video: true); }
+        finally
+        {
+            while (reader.TryRead(out var abandoned)) abandoned.Owner?.Dispose();
+        }
     }
 
     private async Task RunAudioWorkersAsync(
@@ -369,9 +401,52 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
 
     private async Task StopPipelinesAsync()
     {
+        await StopCompletionMonitorAsync().ConfigureAwait(false);
         _fallbackClock.Stop();
         await StopVideoAsync().ConfigureAwait(false);
         await StopAudioAsync().ConfigureAwait(false);
+    }
+
+    private void StartCompletionMonitor()
+    {
+        if (_plan is null) return;
+        _completionCancellation = new CancellationTokenSource();
+        var pumps = new[] { _videoPump, _presentation, _audioPump }.OfType<Task>().ToArray();
+        _completionMonitor = CompletePlaybackAsync(_plan.Range.End, pumps, _completionCancellation.Token);
+    }
+
+    private async Task CompletePlaybackAsync(TimelineTime end, Task[] pumps, CancellationToken token)
+    {
+        try
+        {
+            await Task.WhenAll(pumps).WaitAsync(token).ConfigureAwait(false);
+            while (State == PreviewState.Playing &&
+                   (GetClockPosition() < end || _audioBuffer is { BufferedBytes: > 0 }))
+                await Task.Delay(10, token).ConfigureAwait(false);
+            await _gate.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                if (State != PreviewState.Playing) return;
+                await StopVideoAsync().ConfigureAwait(false);
+                await StopAudioAsync().ConfigureAwait(false);
+                _fallbackClock.Stop();
+                _position = end;
+                SetState(PreviewState.Paused);
+            }
+            finally { _gate.Release(); }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception exception) { SetFailed(exception); }
+    }
+
+    private async Task StopCompletionMonitorAsync()
+    {
+        _completionCancellation?.Cancel();
+        if (_completionMonitor is not null) await _completionMonitor.ConfigureAwait(false);
+        _completionMonitor = null;
+        _completionCancellation?.Dispose();
+        _completionCancellation = null;
     }
 
     private async Task StopVideoAsync()
@@ -425,11 +500,15 @@ public sealed class HostPlaybackSession(string ffmpegPath) : IPreviewEngine
 
     private void Present(VideoFrame frame)
     {
-        if (frame.Generation != _request.Generation.Video) return;
-        Interlocked.Increment(ref _framesPresented);
-        _lastFrame = frame;
-        _position = frame.Position;
-        FramePresented?.Invoke(this, frame);
+        try
+        {
+            if (frame.Generation != _request.Generation.Video) return;
+            Interlocked.Increment(ref _framesPresented);
+            _lastFrame = frame with { Bgra = ReadOnlyMemory<byte>.Empty, Owner = null };
+            _position = frame.Position;
+            FramePresented?.Invoke(this, frame);
+        }
+        finally { frame.Owner?.Dispose(); }
     }
 
     private void ReportPipelineFailure(Exception exception, bool video)

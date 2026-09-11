@@ -29,7 +29,8 @@ public sealed record VideoFrame(
     int Height,
     int Stride,
     ReadOnlyMemory<byte> Bgra,
-    long Generation);
+    long Generation,
+    IDisposable? Owner = null);
 
 public sealed record AudioBlock(
     TimelineTime Position,
@@ -100,6 +101,7 @@ public interface IPreviewEngine : IAsyncDisposable
         CancellationToken cancellationToken = default);
     Task StartAsync(CancellationToken cancellationToken = default);
     Task SeekAsync(TimelineTime position, CancellationToken cancellationToken = default);
+    Task SeekAsync(TimelineTime position, PreviewGeneration generation, CancellationToken cancellationToken = default);
     Task PauseAsync(CancellationToken cancellationToken = default);
     Task StopAsync(CancellationToken cancellationToken = default);
 }
